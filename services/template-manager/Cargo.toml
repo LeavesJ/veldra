@@ -1,0 +1,14 @@
+[package]
+name = "template-manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+rg-protocol = { path = "../rg-protocol" }
+bitcoincore-rpc = "0.18"
+

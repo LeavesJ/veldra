@@ -1,0 +1,4 @@
+protocol_version = 1
+required_prevhash_len = 64
+min_total_fees = 1
+max_tx_count = 10000
