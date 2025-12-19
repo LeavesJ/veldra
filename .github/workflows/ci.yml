@@ -7,12 +7,11 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust stable
-      - uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
@@ -22,7 +21,6 @@ jobs:
           ls -la
           find . -maxdepth 3 -name Cargo.toml
 
-      # CHANGE THIS LINE IF YOUR Cargo.toml IS NOT AT REPO ROOT
       - name: fmt
         run: cargo fmt --all --check --manifest-path services/Cargo.toml
 
