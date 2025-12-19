@@ -9,7 +9,7 @@ This repo is a **beta prototype** intended to be legible, testable, and easy for
 ## Demo and repo links
 - **Repo:** `<YOUR_GITHUB_REPO_URL>`
 - **Demo (dashboard video or live):** `<YOUR_DEMO_LINK>`
-- **Contact:** `<YOUR_EMAIL_OR_SITE>`
+- **Contact:** `<jarrondeng@gmail.com>`
 
 If you are sending this to a pool operator, include:
 1. A 60 to 120 second screen recording of: regtest stack boot, dashboard live updates, policy wizard applying a policy, and a visible change in accept or reject behavior.
