@@ -7,8 +7,8 @@ This repo is a **beta prototype** intended to be legible, testable, and easy for
 ---
 
 ## Demo and repo links
-- **Repo:** `<YOUR_GITHUB_REPO_URL>`
-- **Demo (dashboard video or live):** `<YOUR_DEMO_LINK>`
+- **Repo:** `<>`
+- **Demo (dashboard video or live):** `<>`
 - **Contact:** `<jarrondeng@gmail.com>`
 
 If you are sending this to a pool operator, include:
@@ -461,12 +461,12 @@ If you want maximum flexibility without forking:
 ---
 
 ## License
-`<YOUR_LICENSE_HERE>`
+`<Copyright (c) 2025 Veldra>`
 
 ---
 
 ## Maintainer
 Veldra, ReserveGrid OS
-`<YOUR_NAME>`  
-`<YOUR_EMAIL>`  
-`<YOUR_SITE_OR_LINKEDIN>`
+`<Jarron Deng>`  
+`<jarrondeng@gmail.com>`  
+
