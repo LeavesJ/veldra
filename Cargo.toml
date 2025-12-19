@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+  "services/pool-verifier",
+  "services/template-manager",
+  "services/rg-protocol"
+  "services/sv2-bridge"
+]
