@@ -68,10 +68,8 @@ fn main() -> anyhow::Result<()> {
 
     // Mempool thresholds in number of transactions
     println!("\nDynamic fee tiers based on mempool size (in number of transactions)");
-    let low_mempool_tx = read_u64_with_default(
-        "Low mempool upper bound (tx_count <= low is low tier)",
-        500,
-    )?;
+    let low_mempool_tx =
+        read_u64_with_default("Low mempool upper bound (tx_count <= low is low tier)", 500)?;
     let high_mempool_tx = read_u64_with_default(
         "High mempool lower bound (tx_count >= high is high tier)",
         50_000,
@@ -79,18 +77,10 @@ fn main() -> anyhow::Result<()> {
 
     // Fee floors in sats per tx for each tier
     println!("\nMinimum average fee per transaction (sats per tx) for each tier");
-    let min_avg_fee_lo = read_u64_with_default(
-        "Low tier min average fee (0 recommended for regtest)",
-        0,
-    )?;
-    let min_avg_fee_mid = read_u64_with_default(
-        "Mid tier min average fee",
-        1_000,
-    )?;
-    let min_avg_fee_hi = read_u64_with_default(
-        "High tier min average fee",
-        5_000,
-    )?;
+    let min_avg_fee_lo =
+        read_u64_with_default("Low tier min average fee (0 recommended for regtest)", 0)?;
+    let min_avg_fee_mid = read_u64_with_default("Mid tier min average fee", 1_000)?;
+    let min_avg_fee_hi = read_u64_with_default("High tier min average fee", 5_000)?;
 
     // Build config
     let mut cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);

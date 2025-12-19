@@ -2,27 +2,29 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, Write};
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::state::{AppState, PolicyHolder, load_initial_policy};
+use crate::state::{AppState, load_initial_policy};
 
 use axum::{
+    Json, Router,
     extract::{Extension, State},
-    routing::{get, post},
+    http::StatusCode,
     response::{Html, IntoResponse},
-    Json,
-    Router,
+    routing::{get, post},
 };
-use axum::http::StatusCode;
 
-use serde::{Serialize, Deserialize};
+use axum::body::Bytes;
+
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
-use pool_verifier::policy::VerdictReason;
-use rg_protocol::{TemplatePropose, TemplateVerdict, PROTOCOL_VERSION};
+use pool_verifier::policy::{PolicyConfig, VerdictReason};
+use rg_protocol::{PROTOCOL_VERSION, TemplatePropose, TemplateVerdict};
 
 mod mempool_client;
 mod state;
@@ -56,11 +58,6 @@ struct StatsResponse {
 }
 
 #[derive(Deserialize)]
-struct PolicyForm {
-    policy_toml: String,
-}
-
-#[derive(Deserialize)]
 struct ApplyPolicyReq {
     low_mempool_tx: Option<u64>,
     high_mempool_tx: Option<u64>,
@@ -82,18 +79,16 @@ fn load_verdict_log() -> (VerdictLog, LogIdCounter) {
 
     if let Ok(file) = File::open(VERDICT_LOG_PATH) {
         let reader = StdBufReader::new(file);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
+        for line in reader.lines().map_while(Result::ok) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<LoggedVerdict>(line) {
+                if v.log_id > max_id {
+                    max_id = v.log_id;
                 }
-                if let Ok(v) = serde_json::from_str::<LoggedVerdict>(line) {
-                    if v.log_id > max_id {
-                        max_id = v.log_id;
-                    }
-                    list.push(v);
-                }
+                list.push(v);
             }
         }
     }
@@ -116,10 +111,9 @@ fn append_verdict_to_disk(v: &LoggedVerdict) {
         .create(true)
         .append(true)
         .open(VERDICT_LOG_PATH)
+        && let Ok(line) = serde_json::to_string(v)
     {
-        if let Ok(line) = serde_json::to_string(v) {
-            let _ = writeln!(file, "{}", line);
-        }
+        let _ = writeln!(file, "{}", line);
     }
 }
 
@@ -128,8 +122,7 @@ async fn main() -> anyhow::Result<()> {
     // addresses from env, with defaults
     let tcp_addr =
         env::var("VELDRA_VERIFIER_ADDR").unwrap_or_else(|_| "127.0.0.1:5001".to_string());
-    let http_addr =
-        env::var("VELDRA_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let http_addr = env::var("VELDRA_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
     // UI / mode label
     let ui_mode = env::var("VELDRA_DASH_MODE").unwrap_or_else(|_| "unknown".to_string());
@@ -138,10 +131,10 @@ async fn main() -> anyhow::Result<()> {
     let policy_path =
         env::var("VELDRA_POLICY_FILE").unwrap_or_else(|_| "config/policy.toml".to_string());
 
-        println!("Using policy file: {}", policy_path);
+    println!("Using policy file: {}", policy_path);
 
-    let policy_holder = load_initial_policy(&policy_path)
-        .expect("Failed to load or construct initial policy");
+    let policy_holder =
+        load_initial_policy(&policy_path).expect("Failed to load or construct initial policy");
 
     let app_state = AppState {
         policy: Arc::new(RwLock::new(policy_holder)),
@@ -181,7 +174,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-
     // HTTP server task
     let http_task = tokio::spawn(async move {
         if let Err(e) = run_http_server(http_addr, http_log, http_ui_mode, http_state).await {
@@ -189,7 +181,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    
     let _ = tokio::join!(tcp_task, http_task);
 
     Ok(())
@@ -244,7 +235,7 @@ async fn run_tcp_server(
                 };
 
                 // read live policy for each decision
-                                // Grab current policy snapshot
+                // Grab current policy snapshot
                 let cfg = {
                     let holder = state_clone.policy.read().unwrap();
                     holder.config.clone()
@@ -298,37 +289,37 @@ async fn run_tcp_server(
                 };
 
                 let verdict = TemplateVerdict {
-                version: PROTOCOL_VERSION,
-                id: propose.id,
-                accepted,
-                reason: reason_str.clone(),
+                    version: PROTOCOL_VERSION,
+                    id: propose.id,
+                    accepted,
+                    reason: reason_str.clone(),
                 };
 
                 let log_id = id_ctr.fetch_add(1, Ordering::Relaxed);
 
                 // build one LoggedVerdict
                 let logged = LoggedVerdict {
-                log_id,
-                template_id: propose.id,
-                height: propose.block_height,
-                total_fees: propose.total_fees,
-                tx_count: propose.tx_count,
-                accepted,
-                reason: reason_str,
-                timestamp: current_timestamp(),
-                min_avg_fee_used,
-                fee_tier: fee_tier.as_str().to_string(),
-                avg_fee_sats_per_tx: avg_fee,
+                    log_id,
+                    template_id: propose.id,
+                    height: propose.block_height,
+                    total_fees: propose.total_fees,
+                    tx_count: propose.tx_count,
+                    accepted,
+                    reason: reason_str,
+                    timestamp: current_timestamp(),
+                    min_avg_fee_used,
+                    fee_tier: fee_tier.as_str().to_string(),
+                    avg_fee_sats_per_tx: avg_fee,
                 };
 
-              {
-                let mut guard = log.lock().unwrap();
-                guard.push(logged.clone());
-                const MAX_LOG: usize = 1000;
-                if guard.len() > MAX_LOG {
-                    guard.remove(0);
+                {
+                    let mut guard = log.lock().unwrap();
+                    guard.push(logged.clone());
+                    const MAX_LOG: usize = 1000;
+                    if guard.len() > MAX_LOG {
+                        guard.remove(0);
+                    }
                 }
-              }
 
                 append_verdict_to_disk(&logged);
 
@@ -1481,15 +1472,16 @@ async fn run_http_server(
     app_state: AppState,
 ) -> anyhow::Result<()> {
     let app = Router::new()
-        .route("/",      get(ui_index))
-        .route("/ui",    get(ui_index))
+        .route("/", get(ui_index))
+        .route("/ui", get(ui_index))
         .route("/health", get(health_check))
-        .route("/verdicts",      get(get_verdicts))
-        .route("/verdicts/log",  get(get_verdict_log))
-        .route("/verdicts.csv",  get(get_verdicts_csv))
-        .route("/stats",  get(get_stats))
+        .route("/verdicts", get(get_verdicts))
+        .route("/verdicts/log", get(get_verdict_log))
+        .route("/verdicts.csv", get(get_verdicts_csv))
+        .route("/stats", get(get_stats))
         .route("/policy", get(get_policy))
         .route("/policy/apply", post(apply_policy))
+        .route("/policy/apply_toml", post(apply_policy_toml))
         .route("/mempool", get(get_mempool_proxy))
         .route("/meta", get(get_meta))
         .with_state(app_state.clone())
@@ -1516,11 +1508,7 @@ async fn get_verdict_log() -> impl IntoResponse {
         Ok(f) => f,
         Err(_) => {
             let body = "no verdicts yet\n".to_string();
-            return (
-                StatusCode::OK,
-                [("Content-Type", "text/plain")],
-                body,
-            );
+            return (StatusCode::OK, [("Content-Type", "text/plain")], body);
         }
     };
 
@@ -1528,11 +1516,9 @@ async fn get_verdict_log() -> impl IntoResponse {
 
     let mut out = String::new();
 
-    for line_res in reader.lines() {
-        if let Ok(line) = line_res {
-            out.push_str(&line);
-            out.push('\n');
-        }
+    for line in reader.lines().map_while(Result::ok) {
+        out.push_str(&line);
+        out.push('\n');
     }
 
     (
@@ -1542,9 +1528,7 @@ async fn get_verdict_log() -> impl IntoResponse {
     )
 }
 
-async fn get_verdicts_csv(
-    Extension(log): Extension<VerdictLog>,
-) -> impl IntoResponse {
+async fn get_verdicts_csv(Extension(log): Extension<VerdictLog>) -> impl IntoResponse {
     let log = log.lock().unwrap();
 
     let mut out = String::new();
@@ -1558,7 +1542,7 @@ async fn get_verdicts_csv(
         let escaped_reason = reason.replace('"', "\"\"");
 
         use std::fmt::Write as _;
-        let _ = write!(
+        let _ = writeln!(
             out,
             "{},{},{},{},{},{},{},{},{},\"{}\",{}\n",
             v.log_id,
@@ -1575,11 +1559,7 @@ async fn get_verdicts_csv(
         );
     }
 
-    (
-        StatusCode::OK,
-        [("Content-Type", "text/csv")],
-        out,
-    )
+    (StatusCode::OK, [("Content-Type", "text/csv")], out)
 }
 
 async fn apply_policy(
@@ -1594,13 +1574,27 @@ async fn apply_policy(
 
     // Apply changes to a local copy
     let mut cfg = base_cfg;
-    if let Some(v) = req.low_mempool_tx     { cfg.low_mempool_tx     = v; }
-    if let Some(v) = req.high_mempool_tx    { cfg.high_mempool_tx    = v; }
-    if let Some(v) = req.min_avg_fee_lo     { cfg.min_avg_fee_lo     = v; }
-    if let Some(v) = req.min_avg_fee_mid    { cfg.min_avg_fee_mid    = v; }
-    if let Some(v) = req.min_avg_fee_hi     { cfg.min_avg_fee_hi     = v; }
-    if let Some(v) = req.min_total_fees     { cfg.min_total_fees     = v; }
-    if let Some(v) = req.max_tx_count       { cfg.max_tx_count       = v; }
+    if let Some(v) = req.low_mempool_tx {
+        cfg.low_mempool_tx = v;
+    }
+    if let Some(v) = req.high_mempool_tx {
+        cfg.high_mempool_tx = v;
+    }
+    if let Some(v) = req.min_avg_fee_lo {
+        cfg.min_avg_fee_lo = v;
+    }
+    if let Some(v) = req.min_avg_fee_mid {
+        cfg.min_avg_fee_mid = v;
+    }
+    if let Some(v) = req.min_avg_fee_hi {
+        cfg.min_avg_fee_hi = v;
+    }
+    if let Some(v) = req.min_total_fees {
+        cfg.min_total_fees = v;
+    }
+    if let Some(v) = req.max_tx_count {
+        cfg.max_tx_count = v;
+    }
 
     // Validate before committing
     if let Err(e) = cfg.validate() {
@@ -1621,9 +1615,7 @@ async fn apply_policy(
     (StatusCode::OK, "ok".to_string())
 }
 
-async fn get_policy(
-    State(app_state): State<AppState>,
-) -> Json<serde_json::Value> {
+async fn get_policy(State(app_state): State<AppState>) -> Json<serde_json::Value> {
     let holder = app_state.policy.read().unwrap();
     let policy = &holder.config;
     let dbg = format!("{policy:?}");
@@ -1650,9 +1642,7 @@ async fn get_policy(
     Json(body)
 }
 
-async fn get_meta(
-    Extension(ui_mode): Extension<String>,
-) -> Json<serde_json::Value> {
+async fn get_meta(Extension(ui_mode): Extension<String>) -> Json<serde_json::Value> {
     let body = serde_json::json!({
         "mode": ui_mode,
     });
@@ -1670,17 +1660,15 @@ async fn get_mempool_proxy() -> Json<serde_json::Value> {
     };
 
     match reqwest::get(&url).await {
-        Ok(resp) => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => Json(json),
-                Err(e) => {
-                    let body = serde_json::json!({
-                        "error": format!("invalid mempool json: {e}")
-                    });
-                    Json(body)
-                }
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(json) => Json(json),
+            Err(e) => {
+                let body = serde_json::json!({
+                    "error": format!("invalid mempool json: {e}")
+                });
+                Json(body)
             }
-        }
+        },
         Err(e) => {
             let body = serde_json::json!({
                 "error": format!("mempool fetch failed: {e}")
@@ -1690,9 +1678,7 @@ async fn get_mempool_proxy() -> Json<serde_json::Value> {
     }
 }
 
-async fn get_stats(
-    Extension(log): Extension<VerdictLog>,
-) -> Json<StatsResponse> {
+async fn get_stats(Extension(log): Extension<VerdictLog>) -> Json<StatsResponse> {
     let log = log.lock().unwrap();
 
     let mut total = 0_u64;
@@ -1737,4 +1723,61 @@ fn current_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+async fn apply_policy_toml(State(app_state): State<AppState>, bytes: Bytes) -> impl IntoResponse {
+    let body = match std::str::from_utf8(&bytes) {
+        Ok(s) => s.to_string(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("body must be utf8 text: {}", e),
+                })),
+            );
+        }
+    };
+
+    // Parse TOML into PolicyConfig the same way your file loader does:
+    // the TOML shape is [policy] {...}
+    #[derive(Deserialize)]
+    struct Wrapper {
+        policy: PolicyConfig,
+    }
+
+    let parsed: Wrapper = match toml::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("toml parse failed: {}", e),
+                })),
+            );
+        }
+    };
+
+    if let Err(e) = parsed.policy.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": format!("policy validation failed: {:?}", e),
+            })),
+        );
+    }
+
+    {
+        let mut holder = match app_state.policy.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        holder.config = parsed.policy;
+        holder.toml_text = body;
+    }
+
+    (StatusCode::OK, Json(json!({ "ok": true })))
 }

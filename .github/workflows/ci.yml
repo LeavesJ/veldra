@@ -22,10 +22,10 @@ jobs:
           find . -maxdepth 3 -name Cargo.toml
 
       - name: fmt
-        run: cargo fmt --all --check --manifest-path services/Cargo.toml
+        run: cargo fmt --all --check
 
       - name: clippy
-        run: cargo clippy --all-targets --all-features -D warnings --manifest-path services/Cargo.toml
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: test
-        run: cargo test --all --manifest-path services/Cargo.toml
+        run: cargo test --all

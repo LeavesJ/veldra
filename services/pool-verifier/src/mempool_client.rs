@@ -1,5 +1,5 @@
-use std::time::Duration;
 use serde::Deserialize;
+use std::time::Duration;
 
 #[derive(Deserialize)]
 struct MempoolSnapshot {
@@ -13,12 +13,7 @@ pub fn mempool_url_from_env() -> Option<String> {
 pub async fn fetch_mempool_tx_count(url: &str) -> Option<u64> {
     let client = reqwest::Client::new();
 
-    let resp = match client
-        .get(url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-    {
+    let resp = match client.get(url).timeout(Duration::from_secs(2)).send().await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[mempool_client] HTTP error fetching {}: {e:?}", url);

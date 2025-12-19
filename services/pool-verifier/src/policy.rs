@@ -1,5 +1,5 @@
-use serde::{Serialize, Deserialize};
 use rg_protocol::TemplatePropose;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub enum FeeTier {
@@ -21,27 +21,12 @@ impl FeeTier {
 #[derive(Debug, Clone)]
 pub enum VerdictReason {
     Ok,
-    UnsupportedVersion {
-        got: u16,
-        expected: u16,
-    },
-    PrevHashWrongLen {
-        len: usize,
-        expected: usize,
-    },
+    UnsupportedVersion { got: u16, expected: u16 },
+    PrevHashWrongLen { len: usize, expected: usize },
     CoinbaseZero,
-    TotalFeesTooLow {
-        total: u64,
-        min_required: u64,
-    },
-    TooManyTransactions {
-        count: u32,
-        max_allowed: u32,
-    },
-    AverageFeeTooLow {
-        avg: u64,
-        min_required: u64,
-    },
+    TotalFeesTooLow { total: u64, min_required: u64 },
+    TooManyTransactions { count: u32, max_allowed: u32 },
+    AverageFeeTooLow { avg: u64, min_required: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,8 +57,8 @@ pub struct PolicyConfig {
 }
 
 fn default_reject_empty_templates() -> bool {
-        true  // or false if you want legacy behavior; I recommend true for safety
-    }
+    true // or false if you want legacy behavior; I recommend true for safety
+}
 
 impl PolicyConfig {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
@@ -102,7 +87,7 @@ impl PolicyConfig {
             min_avg_fee_hi: 2_000,
 
             max_weight_ratio: 0.999,
-            reject_empty_templates: true,   // make the dev default strict
+            reject_empty_templates: true, // make the dev default strict
         }
     }
 
@@ -150,10 +135,7 @@ impl PolicyConfig {
 
     /// Dynamic helper for TCP server and dashboard.
     /// Returns (floor, tier) based on mempool tx count.
-    pub fn effective_min_avg_fee_dynamic(
-        &self,
-        mempool_tx: Option<u64>,
-    ) -> (u64, FeeTier) {
+    pub fn effective_min_avg_fee_dynamic(&self, mempool_tx: Option<u64>) -> (u64, FeeTier) {
         let tx = mempool_tx.unwrap_or(0);
         if tx < self.low_mempool_tx {
             (self.min_avg_fee_lo, FeeTier::Low)

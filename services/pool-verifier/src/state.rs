@@ -26,7 +26,10 @@ pub fn load_initial_policy(path: &str) -> anyhow::Result<PolicyHolder> {
             let toml_text = std::fs::read_to_string(path)
                 .unwrap_or_else(|_| format!("# could not read {path}\n# {cfg:?}"));
 
-            Ok(PolicyHolder { config: cfg, toml_text })
+            Ok(PolicyHolder {
+                config: cfg,
+                toml_text,
+            })
         }
         Err(e) => {
             println!(
@@ -38,7 +41,10 @@ pub fn load_initial_policy(path: &str) -> anyhow::Result<PolicyHolder> {
                 anyhow::bail!("Default policy validation failed: {e:?}");
             }
             let toml_text = format!("# default policy\n# {cfg:?}");
-            Ok(PolicyHolder { config: cfg, toml_text })
+            Ok(PolicyHolder {
+                config: cfg,
+                toml_text,
+            })
         }
     }
 }

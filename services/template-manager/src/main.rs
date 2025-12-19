@@ -1,4 +1,8 @@
-use std::{env, sync::{Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    env,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -6,13 +10,11 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-use bitcoincore_rpc::{Auth, Client, RpcApi};
-use bitcoincore_rpc::json::{
-    GetBlockTemplateCapabilities,
-    GetBlockTemplateModes,
-    GetBlockTemplateRules,
-};
 use axum::{routing::get, Extension, Json, Router};
+use bitcoincore_rpc::json::{
+    GetBlockTemplateCapabilities, GetBlockTemplateModes, GetBlockTemplateRules,
+};
+use bitcoincore_rpc::{Auth, Client, RpcApi};
 use serde::Serialize;
 
 use rg_protocol::{TemplatePropose, TemplateVerdict, PROTOCOL_VERSION};
@@ -40,10 +42,7 @@ impl BitcoindTemplateSource {
             .rpc_url
             .clone()
             .unwrap_or_else(|| "http://127.0.0.1:18443".to_string());
-        let user = cfg
-            .rpc_user
-            .clone()
-            .unwrap_or_else(|| "veldra".to_string());
+        let user = cfg.rpc_user.clone().unwrap_or_else(|| "veldra".to_string());
         let pass = cfg
             .rpc_pass
             .clone()
@@ -73,15 +72,13 @@ impl TemplateSource for BitcoindTemplateSource {
                 Ok(t) => break Some(t),
                 Err(e) => {
                     attempts += 1;
-                    eprintln!(
-                        "[manager] get_block_template attempt {attempts} failed: {e:?}"
-                    );
+                    eprintln!("[manager] get_block_template attempt {attempts} failed: {e:?}");
 
                     if attempts >= 3 {
                         eprintln!(
                             "[manager] get_block_template giving up for this poll after {attempts} attempts (will retry next tick)"
                         );
-                        self.had_rpc_error = true;   
+                        self.had_rpc_error = true;
                         break None;
                     }
 
@@ -120,11 +117,7 @@ impl TemplateSource for BitcoindTemplateSource {
 
         let coinbase_value: u64 = tpl.coinbase_value.to_sat();
         let tx_count = tpl.transactions.len() as u32;
-        let total_fees: u64 = tpl
-            .transactions
-            .iter()
-            .map(|tx| tx.fee.to_sat())
-            .sum();
+        let total_fees: u64 = tpl.transactions.iter().map(|tx| tx.fee.to_sat()).sum();
 
         let proposal = TemplatePropose {
             version: PROTOCOL_VERSION,
@@ -256,8 +249,7 @@ type MempoolLog = Arc<Mutex<Option<MempoolStats>>>;
 #[tokio::main]
 async fn main() -> Result<()> {
     // manager config path
-    let cfg_path = env::var("VELDRA_MANAGER_CONFIG")
-        .unwrap_or_else(|_| "manager.toml".to_string());
+    let cfg_path = env::var("VELDRA_MANAGER_CONFIG").unwrap_or_else(|_| "manager.toml".to_string());
 
     let cfg = TemplateManagerConfig::from_path(&cfg_path)?;
     println!("Loaded manager config from {}: {:?}", cfg_path, cfg);
@@ -267,8 +259,8 @@ async fn main() -> Result<()> {
 
     let poll_secs: u64 = cfg.poll_interval_secs.unwrap_or(5);
 
-    let http_addr = env::var("VELDRA_MANAGER_HTTP_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8081".to_string());
+    let http_addr =
+        env::var("VELDRA_MANAGER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
 
     println!(
         "Template manager backend={} polling every {}s, sending to verifier {}, HTTP at {}",
@@ -280,7 +272,10 @@ async fn main() -> Result<()> {
         "bitcoind" => Box::new(BitcoindTemplateSource::from_config(&cfg)),
         "stratum" => Box::new(StratumTemplateSource::from_config(&cfg)),
         other => {
-            panic!("Unsupported backend {:?} (expected \"bitcoind\" or \"stratum\")", other);
+            panic!(
+                "Unsupported backend {:?} (expected \"bitcoind\" or \"stratum\")",
+                other
+            );
         }
     };
 
@@ -291,10 +286,7 @@ async fn main() -> Result<()> {
             .rpc_url
             .clone()
             .unwrap_or_else(|| "http://127.0.0.1:18443".to_string());
-        let user = cfg
-            .rpc_user
-            .clone()
-            .unwrap_or_else(|| "veldra".to_string());
+        let user = cfg.rpc_user.clone().unwrap_or_else(|| "veldra".to_string());
         let pass = cfg
             .rpc_pass
             .clone()
@@ -334,7 +326,6 @@ async fn main() -> Result<()> {
             eprintln!("manager loop error: {e:?}");
         }
     });
-
 
     let _ = tokio::join!(http_task, manager_task);
 
@@ -450,13 +441,10 @@ async fn run_manager_loop(
                 eprintln!("[manager] bitcoind_client is None while backend_name=bitcoind");
             }
 
-                sleep(Duration::from_secs(poll_secs)).await;
+            sleep(Duration::from_secs(poll_secs)).await;
         }
     }
 }
-
-
-
 
 async fn send_and_receive(mut stream: TcpStream, propose: &mut TemplatePropose) -> Result<()> {
     let (reader, mut writer) = stream.split();
@@ -513,16 +501,12 @@ async fn health_check() -> &'static str {
     "ok"
 }
 
-async fn get_templates(
-    Extension(log): Extension<TemplateLog>,
-) -> Json<Vec<LoggedTemplate>> {
+async fn get_templates(Extension(log): Extension<TemplateLog>) -> Json<Vec<LoggedTemplate>> {
     let log = log.lock().unwrap();
     Json(log.clone())
 }
 
-async fn get_mempool(
-    Extension(mem): Extension<MempoolLog>,
-) -> Json<MempoolStats> {
+async fn get_mempool(Extension(mem): Extension<MempoolLog>) -> Json<MempoolStats> {
     let mem = mem.lock().unwrap();
 
     let snapshot = mem.clone().unwrap_or_else(|| MempoolStats {

@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u16 = 1;
 
-
 /// Versioned template proposal from a Template Manager to a Pool Verifier.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TemplatePropose {
