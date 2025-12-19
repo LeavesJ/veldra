@@ -1,22 +1,37 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::sync::{Arc, Mutex};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader as StdBufReader, Write};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{extract::Extension, routing::get, Json, Router, response::Html};
-use serde::Serialize;
+use crate::state::{AppState, PolicyHolder, load_initial_policy};
+
+use axum::{
+    extract::{Extension, State},
+    routing::{get, post},
+    response::{Html, IntoResponse},
+    Json,
+    Router,
+};
+use axum::http::StatusCode;
+
+use serde::{Serialize, Deserialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
-use pool_verifier::policy::{PolicyConfig, VerdictReason};
+use pool_verifier::policy::VerdictReason;
 use rg_protocol::{TemplatePropose, TemplateVerdict, PROTOCOL_VERSION};
 
 mod mempool_client;
+mod state;
 use mempool_client::{fetch_mempool_tx_count, mempool_url_from_env};
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct LoggedVerdict {
-    pub id: u64,
+    pub log_id: u64,
+    pub template_id: u64,
     pub height: u32,
     pub total_fees: u64,
     pub tx_count: u32,
@@ -40,13 +55,71 @@ struct StatsResponse {
     last: Option<LoggedVerdict>,
 }
 
+#[derive(Deserialize)]
+struct PolicyForm {
+    policy_toml: String,
+}
+
+#[derive(Deserialize)]
+struct ApplyPolicyReq {
+    low_mempool_tx: Option<u64>,
+    high_mempool_tx: Option<u64>,
+    min_avg_fee_lo: Option<u64>,
+    min_avg_fee_mid: Option<u64>,
+    min_avg_fee_hi: Option<u64>,
+    min_total_fees: Option<u64>,
+    max_tx_count: Option<u32>,
+}
+
 type VerdictLog = Arc<Mutex<Vec<LoggedVerdict>>>;
+type LogIdCounter = Arc<AtomicU64>;
+
+const VERDICT_LOG_PATH: &str = "data/verdicts.log";
+
+fn load_verdict_log() -> (VerdictLog, LogIdCounter) {
+    let mut list = Vec::new();
+    let mut max_id = 0u64;
+
+    if let Ok(file) = File::open(VERDICT_LOG_PATH) {
+        let reader = StdBufReader::new(file);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<LoggedVerdict>(line) {
+                    if v.log_id > max_id {
+                        max_id = v.log_id;
+                    }
+                    list.push(v);
+                }
+            }
+        }
+    }
+
+    let log = Arc::new(Mutex::new(list));
+    let counter = Arc::new(AtomicU64::new(max_id + 1));
+    (log, counter)
+}
 
 fn compute_avg_fee_sats_per_tx(t: &TemplatePropose) -> u64 {
     if t.tx_count == 0 {
         0
     } else {
         t.total_fees / t.tx_count as u64
+    }
+}
+
+fn append_verdict_to_disk(v: &LoggedVerdict) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(VERDICT_LOG_PATH)
+    {
+        if let Ok(line) = serde_json::to_string(v) {
+            let _ = writeln!(file, "{}", line);
+        }
     }
 }
 
@@ -63,41 +136,31 @@ async fn main() -> anyhow::Result<()> {
 
     // load policy from file or default
     let policy_path =
-        env::var("VELDRA_POLICY_PATH").unwrap_or_else(|_| "policy.toml".to_string());
+        env::var("VELDRA_POLICY_FILE").unwrap_or_else(|_| "config/policy.toml".to_string());
 
-    println!("Using policy file: {}", policy_path);
+        println!("Using policy file: {}", policy_path);
 
-    let policy_cfg = match PolicyConfig::from_file(&policy_path) {
-        Ok(cfg) => {
-            println!("Loaded policy: {:?}", cfg);
-            if let Err(e) = cfg.validate() {
-                panic!("Policy validation failed: {e:?}");
-            }
-            cfg
-        }
-        Err(e) => {
-            println!(
-                "Failed to load policy at {} (using default_with_protocol): {e:?}",
-                policy_path
-            );
-            let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
-            if let Err(e) = cfg.validate() {
-                panic!("Default policy validation failed: {e:?}");
-            }
-            cfg
-        }
+    let policy_holder = load_initial_policy(&policy_path)
+        .expect("Failed to load or construct initial policy");
+
+    let app_state = AppState {
+        policy: Arc::new(RwLock::new(policy_holder)),
     };
 
-    println!("Effective policy: {:?}", policy_cfg);
-
     // shared in-memory log
-    let verdict_log: VerdictLog = Arc::new(Mutex::new(Vec::new()));
+    let (verdict_log, log_id_counter) = load_verdict_log();
+    println!(
+        "Loaded {} verdicts from disk, next log_id={}",
+        verdict_log.lock().unwrap().len(),
+        log_id_counter.load(Ordering::Relaxed)
+    );
 
-    let tcp_policy = policy_cfg.clone();
+    let tcp_state = app_state.clone();
     let tcp_log = verdict_log.clone();
+    let tcp_log_counter = log_id_counter.clone();
     let http_log = verdict_log.clone();
-    let http_policy = policy_cfg.clone();
     let http_ui_mode = ui_mode.clone();
+    let http_state = app_state.clone();
 
     // read mempool url once (template-manager /mempool endpoint)
     let mempool_url = mempool_url_from_env();
@@ -105,17 +168,27 @@ async fn main() -> anyhow::Result<()> {
 
     // TCP server task
     let tcp_task = tokio::spawn(async move {
-    if let Err(e) = run_tcp_server(tcp_policy, tcp_addr, tcp_log, tcp_mempool_url).await {
-        eprintln!("tcp server error: {e:?}");
+        if let Err(e) = run_tcp_server(
+            tcp_state,
+            tcp_addr,
+            tcp_log,
+            tcp_mempool_url,
+            tcp_log_counter,
+        )
+        .await
+        {
+            eprintln!("tcp server error: {e:?}");
         }
     });
 
+
     // HTTP server task
     let http_task = tokio::spawn(async move {
-    if let Err(e) = run_http_server(http_addr, http_log, http_policy, http_ui_mode).await {
-        eprintln!("http server error: {e:?}");
+        if let Err(e) = run_http_server(http_addr, http_log, http_ui_mode, http_state).await {
+            eprintln!("http server error: {e:?}");
         }
     });
+
     
     let _ = tokio::join!(tcp_task, http_task);
 
@@ -123,19 +196,21 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_tcp_server(
-    policy_cfg: PolicyConfig,
+    app_state: AppState,
     addr: String,
     verdict_log: VerdictLog,
     mempool_url: Option<String>,
+    log_id_counter: LogIdCounter,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("TCP listening on {}", addr);
 
     loop {
         let (stream, _peer) = listener.accept().await?;
-        let policy = policy_cfg.clone();
+        let state_clone = app_state.clone();
         let log = verdict_log.clone();
         let url_clone = mempool_url.clone();
+        let id_ctr = log_id_counter.clone();
 
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
@@ -168,20 +243,53 @@ async fn run_tcp_server(
                     None
                 };
 
+                // read live policy for each decision
+                                // Grab current policy snapshot
+                let cfg = {
+                    let holder = state_clone.policy.read().unwrap();
+                    holder.config.clone()
+                };
+
                 let (min_avg_fee_used, fee_tier) =
-                    policy.effective_min_avg_fee_dynamic(mempool_tx_count);
+                    cfg.effective_min_avg_fee_dynamic(mempool_tx_count);
 
                 let avg_fee = compute_avg_fee_sats_per_tx(&propose);
-                let accepted = avg_fee >= min_avg_fee_used;
 
-                let reason_enum = if accepted {
-                    VerdictReason::Ok
-                } else {
-                    VerdictReason::AverageFeeTooLow {
+                let mut accepted = true;
+                let mut reason_enum = VerdictReason::Ok;
+
+                // 0) reject empty templates if policy says so
+                if accepted && cfg.reject_empty_templates && propose.tx_count == 0 {
+                    accepted = false;
+                    reason_enum = VerdictReason::CoinbaseZero;
+                }
+
+                // 1) Global min_total_fees
+                if accepted && propose.total_fees < cfg.min_total_fees {
+                    accepted = false;
+                    reason_enum = VerdictReason::TotalFeesTooLow {
+                        total: propose.total_fees,
+                        min_required: cfg.min_total_fees,
+                    };
+                }
+
+                // 2) Max tx count
+                if accepted && (propose.tx_count as u32) > cfg.max_tx_count {
+                    accepted = false;
+                    reason_enum = VerdictReason::TooManyTransactions {
+                        count: propose.tx_count,
+                        max_allowed: cfg.max_tx_count,
+                    };
+                }
+
+                // 3) Tiered fee floor
+                if accepted && avg_fee < min_avg_fee_used {
+                    accepted = false;
+                    reason_enum = VerdictReason::AverageFeeTooLow {
                         avg: avg_fee,
                         min_required: min_avg_fee_used,
-                    }
-                };
+                    };
+                }
 
                 let reason_str = if matches!(reason_enum, VerdictReason::Ok) {
                     None
@@ -190,33 +298,39 @@ async fn run_tcp_server(
                 };
 
                 let verdict = TemplateVerdict {
-                    version: PROTOCOL_VERSION,
-                    id: propose.id,
-                    accepted,
-                    reason: reason_str.clone(),
+                version: PROTOCOL_VERSION,
+                id: propose.id,
+                accepted,
+                reason: reason_str.clone(),
                 };
 
-                {
-                    let mut guard = log.lock().unwrap();
-                    guard.push(LoggedVerdict {
-                        id: propose.id,
-                        height: propose.block_height,
-                        total_fees: propose.total_fees,
-                        tx_count: propose.tx_count,
-                        accepted,
-                        reason: reason_str,
-                        timestamp: current_timestamp(),
-                        min_avg_fee_used,
-                        fee_tier: fee_tier.as_str().to_string(), // enum → "low"/"mid"/"high"
-                        avg_fee_sats_per_tx: avg_fee,
-                    });
+                let log_id = id_ctr.fetch_add(1, Ordering::Relaxed);
 
-                    const MAX_LOG: usize = 1000;
-                    if guard.len() > MAX_LOG {
-                        let excess = guard.len() - MAX_LOG;
-                        guard.drain(0..excess);
-                    }
+                // build one LoggedVerdict
+                let logged = LoggedVerdict {
+                log_id,
+                template_id: propose.id,
+                height: propose.block_height,
+                total_fees: propose.total_fees,
+                tx_count: propose.tx_count,
+                accepted,
+                reason: reason_str,
+                timestamp: current_timestamp(),
+                min_avg_fee_used,
+                fee_tier: fee_tier.as_str().to_string(),
+                avg_fee_sats_per_tx: avg_fee,
+                };
+
+              {
+                let mut guard = log.lock().unwrap();
+                guard.push(logged.clone());
+                const MAX_LOG: usize = 1000;
+                if guard.len() > MAX_LOG {
+                    guard.remove(0);
                 }
+              }
+
+                append_verdict_to_disk(&logged);
 
                 let json = match serde_json::to_string(&verdict) {
                     Ok(j) => j,
@@ -255,6 +369,20 @@ static INDEX_HTML: &str = r##"<!doctype html>
     :root {
       color-scheme: dark;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    }
+      .recent-table td.num {
+      text-align: right;
+    }
+
+    .recent-table td.mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    .recent-table td.reason {
+      max-width: 380px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     body {
       margin: 0;
@@ -425,6 +553,96 @@ static INDEX_HTML: &str = r##"<!doctype html>
     border: 1px solid #444;
     background: #151515;
     }
+    .badge-click {
+      cursor: pointer;
+      user-select: none;
+    }
+    .badge-click:hover {
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.18);
+    }
+    .badge-download {
+      border-color: rgba(122, 162, 255, 0.9);
+      color: #e0e7ff;
+      background: radial-gradient(circle at top left,
+                                  rgba(122, 162, 255, 0.26),
+                                  rgba(122, 162, 255, 0.05));
+      box-shadow: 0 0 0 1px rgba(122, 162, 255, 0.45);
+    }
+
+    .badge-download:hover {
+      background: radial-gradient(circle at top left,
+                                  rgba(122, 162, 255, 0.35),
+                                  rgba(122, 162, 255, 0.10));
+      box-shadow: 0 0 14px rgba(122, 162, 255, 0.60);
+    }
+
+    a.badge-download,
+    a.badge-download:hover {
+      text-decoration: none;
+    }
+    .badge-wizard {
+      border-color: #ffb347;
+      color: #ffe3b3;
+      background: radial-gradient(circle at top left,
+                                  rgba(255, 179, 71, 0.22),
+                                  rgba(255, 179, 71, 0.04));
+      box-shadow: 0 0 0 1px rgba(255, 179, 71, 0.35);
+    }
+
+    .badge-wizard:hover {
+      background: radial-gradient(circle at top left,
+                                  rgba(255, 179, 71, 0.30),
+                                  rgba(255, 179, 71, 0.08));
+      box-shadow: 0 0 14px rgba(255, 179, 71, 0.55);
+    }
+  
+    #policy-debug {
+      background: rgba(5, 10, 40, 0.9);
+      border-radius: 10px;
+      padding: 8px 10px;
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+
+    .wizard-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px 14px;
+      margin-top: 6px;
+      margin-bottom: 8px;
+    }
+    .wizard-label {
+      font-size: 11px;
+      color: #9ba3b4;
+      margin-bottom: 2px;
+    }
+    .wizard-input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 4px 6px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(10,12,24,0.9);
+      color: #f5f5f5;
+      font-size: 12px;
+    }
+    .wizard-input:focus {
+      outline: none;
+      border-color: #7aa2ff;
+      box-shadow: 0 0 0 1px rgba(122,162,255,0.5);
+    }
+    .wizard-output {
+      width: 100%;
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(5,7,18,0.95);
+      color: #dfe3f0;
+      font-size: 11px;
+      resize: vertical;
+    }
+  
   </style>
 </head>
 <body>
@@ -434,9 +652,23 @@ static INDEX_HTML: &str = r##"<!doctype html>
         <h1>Veldra ReserveGrid OS</h1>
         <div class="subtitle">Pool verifier live view</div>
       </div>
+
       <div style="display:flex;align-items:center;gap:8px;">
+        <a href="/verdicts/log"
+          class="badge badge-download"
+          id="download-log-link">download log</a>
+
+        <a href="/verdicts.csv"
+          class="badge badge-download"
+          id="download-csv-link">download csv</a>
+
+        <button class="badge badge-click badge-wizard"
+                id="btn-open-wizard">open wizard</button>
+
         <div class="badge" id="badge-mode">mode: unknown</div>
-        <div class="status" id="status-line">Last update: <span>never</span></div>
+        <div class="status" id="status-line">
+          Last update: <span>never</span>
+        </div>
       </div>
     </header>
 
@@ -482,20 +714,25 @@ static INDEX_HTML: &str = r##"<!doctype html>
 
     <div class="grid-wide">
       <div class="card">
-        <h2>Recent templates <span class="badge">last 15</span></h2>
+        <h2>
+          Recent templates
+          <span class="badge badge-click" id="badge-last">last 0</span>
+          <span class="badge badge-click" id="badge-show-all">show all</span>
+        </h2>
         <table>
           <thead>
             <tr>
-              <th style="width:70px;">time</th>
-              <th style="width:60px;">id</th>
-              <th style="width:70px;">height</th>
-              <th style="width:70px;">tier</th>
-              <th style="width:80px;">decision</th>
+              <th style="width: 90px;">time</th>
+              <th style="width: 40px;">id</th>
+              <th style="width: 60px;">height</th>
+              <th style="width: 40px;">tier</th>
+              <th style="width: 50px;">ratio</th>
+              <th style="width: 70px;">decision</th>
               <th>reason</th>
             </tr>
           </thead>
           <tbody id="table-latest">
-            <tr><td class="muted" colspan="6">no verdicts yet</td></tr>
+            <tr><td class="muted" colspan="7">no verdicts yet</td></tr>
           </tbody>
         </table>
       </div>
@@ -533,12 +770,227 @@ static INDEX_HTML: &str = r##"<!doctype html>
         </div>
       </div>
     </div>
+
+        <div class="card" style="margin-top:16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <h2 style="margin:0;">Policy wizard</h2>
+            <button id="btn-open-wizard-footer" class="badge badge-click badge-wizard">
+              open wizard
+            </button>
+          </div>
+
+          <p class="metric-sub">
+            Tweak fee tiers and mempool thresholds, then export a suggested
+            <code>policy.toml</code> to paste into your config.
+          </p>
+
+          <div id="wizard-panel" style="display:none;margin-top:10px;">
+            <div class="wizard-grid">
+              <div>
+                <div class="wizard-label">Low tier mempool &lt; tx</div>
+                <input id="wiz-low-mempool" class="wizard-input" type="number" min="0" />
+              </div>
+              <div>
+                <div class="wizard-label">High tier mempool ≥ tx</div>
+                <input id="wiz-high-mempool" class="wizard-input" type="number" min="0" />
+              </div>
+              <div>
+                <div class="wizard-label">Low tier floor sats/tx</div>
+                <input id="wiz-fee-lo" class="wizard-input" type="number" min="0" />
+              </div>
+              <div>
+                <div class="wizard-label">Mid tier floor sats/tx</div>
+                <input id="wiz-fee-mid" class="wizard-input" type="number" min="0" />
+              </div>
+              <div>
+                <div class="wizard-label">High tier floor sats/tx</div>
+                <input id="wiz-fee-hi" class="wizard-input" type="number" min="0" />
+              </div>
+              <div>
+                <div class="wizard-label">Min total fees sats</div>
+                <input id="wiz-min-total" class="wizard-input" type="number" min="0" />
+              </div>
+              <div>
+                <div class="wizard-label">Max tx count</div>
+                <input id="wiz-max-tx" class="wizard-input" type="number" min="0" />
+              </div>
+            </div>
+
+            <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+              <button id="btn-generate-toml" class="badge badge-click">
+                generate policy.toml
+              </button>
+              <span class="metric-sub" id="wizard-status"></span>
+            </div>
+
+            <textarea id="wizard-output"
+                      class="wizard-output mono"
+                      rows="8"
+                      readonly
+                      placeholder="Generated policy.toml will appear here..."></textarea>
+        </div>
+      </div>
   </div>
 
   <script>
+    const LATEST_LIMIT = 15;  // size of "last N" window
+    let latestMode = "last";
+    let showAllLog = false;
+    let latestVerdicts = [];
+    let wizardDirty = false;
     function setText(id, text) {
       var el = document.getElementById(id);
       if (el) el.textContent = text;
+    }
+
+    // shared wizard state for both buttons
+    var wizardOpen = false;
+
+    function setWizardOpen(open) {
+      wizardOpen = !!open;
+
+      var panel    = document.getElementById("wizard-panel");
+      var btnTop   = document.getElementById("btn-open-wizard");
+      var btnBottom = document.getElementById("btn-open-wizard-footer");
+
+      if (panel) {
+        panel.style.display = wizardOpen ? "block" : "none";
+      }
+
+      var label = wizardOpen ? "close wizard" : "open wizard";
+      if (btnTop)    btnTop.textContent = label;
+      if (btnBottom) btnBottom.textContent = label;
+    }
+
+    function setupWizard() {
+      var btnTop    = document.getElementById("btn-open-wizard");
+      var btnBottom = document.getElementById("btn-open-wizard-footer");
+      var panel     = document.getElementById("wizard-panel");
+      if (!panel) return;
+
+      function toggle() {
+        setWizardOpen(!wizardOpen);
+      }
+
+      if (btnTop) {
+        btnTop.addEventListener("click", toggle);
+      }
+      if (btnBottom) {
+        btnBottom.addEventListener("click", toggle);
+      }
+
+      var wizardIds = [
+        "wiz-low-mempool",
+        "wiz-high-mempool",
+        "wiz-fee-lo",
+        "wiz-fee-mid",
+        "wiz-fee-hi",
+        "wiz-min-total",
+        "wiz-max-tx",
+      ];
+
+      wizardIds.forEach(function (id) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener("input", function () {
+          wizardDirty = true;
+        });
+      });
+
+      // generate button stays as before
+      var gen = document.getElementById("btn-generate-toml");
+      if (gen) {
+        gen.addEventListener("click", generateTomlFromWizard);
+      }
+
+      // start closed with consistent labels
+      setWizardOpen(false);
+    }
+
+    function populateWizardFromPolicy(policy) {
+      // once user touches the wizard, do not auto overwrite their inputs
+      if (wizardDirty) return;
+      if (!policy) return;
+
+      function setVal(id, value) {
+        var el = document.getElementById(id);
+        if (el && value !== undefined && value !== null) {
+          el.value = value;
+        }
+      }
+      setVal("wiz-low-mempool", policy.low_mempool_tx);
+      setVal("wiz-high-mempool", policy.high_mempool_tx);
+      setVal("wiz-fee-lo",      policy.min_avg_fee_lo);
+      setVal("wiz-fee-mid",     policy.min_avg_fee_mid);
+      setVal("wiz-fee-hi",      policy.min_avg_fee_hi);
+      setVal("wiz-min-total",   policy.min_total_fees);
+      setVal("wiz-max-tx",      policy.max_tx_count);
+    }
+
+    function generateTomlFromWizard() {
+      function getNum(id) {
+        var el = document.getElementById(id);
+        if (!el) return null;
+        var v = el.value.trim();
+        return v === "" ? null : Number(v);
+      }
+
+      var low   = getNum("wiz-low-mempool");
+      var high  = getNum("wiz-high-mempool");
+      var flo   = getNum("wiz-fee-lo");
+      var fmid  = getNum("wiz-fee-mid");
+      var fhi   = getNum("wiz-fee-hi");
+      var minT  = getNum("wiz-min-total");
+      var maxTx = getNum("wiz-max-tx");
+
+      // Build TOML text just for display / copy
+      var lines = [];
+      lines.push("# Generated by Veldra dashboard wizard");
+      lines.push("[policy]");
+      if (low  != null)   lines.push("low_mempool_tx = "   + low);
+      if (high != null)   lines.push("high_mempool_tx = "  + high);
+      if (flo  != null)   lines.push("min_avg_fee_lo = "   + flo);
+      if (fmid != null)   lines.push("min_avg_fee_mid = "  + fmid);
+      if (fhi  != null)   lines.push("min_avg_fee_hi = "   + fhi);
+      if (minT != null)   lines.push("min_total_fees = "   + minT);
+      if (maxTx != null)  lines.push("max_tx_count = "     + maxTx);
+
+      var toml = lines.join("\n");
+
+      var out = document.getElementById("wizard-output");
+      var status = document.getElementById("wizard-status");
+      if (out) out.value = toml;
+      if (status) status.textContent = "applying...";
+
+      // Send JSON numbers to backend; backend mutates PolicyConfig directly
+      fetch("/policy/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          low_mempool_tx:   low,
+          high_mempool_tx:  high,
+          min_avg_fee_lo:   flo,
+          min_avg_fee_mid:  fmid,
+          min_avg_fee_hi:   fhi,
+          min_total_fees:   minT,
+          max_tx_count:     maxTx,
+        }),
+      })
+        .then(function (res) {
+          return res.text().then(function (text) {
+            if (res.ok) {
+              // backend accepted and validated the new config
+              wizardDirty = false; // allow next /policy to repopulate debug, etc.
+              if (status) status.textContent = "policy applied";
+            } else {
+              if (status) status.textContent = "error: " + text;
+            }
+          });
+        })
+        .catch(function (err) {
+          console.error("apply policy failed", err);
+          if (status) status.textContent = "network error";
+        });
     }
 
     function renderTable(targetId, map, emptyText) {
@@ -610,12 +1062,12 @@ static INDEX_HTML: &str = r##"<!doctype html>
     function renderLatest(verdicts) {
       var tbody = document.getElementById("table-latest");
       if (!tbody) return;
-      while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+      tbody.innerHTML = "";
 
       if (!Array.isArray(verdicts) || verdicts.length === 0) {
         var tr = document.createElement("tr");
         var td = document.createElement("td");
-        td.colSpan = 6;
+        td.colSpan = 7;
         td.textContent = "no verdicts yet";
         td.className = "muted";
         tr.appendChild(td);
@@ -623,7 +1075,7 @@ static INDEX_HTML: &str = r##"<!doctype html>
         return;
       }
 
-      verdicts.forEach(function(v) {
+      verdicts.forEach(function (v) {
         var tr = document.createElement("tr");
 
         var tdTime = document.createElement("td");
@@ -631,7 +1083,7 @@ static INDEX_HTML: &str = r##"<!doctype html>
         tdTime.className = "mono";
 
         var tdId = document.createElement("td");
-        tdId.textContent = v.id;
+        tdId.textContent = v.log_id ?? "";
         tdId.className = "mono";
 
         var tdHeight = document.createElement("td");
@@ -642,18 +1094,32 @@ static INDEX_HTML: &str = r##"<!doctype html>
         tdTier.textContent = v.fee_tier || "";
         tdTier.className = "mono";
 
+        var tdRatio = document.createElement("td");
+        var ratioText;
+
+        if (typeof v.min_avg_fee_used === "number" && v.min_avg_fee_used > 0) {
+          var ratio = v.avg_fee_sats_per_tx / v.min_avg_fee_used;
+          ratioText = ratio.toFixed(2);
+        } else {
+          ratioText = "n/a";  // or "∞", or leave blank
+        }
+
+        tdRatio.textContent = ratioText;
+        tdRatio.className = "mono";
+
         var tdDecision = document.createElement("td");
         tdDecision.textContent = v.accepted ? "accepted" : "rejected";
         tdDecision.className = v.accepted ? "tag-accepted" : "tag-rejected";
 
         var tdReason = document.createElement("td");
         tdReason.textContent = v.reason || "Ok";
-        tdReason.className = v.reason ? "reason-cell" : "muted";
+        tdReason.className = v.reason ? "" : "muted";
 
         tr.appendChild(tdTime);
         tr.appendChild(tdId);
         tr.appendChild(tdHeight);
         tr.appendChild(tdTier);
+        tr.appendChild(tdRatio);
         tr.appendChild(tdDecision);
         tr.appendChild(tdReason);
 
@@ -679,7 +1145,26 @@ static INDEX_HTML: &str = r##"<!doctype html>
 
         const data     = await resStats.json();
         const verdicts = await resVerdicts.json();
+        latestVerdicts = Array.isArray(verdicts) ? verdicts.slice() : [];
+
+        const slice = showAllLog
+          ? latestVerdicts.slice().reverse()            // all
+          : latestVerdicts.slice(-LATEST_LIMIT).reverse(); // last N
+
+        // update the "last X" badge text on every refresh
+        const lastBadge = document.getElementById("badge-last");
+        if (lastBadge) {
+          // cap at LATEST_LIMIT regardless of showAllLog
+          const count = Math.min(LATEST_LIMIT, latestVerdicts.length);
+          lastBadge.textContent = "last " + count;
+        }
+
+        // render the table rows
+        renderLatest(slice);
+
         const policy   = await resPolicy.json();
+
+        populateWizardFromPolicy(policy);
 
         let mempool = null;
         if (resMempool.ok) {
@@ -719,10 +1204,7 @@ static INDEX_HTML: &str = r##"<!doctype html>
         renderTable("table-tiers",   byTier,   "no tiers yet");
         renderPillsForTiers(byTier);
 
-        // recent 15 templates, newest first
-        const latest = Array.isArray(verdicts) ? verdicts.slice(-15).reverse() : [];
-        renderLatest(latest);  
-
+    
         // ---------- latest verdict card ----------
         if (last) {
         const labelTier = last.fee_tier || "unknown";
@@ -741,7 +1223,7 @@ static INDEX_HTML: &str = r##"<!doctype html>
             resultElem.style.color = last.accepted ? "#9ff6d7" : "#ffd3dd";
         }
 
-        setText("pill-latest-id",     "id "     + last.id);
+        setText("pill-latest-id", "id " + (last.log_id ?? ""));
         setText("pill-latest-height", "height " + last.height);
 
         const avgFeeLine =
@@ -771,18 +1253,75 @@ static INDEX_HTML: &str = r##"<!doctype html>
             const lines = [];
 
             if (typeof lo === "number" && typeof hi === "number") {
-            lines.push("Tier logic (by mempool tx count):");
-            lines.push("  low:  mempool < " + lo + " tx  → floor " + flo  + " sats/tx");
-            lines.push("  mid:  " + lo + " ≤ mempool < " + hi + " tx  → floor " + fmid + " sats/tx");
-            lines.push("  high: mempool ≥ " + hi + " tx  → floor " + fhi  + " sats/tx");
+              const rows = [
+                {
+                  tier: "low",
+                  window: "mempool < " + lo + " tx",
+                  floor: "floor " + flo + " sats/tx",
+                },
+                {
+                  tier: "mid",
+                  window: lo + " ≤ mempool < " + hi + " tx",
+                  floor: "floor " + fmid + " sats/tx",
+                },
+                {
+                  tier: "high",
+                  window: "mempool ≥ " + hi + " tx",
+                  floor: "floor " + fhi + " sats/tx",
+                },
+              ];
+
+              function pad(str, width) {
+                return str + " ".repeat(Math.max(0, width - str.length));
+              }
+
+              const col1 = Math.max("tier".length, ...rows.map(r => r.tier.length));
+              const col2 = Math.max("window".length, ...rows.map(r => r.window.length));
+              const col3 = Math.max("floor".length, ...rows.map(r => r.floor.length));
+
+              lines.push("Tier logic (by mempool tx count)");
+              lines.push("");
+              lines.push(
+                "  " +
+                  pad("tier", col1) +
+                  "   " +
+                  pad("window", col2) +
+                  "   " +
+                  pad("floor", col3)
+              );
+              lines.push(
+                "  " +
+                  "-".repeat(col1) +
+                  "   " +
+                  "-".repeat(col2) +
+                  "   " +
+                  "-".repeat(col3)
+              );
+
+              rows.forEach(r => {
+                lines.push(
+                  "  " +
+                    pad(r.tier, col1) +
+                    "   " +
+                    pad(r.window, col2) +
+                    "   " +
+                    pad(r.floor, col3)
+                );
+              });
             }
 
             if (typeof policy.min_total_fees === "number") {
-            lines.push("");
-            lines.push(
-                "Other constraints: min_total_fees = " + policy.min_total_fees +
-                " sats, max_tx_count = " + policy.max_tx_count
-            );
+              lines.push("");
+              lines.push("Other constraints");
+              lines.push(
+                "  min_total_fees = " +
+                  policy.min_total_fees +
+                  " sats"
+              );
+              lines.push(
+                "  max_tx_count   = " +
+                  policy.max_tx_count
+              );
             }
 
             if (lines.length === 0 && typeof policy.debug === "string") {
@@ -873,13 +1412,59 @@ static INDEX_HTML: &str = r##"<!doctype html>
         status.innerHTML = "Last update: <span>error</span>";
         }
         console.error("refresh failed", err);
-    }
-}
+      }
+  }
 
-    document.addEventListener("DOMContentLoaded", function() {
+    function updateLogModeBadge() {
+      const badge = document.getElementById("badge-log-mode");
+      if (!badge) return;
+      if (showAllLog) {
+        badge.textContent = "showing all";
+      } else {
+        const n = latestVerdicts.length;
+        const label = n <= 15 ? "last " + n : "last 15";
+        badge.textContent = label;
+      }
+    }
+
+    function toggleLogMode() {
+      showAllLog = !showAllLog;
+      const btn = document.getElementById("btn-toggle-log");
+      if (btn) {
+        btn.textContent = showAllLog ? "show last 15" : "show all";
+      }
+
+      const slice = showAllLog
+        ? latestVerdicts.slice().reverse()
+        : latestVerdicts.slice(-15).reverse();
+
+      renderLatest(slice);
+      updateLogModeBadge();
+    }
+
+    document.addEventListener("DOMContentLoaded", function () {
+      const badgeLast     = document.getElementById("badge-last");
+      const badgeShowAll  = document.getElementById("badge-show-all");
+
+      if (badgeLast) {
+        badgeLast.addEventListener("click", function () {
+          showAllLog = false;
+          refresh();
+        });
+      }
+
+      if (badgeShowAll) {
+        badgeShowAll.addEventListener("click", function () {
+          showAllLog = true;
+          refresh();
+        });
+      }
+
+      setupWizard();
       refresh();
       setInterval(refresh, 3000);
     });
+
   </script>
 </body>
 </html>
@@ -892,20 +1477,23 @@ async fn ui_index() -> Html<&'static str> {
 async fn run_http_server(
     bind_addr: String,
     verdict_log: VerdictLog,
-    policy_cfg: PolicyConfig,
     ui_mode: String,
+    app_state: AppState,
 ) -> anyhow::Result<()> {
     let app = Router::new()
-        .route("/", get(ui_index))
-        .route("/ui", get(ui_index))
+        .route("/",      get(ui_index))
+        .route("/ui",    get(ui_index))
         .route("/health", get(health_check))
-        .route("/verdicts", get(get_verdicts))
-        .route("/stats", get(get_stats))
+        .route("/verdicts",      get(get_verdicts))
+        .route("/verdicts/log",  get(get_verdict_log))
+        .route("/verdicts.csv",  get(get_verdicts_csv))
+        .route("/stats",  get(get_stats))
         .route("/policy", get(get_policy))
+        .route("/policy/apply", post(apply_policy))
         .route("/mempool", get(get_mempool_proxy))
         .route("/meta", get(get_meta))
+        .with_state(app_state.clone())
         .layer(Extension(verdict_log))
-        .layer(Extension(policy_cfg))
         .layer(Extension(ui_mode));
 
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -923,9 +1511,121 @@ async fn get_verdicts(Extension(log): Extension<VerdictLog>) -> Json<Vec<LoggedV
     Json(log.clone())
 }
 
+async fn get_verdict_log() -> impl IntoResponse {
+    let file = match File::open(VERDICT_LOG_PATH) {
+        Ok(f) => f,
+        Err(_) => {
+            let body = "no verdicts yet\n".to_string();
+            return (
+                StatusCode::OK,
+                [("Content-Type", "text/plain")],
+                body,
+            );
+        }
+    };
+
+    let reader = StdBufReader::new(file);
+
+    let mut out = String::new();
+
+    for line_res in reader.lines() {
+        if let Ok(line) = line_res {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    (
+        StatusCode::OK,
+        [("Content-Type", "application/x-ndjson")],
+        out,
+    )
+}
+
+async fn get_verdicts_csv(
+    Extension(log): Extension<VerdictLog>,
+) -> impl IntoResponse {
+    let log = log.lock().unwrap();
+
+    let mut out = String::new();
+
+    // header
+    out.push_str("log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,min_avg_fee_used,avg_fee_sats_per_tx,reason,timestamp\n");
+
+    for v in log.iter() {
+        let reason = v.reason.as_deref().unwrap_or("Ok");
+        // escape double quotes in reason and wrap in quotes
+        let escaped_reason = reason.replace('"', "\"\"");
+
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            "{},{},{},{},{},{},{},{},{},\"{}\",{}\n",
+            v.log_id,
+            v.template_id,
+            v.height,
+            v.total_fees,
+            v.tx_count,
+            v.accepted,
+            v.fee_tier,
+            v.min_avg_fee_used,
+            v.avg_fee_sats_per_tx,
+            escaped_reason,
+            v.timestamp,
+        );
+    }
+
+    (
+        StatusCode::OK,
+        [("Content-Type", "text/csv")],
+        out,
+    )
+}
+
+async fn apply_policy(
+    State(app_state): State<AppState>,
+    Json(req): Json<ApplyPolicyReq>,
+) -> impl IntoResponse {
+    // Start from current config
+    let base_cfg = {
+        let holder = app_state.policy.read().unwrap();
+        holder.config.clone()
+    };
+
+    // Apply changes to a local copy
+    let mut cfg = base_cfg;
+    if let Some(v) = req.low_mempool_tx     { cfg.low_mempool_tx     = v; }
+    if let Some(v) = req.high_mempool_tx    { cfg.high_mempool_tx    = v; }
+    if let Some(v) = req.min_avg_fee_lo     { cfg.min_avg_fee_lo     = v; }
+    if let Some(v) = req.min_avg_fee_mid    { cfg.min_avg_fee_mid    = v; }
+    if let Some(v) = req.min_avg_fee_hi     { cfg.min_avg_fee_hi     = v; }
+    if let Some(v) = req.min_total_fees     { cfg.min_total_fees     = v; }
+    if let Some(v) = req.max_tx_count       { cfg.max_tx_count       = v; }
+
+    // Validate before committing
+    if let Err(e) = cfg.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("policy validation failed: {e:?}"),
+        );
+    }
+
+    // Commit into AppState
+    {
+        let mut holder = app_state.policy.write().unwrap();
+        holder.config = cfg;
+        // Best effort debug text (you can improve this later if you care about exact TOML)
+        holder.toml_text = format!("# updated via wizard\n# {:#?}", holder.config);
+    }
+
+    (StatusCode::OK, "ok".to_string())
+}
+
 async fn get_policy(
-    Extension(policy): Extension<PolicyConfig>,
+    State(app_state): State<AppState>,
 ) -> Json<serde_json::Value> {
+    let holder = app_state.policy.read().unwrap();
+    let policy = &holder.config;
     let dbg = format!("{policy:?}");
 
     let body = serde_json::json!({
@@ -940,6 +1640,9 @@ async fn get_policy(
         "min_avg_fee_lo": policy.min_avg_fee_lo,
         "min_avg_fee_mid": policy.min_avg_fee_mid,
         "min_avg_fee_hi": policy.min_avg_fee_hi,
+
+        "max_weight_ratio": policy.max_weight_ratio,
+        "reject_empty_templates": policy.reject_empty_templates,
 
         "debug": dbg
     });
@@ -1028,7 +1731,6 @@ async fn get_stats(
         last,
     })
 }
-
 
 fn current_timestamp() -> u64 {
     SystemTime::now()

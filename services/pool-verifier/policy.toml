@@ -1,3 +1,4 @@
+[policy]
 protocol_version = 1
 required_prevhash_len = 64
 min_total_fees = 0
@@ -10,3 +11,7 @@ tx_count_hi_threshold = 50
 min_avg_fee_lo = 0
 min_avg_fee_mid = 0
 min_avg_fee_hi = 0
+
+[policy.safety]
+max_weight_ratio = 0.999
+reject_empty_templates = true

@@ -1,0 +1,20 @@
+[policy]
+name        = "regtest-default"
+description = "Baseline dynamic fee tier policy for Veldra regtest"
+mode        = "regtest"
+
+[policy.fee_tiers]
+# sats per vbyte
+min_avg_fee_lo  = 1.0
+min_avg_fee_mid = 5.0
+min_avg_fee_hi  = 15.0
+
+[policy.mempool_tiers]
+# tx counts that control which tier is active
+lo_max_txs  = 5_000
+mid_max_txs = 50_000
+
+[policy.safety]
+# fraction of max block weight you allow
+max_weight_ratio       = 0.999
+reject_empty_templates = true

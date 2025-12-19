@@ -62,7 +62,18 @@ pub struct PolicyConfig {
     pub min_avg_fee_lo: u64,
     pub min_avg_fee_mid: u64,
     pub min_avg_fee_hi: u64,
+
+    // safety
+    pub max_weight_ratio: f64,
+
+    // NEW
+    #[serde(default = "default_reject_empty_templates")]
+    pub reject_empty_templates: bool,
 }
+
+fn default_reject_empty_templates() -> bool {
+        true  // or false if you want legacy behavior; I recommend true for safety
+    }
 
 impl PolicyConfig {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
@@ -89,6 +100,9 @@ impl PolicyConfig {
             min_avg_fee_lo: 0,
             min_avg_fee_mid: 500,
             min_avg_fee_hi: 2_000,
+
+            max_weight_ratio: 0.999,
+            reject_empty_templates: true,   // make the dev default strict
         }
     }
 

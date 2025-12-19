@@ -10,6 +10,8 @@ set -euo pipefail
 ########################################################################
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BTC_CLI="${ROOT_DIR}/scripts/dev-bitcoin-cli.sh"
 
 BITCOIN_PID=""
 VERIFIER_PID=""
@@ -42,6 +44,7 @@ echo "[dev-regtest] ROOT_DIR = ${ROOT_DIR}"
 # 1. start bitcoind on regtest
 ########################################
 echo "[dev-regtest] starting bitcoind (regtest)..."
+echo "[dev-regtest] starting bitcoind (regtest)..."
 bitcoind -regtest \
   -daemon \
   -server=1 \
@@ -50,7 +53,9 @@ bitcoind -regtest \
   -rpcport=18443 \
   -fallbackfee=0.0001 \
   -maxmempool=300 \
+  -deprecatedrpc=settxfee \
   >/dev/null 2>&1 || true
+
 
 sleep 2
 
@@ -85,11 +90,14 @@ echo "[dev-regtest] starting pool-verifier..."
 (
   cd "${ROOT_DIR}/services/pool-verifier"
 
+  mkdir -p data
+
   export VELDRA_HTTP_ADDR="127.0.0.1:8080"
   export VELDRA_VERIFIER_ADDR="127.0.0.1:5001"
   export VELDRA_POLICY_PATH="${ROOT_DIR}/services/pool-verifier/policy.toml"
   export VELDRA_MEMPOOL_URL="http://127.0.0.1:8081/mempool"
   export VELDRA_DASH_MODE="regtest-bitcoind"
+  export VELDRA_POLICY_FILE="${ROOT_DIR}/config/beta-policy.toml"
 
   exec ./target/debug/pool-verifier
 ) &
@@ -122,6 +130,40 @@ echo "[dev-regtest] template-manager pid = ${MANAGER_PID}"
 echo "[dev-regtest] HTTP: verifier 127.0.0.1:8080, manager 127.0.0.1:8081"
 
 echo "[dev-regtest] services running. Ctrl+C to stop."
+
+########################################
+echo "[dev-regtest] funding wallet if needed..."
+ADDR="$(${BTC_CLI} getnewaddress)"
+${BTC_CLI} generatetoaddress 101 "$ADDR" >/dev/null
+
+low_fee_batch() {
+  echo "[dev-regtest] creating low fee tx batch..."
+  for i in {1..5}; do
+    TO="$(${BTC_CLI} getnewaddress)"
+    ${BTC_CLI} sendtoaddress "$TO" 1.0 >/dev/null
+  done
+  ${BTC_CLI} generatetoaddress 1 "$ADDR" >/dev/null
+}
+
+high_fee_batch() {
+  echo "[dev-regtest] creating high fee tx batch..."
+  ${BTC_CLI} settxfee 0.01 >/dev/null
+  for i in {1..10}; do
+    TO="$(${BTC_CLI} getnewaddress)"
+    ${BTC_CLI} sendtoaddress "$TO" 0.5 >/dev/null
+  done
+  ${BTC_CLI} settxfee 0 >/dev/null
+  ${BTC_CLI} generatetoaddress 1 "$ADDR" >/dev/null
+}
+
+echo "[dev-regtest] running fee pattern..."
+while true; do 
+  low_fee_batch
+  sleep 1
+  high_fee_batch
+  sleep 1
+done
+
 
 ########################################
 # 5. block until Ctrl+C

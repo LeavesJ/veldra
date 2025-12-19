@@ -1,0 +1,14 @@
+# Rust
+target/
+**/target/
+
+# macOS
+.DS_Store
+
+# Local data / logs
+services/pool-verifier/data/
+data/
+*.log
+
+# Regtest/bitcoin data if you have any local dirs
+.*/ 

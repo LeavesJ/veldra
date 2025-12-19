@@ -1,0 +1,15 @@
+protocol_version = 1
+required_prevhash_len = 64
+min_total_fees = 0
+max_tx_count = 100
+min_avg_fee = 0
+
+low_mempool_tx  = 0
+high_mempool_tx = 50
+
+tx_count_mid_threshold = 10
+tx_count_hi_threshold  = 50
+
+min_avg_fee_lo  = 1
+min_avg_fee_mid = 2000
+min_avg_fee_hi  = 5000
