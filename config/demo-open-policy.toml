@@ -1,0 +1,19 @@
+[policy]
+protocol_version = 1
+required_prevhash_len = 64
+
+# required by PolicyConfig
+min_avg_fee = 0
+tx_count_mid_threshold = 0
+tx_count_hi_threshold  = 50
+
+reject_empty_templates = false
+min_total_fees = 0
+max_tx_count = 10000
+
+min_avg_fee_lo  = 0
+min_avg_fee_mid = 0
+min_avg_fee_hi  = 0
+
+low_mempool_tx  = 0
+high_mempool_tx = 50
