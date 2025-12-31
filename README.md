@@ -7,7 +7,7 @@ This repo is a **beta prototype** intended to be legible, testable, and easy for
 ---
 
 ## Demo and repo links
-- **Repo:** `<>`
+- **Repo:** `<https://github.com/LeavesJ/veldra>`
 - **Demo (dashboard video or live):** `<>`
 - **Contact:** `<jarrondeng@gmail.com>`
 
@@ -461,7 +461,7 @@ If you want maximum flexibility without forking:
 ---
 
 ## License
-`<Copyright (c) 2025 Veldra>`
+`<License: MIT (see LICENSE)>`
 
 ---
 
