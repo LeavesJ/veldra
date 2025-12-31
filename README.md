@@ -11,10 +11,6 @@ This repo is a **beta prototype** intended to be legible, testable, and easy for
 - **Demo (dashboard video or live):** `<>`
 - **Contact:** `<jarrondeng@gmail.com>`
 
-If you are sending this to a pool operator, include:
-1. A 60 to 120 second screen recording of: regtest stack boot, dashboard live updates, policy wizard applying a policy, and a visible change in accept or reject behavior.
-2. A short “integration sketch” for where ReserveGrid OS sits in their stack.
-
 ---
 
 ## What ReserveGrid OS does
@@ -431,7 +427,7 @@ Pools can implement their own policy constraints by:
 The dashboard will display whatever `reason` string is returned in the verdict.
 
 ### Future direction for pool defined reasons
-If you want maximum flexibility without forking:
+For maximum flexibility without forking:
 - define a plugin interface (dynamic library, wasm, or policy DSL)
 - allow policies to define custom reason codes and messages
 - keep the dashboard generic: it renders reason strings and aggregates by key
@@ -450,7 +446,7 @@ If you want maximum flexibility without forking:
 
 ---
 
-## 13. Roadmap (high signal, not fluff)
+## 13. Roadmap (high signal)
 - Stronger policy validation with actionable errors
 - Cleaner policy wizard UX and policy export workflow
 - Stratum v2 integration path for real pool pipelines
