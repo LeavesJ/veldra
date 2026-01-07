@@ -1,8 +1,8 @@
 backend = "bitcoind"
+poll_interval_secs = 8
 
 rpc_url = "http://127.0.0.1:18443"
 rpc_user = "veldra"
 rpc_pass = "very_secure_password"
 
-poll_interval_secs = 5
 

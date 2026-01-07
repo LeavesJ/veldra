@@ -1,12 +1,14 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     env,
+    hash::{Hash, Hasher},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
@@ -28,11 +30,41 @@ trait TemplateSource: Send {
     fn next_template(&mut self) -> Result<Option<TemplatePropose>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TemplateFingerprint {
+    height: u64,
+    prev_hash: String,
+    tx_count: u32,
+    total_fees: u64,
+    txids_hash: u64,
+}
+
+fn hash_txids(txids: &[String]) -> u64 {
+    // Order-independent hash so reordering doesn’t create fake “new templates”.
+    let mut v = txids.to_vec();
+    v.sort();
+    let mut h = DefaultHasher::new();
+    for t in v {
+        t.hash(&mut h);
+    }
+    h.finish()
+}
+
+fn block_subsidy_sats(height: u32) -> u64 {
+    // Bitcoin mainnet schedule. Regtest uses same unless you changed params.
+    // 50 BTC = 5_000_000_000 sats at height 0, halves every 210_000 blocks.
+    let halvings = height / 210_000;
+    if halvings >= 64 {
+        return 0;
+    }
+    (50u64 * 100_000_000u64) >> halvings
+}
+
 /// Bitcoind-backed template source using getblocktemplate.
 struct BitcoindTemplateSource {
     client: Client,
     next_id: u64,
-    last_key: Option<(u32, String)>, // (height, prev_hash)
+    last_fp: Option<TemplateFingerprint>,
     had_rpc_error: bool,
 }
 
@@ -51,10 +83,10 @@ impl BitcoindTemplateSource {
         let auth = Auth::UserPass(user, pass);
         let client = Client::new(&url, auth).expect("failed to create bitcoind RPC client");
 
-        BitcoindTemplateSource {
+        Self {
             client,
             next_id: 1,
-            last_key: None,
+            last_fp: None,
             had_rpc_error: false,
         }
     }
@@ -82,13 +114,11 @@ impl TemplateSource for BitcoindTemplateSource {
                         break None;
                     }
 
-                    // small backoff before retrying
                     std::thread::sleep(Duration::from_millis(200));
                 }
             }
         };
 
-        // if we still could not get a template, degrade gracefully: no new work
         let tpl = match tpl_opt {
             Some(t) => {
                 if self.had_rpc_error {
@@ -97,27 +127,48 @@ impl TemplateSource for BitcoindTemplateSource {
                 }
                 t
             }
-            None => {
-                return Ok(None);
-            }
+            None => return Ok(None),
         };
 
         let block_height = tpl.height as u32;
         let prev_hash = tpl.previous_block_hash.to_string();
 
-        let key = (block_height, prev_hash.clone());
-        if Some(key.clone()) == self.last_key {
-            // same height + prev_hash as last time, skip
-            return Ok(None);
-        }
-
-        self.last_key = Some(key);
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let coinbase_value: u64 = tpl.coinbase_value.to_sat();
         let tx_count = tpl.transactions.len() as u32;
         let total_fees: u64 = tpl.transactions.iter().map(|tx| tx.fee.to_sat()).sum();
+
+        let coinbase_raw: u64 = tpl.coinbase_value.to_sat();
+        let coinbase_value: u64 = if coinbase_raw == 0 {
+            let fallback = block_subsidy_sats(block_height) + total_fees;
+            eprintln!(
+                "[manager] WARNING coinbase_value=0 from getblocktemplate at height={} tx_count={} total_fees={}; using fallback={}",
+                block_height, tx_count, total_fees, fallback
+            );
+            fallback
+        } else {
+            coinbase_raw
+        };
+
+        let txids: Vec<String> = tpl
+            .transactions
+            .iter()
+            .map(|tx| tx.txid.to_string())
+            .collect();
+
+        let fp = TemplateFingerprint {
+            height: block_height as u64,
+            prev_hash: prev_hash.clone(),
+            tx_count,
+            total_fees,
+            txids_hash: hash_txids(&txids),
+        };
+
+        if self.last_fp.as_ref() == Some(&fp) {
+            return Ok(None);
+        }
+        self.last_fp = Some(fp);
+
+        let id = self.next_id;
+        self.next_id += 1;
 
         let proposal = TemplatePropose {
             version: PROTOCOL_VERSION,
@@ -159,7 +210,6 @@ impl StratumTemplateSource {
                 match TcpStream::connect(&addr).await {
                     Ok(stream) => {
                         println!("Connected to Stratum V2 bridge at {}", addr);
-                        // keep whole stream alive
                         let mut reader = BufReader::new(stream);
                         let mut line = String::new();
 
@@ -204,7 +254,7 @@ impl StratumTemplateSource {
             }
         });
 
-        StratumTemplateSource { rx }
+        Self { rx }
     }
 }
 
@@ -246,18 +296,19 @@ struct MempoolStats {
 type TemplateLog = Arc<Mutex<Vec<LoggedTemplate>>>;
 type MempoolLog = Arc<Mutex<Option<MempoolStats>>>;
 
+const TEMPLATE_LOG_CAP: usize = 500;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // manager config path
-    let cfg_path = env::var("VELDRA_MANAGER_CONFIG").unwrap_or_else(|_| "manager.toml".to_string());
-
+    let cfg_path =
+        env::var("VELDRA_MANAGER_CONFIG").unwrap_or_else(|_| "manager.toml".to_string());
     let cfg = TemplateManagerConfig::from_path(&cfg_path)?;
     println!("Loaded manager config from {}: {:?}", cfg_path, cfg);
 
     let verifier_addr =
         env::var("VELDRA_VERIFIER_ADDR").unwrap_or_else(|_| "127.0.0.1:5001".to_string());
 
-    let poll_secs: u64 = cfg.poll_interval_secs.unwrap_or(5);
+    let poll_secs: u64 = cfg.poll_interval_secs.unwrap_or(5).max(1);
 
     let http_addr =
         env::var("VELDRA_MANAGER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
@@ -267,16 +318,22 @@ async fn main() -> Result<()> {
         cfg.backend, poll_secs, verifier_addr, http_addr
     );
 
+    // ---- SINGLE-INSTANCE LOCK ----
+    // Bind HTTP listener *before* starting the manager loop.
+    // If this fails, we exit immediately, preventing zombie duplicate senders.
+    let listener: TcpListener = TcpListener::bind(&http_addr)
+        .await
+        .with_context(|| format!("failed to bind manager HTTP at {http_addr} (already running?)"))?;
+    println!("Template manager HTTP listening on {}", http_addr);
+
     // choose backend
     let source: Box<dyn TemplateSource> = match cfg.backend.as_str() {
         "bitcoind" => Box::new(BitcoindTemplateSource::from_config(&cfg)),
         "stratum" => Box::new(StratumTemplateSource::from_config(&cfg)),
-        other => {
-            panic!(
-                "Unsupported backend {:?} (expected \"bitcoind\" or \"stratum\")",
-                other
-            );
-        }
+        other => anyhow::bail!(
+            "Unsupported backend {:?} (expected \"bitcoind\" or \"stratum\")",
+            other
+        ),
     };
 
     let backend_name = cfg.backend.clone();
@@ -301,35 +358,46 @@ async fn main() -> Result<()> {
     let template_log: TemplateLog = Arc::new(Mutex::new(Vec::new()));
     let mempool_log: MempoolLog = Arc::new(Mutex::new(None));
 
-    // spawn HTTP server
-    let http_tpl_log = template_log.clone();
-    let http_mempool_log = mempool_log.clone();
+    // build router once
+    let app = build_router(template_log.clone(), mempool_log.clone());
+
+    // run HTTP server (if it dies, we stop)
     let http_task = tokio::spawn(async move {
-        if let Err(e) = run_http_server(http_addr, http_tpl_log, http_mempool_log).await {
-            eprintln!("manager HTTP server error: {e:?}");
-        }
+        axum::serve(listener, app).await
     });
 
-    // spawn manager loop
-    let manager_task = tokio::spawn(async move {
-        if let Err(e) = run_manager_loop(
-            source,
-            verifier_addr,
-            poll_secs,
-            backend_name,
-            template_log,
-            mempool_log,
-            bitcoind_client,
-        )
-        .await
-        {
-            eprintln!("manager loop error: {e:?}");
+    // run manager loop (if it dies, we stop)
+    let manager_task = tokio::spawn(run_manager_loop(
+        source,
+        verifier_addr,
+        poll_secs,
+        backend_name,
+        template_log,
+        mempool_log,
+        bitcoind_client,
+    ));
+
+    // If either task exits, fail loudly. In a demo product, silent partial failure is poison.
+    tokio::select! {
+        r = http_task => {
+            let r = r.context("HTTP task join failed")?;
+            r.context("HTTP server exited")?;
+            anyhow::bail!("HTTP server exited");
         }
-    });
+        r = manager_task => {
+            r.context("manager task join failed")??;
+            anyhow::bail!("manager loop exited");
+        }
+    }
+}
 
-    let _ = tokio::join!(http_task, manager_task);
-
-    Ok(())
+fn build_router(template_log: TemplateLog, mempool_log: MempoolLog) -> Router {
+    Router::new()
+        .route("/health", get(health_check))
+        .route("/templates", get(get_templates))
+        .route("/mempool", get(get_mempool))
+        .layer(Extension(template_log))
+        .layer(Extension(mempool_log))
 }
 
 async fn run_manager_loop(
@@ -342,20 +410,22 @@ async fn run_manager_loop(
     bitcoind_client: Option<Client>,
 ) -> Result<()> {
     let mut mempool_had_rpc_error = false;
+
     loop {
-        // template handling
+        // ---- template handling ----
         match source.next_template() {
             Ok(Some(mut propose)) => {
                 println!(
-                    "New template from backend={} id={} height={} total_fees={} tx_count={}",
+                    "New template backend={} id={} height={} prev_hash={} coinbase_value={} total_fees={} tx_count={}",
                     backend_name,
                     propose.id,
                     propose.block_height,
+                    propose.prev_hash,
+                    propose.coinbase_value,
                     propose.total_fees,
                     propose.tx_count,
                 );
 
-                // connect to verifier and send + receive verdict, but never kill the loop
                 match TcpStream::connect(&verifier_addr).await {
                     Ok(stream) => {
                         if let Err(e) = send_and_receive(stream, &mut propose).await {
@@ -373,7 +443,7 @@ async fn run_manager_loop(
                     }
                 }
 
-                // store in in-memory log for /templates
+                // store for /templates
                 {
                     let mut log = template_log.lock().unwrap();
                     log.push(LoggedTemplate {
@@ -383,17 +453,19 @@ async fn run_manager_loop(
                         backend: backend_name.clone(),
                         timestamp: current_timestamp(),
                     });
+                    if log.len() > TEMPLATE_LOG_CAP {
+                        let drain = log.len() - TEMPLATE_LOG_CAP;
+                        log.drain(0..drain);
+                    }
                 }
             }
-            Ok(None) => {
-                // nothing new this tick
-            }
+            Ok(None) => {}
             Err(e) => {
                 eprintln!("[manager] error getting template from source: {e:?}");
             }
         }
 
-        // mempool snapshot when backend == bitcoind
+        // ---- mempool snapshot when backend == bitcoind ----
         if backend_name == "bitcoind" {
             if let Some(ref client) = bitcoind_client {
                 let mut attempts = 0;
@@ -402,9 +474,7 @@ async fn run_manager_loop(
                         Ok(info) => break Some(info),
                         Err(e) => {
                             attempts += 1;
-                            eprintln!(
-                                "[manager] get_mempool_info attempt {attempts} failed: {e:?}"
-                            );
+                            eprintln!("[manager] get_mempool_info attempt {attempts} failed: {e:?}");
 
                             if attempts >= 3 {
                                 eprintln!(
@@ -434,15 +504,16 @@ async fn run_manager_loop(
                         min_relay_fee: info.mempool_min_fee.to_sat(),
                         timestamp: current_timestamp(),
                     };
+
                     let mut slot = mempool_log.lock().unwrap();
                     *slot = Some(stats);
                 }
             } else {
                 eprintln!("[manager] bitcoind_client is None while backend_name=bitcoind");
             }
-
-            sleep(Duration::from_secs(poll_secs)).await;
         }
+
+        sleep(Duration::from_secs(poll_secs)).await;
     }
 }
 
@@ -476,26 +547,7 @@ async fn send_and_receive(mut stream: TcpStream, propose: &mut TemplatePropose) 
     Ok(())
 }
 
-// HTTP server
-
-async fn run_http_server(
-    bind_addr: String,
-    template_log: TemplateLog,
-    mempool_log: MempoolLog,
-) -> anyhow::Result<()> {
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .route("/templates", get(get_templates))
-        .route("/mempool", get(get_mempool))
-        .layer(Extension(template_log))
-        .layer(Extension(mempool_log));
-
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    println!("Template manager HTTP listening on {}", bind_addr);
-
-    axum::serve(listener, app).await?;
-    Ok(())
-}
+// HTTP handlers
 
 async fn health_check() -> &'static str {
     "ok"

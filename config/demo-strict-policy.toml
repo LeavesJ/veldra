@@ -9,12 +9,12 @@ min_avg_fee = 0
 low_mempool_tx = 0
 high_mempool_tx = 50
 
-tx_count_mid_threshold = 0
+tx_count_mid_threshold = 10
 tx_count_hi_threshold = 50
 
-min_avg_fee_lo = 0
-min_avg_fee_mid = 5
-min_avg_fee_hi = 15
+min_avg_fee_lo = 50
+min_avg_fee_mid = 500
+min_avg_fee_hi = 2000
 
 max_weight_ratio = 0.999
 reject_empty_templates = true

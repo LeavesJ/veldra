@@ -252,6 +252,12 @@ async fn run_tcp_server(
                 // 0) reject empty templates if policy says so
                 if accepted && cfg.reject_empty_templates && propose.tx_count == 0 {
                     accepted = false;
+                    reason_enum = VerdictReason::EmptyTemplate;
+                }
+
+                // 0.5) real CoinbaseZero check
+                if accepted && propose.coinbase_value == 0 {
+                    accepted = false;
                     reason_enum = VerdictReason::CoinbaseZero;
                 }
 

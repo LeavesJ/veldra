@@ -3,19 +3,34 @@ set -euo pipefail
 
 ########################################################################
 # dev-regtest.sh
-# Spin up:
-#   - bitcoind on regtest
+# Clean regtest boot for ReserveGrid OS demo:
+#   - bitcoind on regtest (dedicated datadir; no stale processes)
 #   - pool-verifier (HTTP 8080, TCP 5001)
 #   - template-manager (HTTP 8081, bitcoind backend)
+#
+# This script does NOT generate ongoing traffic.
+# Use scripts/dev-demo-phases.sh for demo traffic.
 ########################################################################
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BTC_CLI="${ROOT_DIR}/scripts/dev-bitcoin-cli.sh"
+echo "[dev-regtest] ROOT_DIR = ${ROOT_DIR}"
 
-BITCOIN_PID=""
+# Dedicated, fresh regtest datadir per run
+REGTEST_DIR="${ROOT_DIR}/.tmp/regtest-demo"
+mkdir -p "${ROOT_DIR}/.tmp"
+
+RPC_USER="veldra"
+RPC_PASS="very_secure_password"
+RPC_PORT="18443"
+P2P_PORT="18444"
+
+BITCOIND_PID=""
 VERIFIER_PID=""
 MANAGER_PID=""
+
+btc_cli() {
+  bitcoin-cli -regtest -datadir="${REGTEST_DIR}" -rpcuser="${RPC_USER}" -rpcpassword="${RPC_PASS}" -rpcport="${RPC_PORT}" "$@"
+}
 
 cleanup() {
   echo "[dev-regtest] cleanup: stopping services..."
@@ -30,46 +45,45 @@ cleanup() {
     kill "${VERIFIER_PID}" 2>/dev/null || true
   fi
 
-  if [[ -n "${BITCOIN_PID}" ]] && kill -0 "${BITCOIN_PID}" 2>/dev/null; then
-    echo "[dev-regtest] stopping bitcoind..."
-    bitcoin-cli -regtest -rpcuser=veldra -rpcpassword=very_secure_password -rpcport=18443 stop \
-      >/dev/null 2>&1 || true
+  # graceful stop if RPC is reachable
+  btc_cli stop >/dev/null 2>&1 || true
+
+  # best-effort kill if still alive
+  if [[ -n "${BITCOIND_PID}" ]] && kill -0 "${BITCOIND_PID}" 2>/dev/null; then
+    echo "[dev-regtest] KILL bitcoind (pid ${BITCOIND_PID})..."
+    kill "${BITCOIND_PID}" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
 
-echo "[dev-regtest] ROOT_DIR = ${ROOT_DIR}"
+########################################
+# 1) start bitcoind (fresh)
+########################################
+echo "[dev-regtest] starting bitcoind (regtest) in ${REGTEST_DIR}..."
+rm -rf "${REGTEST_DIR}"
+mkdir -p "${REGTEST_DIR}"
 
-########################################
-# 1. start bitcoind on regtest
-########################################
-echo "[dev-regtest] starting bitcoind (regtest)..."
-echo "[dev-regtest] starting bitcoind (regtest)..."
 bitcoind -regtest \
+  -datadir="${REGTEST_DIR}" \
   -daemon \
   -server=1 \
-  -rpcuser=veldra \
-  -rpcpassword=very_secure_password \
-  -rpcport=18443 \
+  -rpcuser="${RPC_USER}" \
+  -rpcpassword="${RPC_PASS}" \
+  -rpcport="${RPC_PORT}" \
+  -port="${P2P_PORT}" \
   -fallbackfee=0.0001 \
   -maxmempool=300 \
-  -deprecatedrpc=settxfee \
-  >/dev/null 2>&1 || true
-
+  >/dev/null 2>&1
 
 sleep 2
-
-# best-effort PID grab (not critical, only used for nicer cleanup)
-BITCOIN_PID="$(pgrep -n bitcoind || true)"
+BITCOIND_PID="$(pgrep -n bitcoind || true)"
+echo "[dev-regtest] bitcoind pid = ${BITCOIND_PID:-unknown}"
 
 echo "[dev-regtest] ensure wallet exists..."
-bitcoin-cli -regtest -rpcuser=veldra -rpcpassword=very_secure_password -rpcport=18443 \
-  loadwallet veldra_wallet 2>/dev/null || \
-bitcoin-cli -regtest -rpcuser=veldra -rpcpassword=very_secure_password -rpcport=18443 \
-  createwallet veldra_wallet >/dev/null
+btc_cli loadwallet veldra_wallet >/dev/null 2>&1 || btc_cli createwallet veldra_wallet >/dev/null
 
 ########################################
-# 2. build binaries
+# 2) build
 ########################################
 echo "[dev-regtest] building pool-verifier..."
 (
@@ -80,24 +94,27 @@ echo "[dev-regtest] building pool-verifier..."
 echo "[dev-regtest] building template-manager..."
 (
   cd "${ROOT_DIR}/services/template-manager"
-  cargo build
+  cargo build --bin template-manager
 )
 
 ########################################
-# 3. start pool-verifier
+# 3) start pool-verifier
 ########################################
 echo "[dev-regtest] starting pool-verifier..."
 (
   cd "${ROOT_DIR}/services/pool-verifier"
-
   mkdir -p data
 
   export VELDRA_HTTP_ADDR="127.0.0.1:8080"
   export VELDRA_VERIFIER_ADDR="127.0.0.1:5001"
+
+  # keep both for compatibility with your code
   export VELDRA_POLICY_PATH="${ROOT_DIR}/services/pool-verifier/policy.toml"
-  export VELDRA_MEMPOOL_URL="http://127.0.0.1:8081/mempool"
-  export VELDRA_DASH_MODE="regtest-bitcoind"
   export VELDRA_POLICY_FILE="${ROOT_DIR}/config/beta-policy.toml"
+  export VELDRA_POLICY_FILE="${ROOT_DIR}/config/demo-showcase-policy.toml"
+
+  export VELDRA_MEMPOOL_URL="http://127.0.0.1:8081/mempool"
+  export VELDRA_DASH_MODE="regtest"
 
   exec ./target/debug/pool-verifier
 ) &
@@ -105,15 +122,15 @@ VERIFIER_PID=$!
 echo "[dev-regtest] pool-verifier pid = ${VERIFIER_PID}"
 
 echo "[dev-regtest] waiting for verifier TCP..."
-for i in {1..10}; do
+for _ in {1..40}; do
   if nc -z 127.0.0.1 5001 2>/dev/null; then
     break
   fi
-  sleep 0.3
+  sleep 0.25
 done
 
 ########################################
-# 4. start template-manager (bitcoind)
+# 4) start template-manager
 ########################################
 echo "[dev-regtest] starting template-manager (bitcoind backend)..."
 (
@@ -127,45 +144,16 @@ echo "[dev-regtest] starting template-manager (bitcoind backend)..."
 ) &
 MANAGER_PID=$!
 echo "[dev-regtest] template-manager pid = ${MANAGER_PID}"
+
 echo "[dev-regtest] HTTP: verifier 127.0.0.1:8080, manager 127.0.0.1:8081"
 
-echo "[dev-regtest] services running. Ctrl+C to stop."
-
 ########################################
-echo "[dev-regtest] funding wallet if needed..."
-ADDR="$(${BTC_CLI} getnewaddress)"
-${BTC_CLI} generatetoaddress 101 "$ADDR" >/dev/null
-
-low_fee_batch() {
-  echo "[dev-regtest] creating low fee tx batch..."
-  for i in {1..5}; do
-    TO="$(${BTC_CLI} getnewaddress)"
-    ${BTC_CLI} sendtoaddress "$TO" 1.0 >/dev/null
-  done
-  ${BTC_CLI} generatetoaddress 1 "$ADDR" >/dev/null
-}
-
-high_fee_batch() {
-  echo "[dev-regtest] creating high fee tx batch..."
-  ${BTC_CLI} settxfee 0.01 >/dev/null
-  for i in {1..10}; do
-    TO="$(${BTC_CLI} getnewaddress)"
-    ${BTC_CLI} sendtoaddress "$TO" 0.5 >/dev/null
-  done
-  ${BTC_CLI} settxfee 0 >/dev/null
-  ${BTC_CLI} generatetoaddress 1 "$ADDR" >/dev/null
-}
-
-echo "[dev-regtest] running fee pattern..."
-while true; do 
-  low_fee_batch
-  sleep 1
-  high_fee_batch
-  sleep 1
-done
-
-
+# 5) initial funding (so demo scripts can spend)
 ########################################
-# 5. block until Ctrl+C
-########################################
+echo "[dev-regtest] funding wallet..."
+ADDR="$(btc_cli getnewaddress)"
+btc_cli generatetoaddress 110 "$ADDR" >/dev/null
+echo "[dev-regtest] funded. coinbase addr = ${ADDR}"
+
+echo "[dev-regtest] stack is up. Now run: ./scripts/dev-demo-phases.sh"
 wait

@@ -1,0 +1,27 @@
+protocol_version = 1
+
+required_prevhash_len = 32
+
+# Make empty templates reject on demand (easy reason diversity)
+reject_empty_templates = true
+
+# Keep this on if you want, but Phase 1 makes it irrelevant
+reject_coinbase_zero = false
+
+# These create predictable reject reasons
+min_total_fees = 5000
+max_tx_count = 12
+min_avg_fee = 0
+
+# Fee tiers. Keep these low enough that "high fee" batches pass.
+low_mempool_tx  = 5
+high_mempool_tx = 20
+
+tx_count_mid_threshold = 0
+tx_count_hi_threshold = 50
+
+min_avg_fee_lo  = 10
+min_avg_fee_mid = 100
+min_avg_fee_hi  = 200
+
+max_weight_ratio = 1.00

@@ -1,15 +1,24 @@
 protocol_version = 1
-required_prevhash_len = 64
+
+# required fields (examples, you must match real field names/types)
+required_prevhash_len = 32
 min_total_fees = 0
-max_tx_count = 100
+max_tx_count = 4000
 min_avg_fee = 0
 
-low_mempool_tx  = 0
-high_mempool_tx = 50
+# fee tiers
+low_mempool_tx = 5
+high_mempool_tx = 20
+min_avg_fee_lo = 10
+min_avg_fee_mid = 100
+min_avg_fee_hi = 200
 
-tx_count_mid_threshold = 10
-tx_count_hi_threshold  = 50
+tx_count_mid_threshold = 0
+tx_count_hi_threshold = 50
 
-min_avg_fee_lo  = 1
-min_avg_fee_mid = 2000
-min_avg_fee_hi  = 5000
+# new required field
+max_weight_ratio = 1.00
+
+# optional flags you added recently
+reject_empty_templates = true
+reject_coinbase_zero = true
