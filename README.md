@@ -165,7 +165,6 @@ bitcoind -regtest \
   -rpcport=18443 \
   -fallbackfee=0.0001 \
   -maxmempool=300 \
-  -deprecatedrpc=settxfee
 ~~~
 
 2) Start `template-manager`:
