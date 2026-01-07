@@ -300,8 +300,7 @@ const TEMPLATE_LOG_CAP: usize = 500;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg_path =
-        env::var("VELDRA_MANAGER_CONFIG").unwrap_or_else(|_| "manager.toml".to_string());
+    let cfg_path = env::var("VELDRA_MANAGER_CONFIG").unwrap_or_else(|_| "manager.toml".to_string());
     let cfg = TemplateManagerConfig::from_path(&cfg_path)?;
     println!("Loaded manager config from {}: {:?}", cfg_path, cfg);
 
@@ -321,9 +320,9 @@ async fn main() -> Result<()> {
     // ---- SINGLE-INSTANCE LOCK ----
     // Bind HTTP listener *before* starting the manager loop.
     // If this fails, we exit immediately, preventing zombie duplicate senders.
-    let listener: TcpListener = TcpListener::bind(&http_addr)
-        .await
-        .with_context(|| format!("failed to bind manager HTTP at {http_addr} (already running?)"))?;
+    let listener: TcpListener = TcpListener::bind(&http_addr).await.with_context(|| {
+        format!("failed to bind manager HTTP at {http_addr} (already running?)")
+    })?;
     println!("Template manager HTTP listening on {}", http_addr);
 
     // choose backend
@@ -362,9 +361,7 @@ async fn main() -> Result<()> {
     let app = build_router(template_log.clone(), mempool_log.clone());
 
     // run HTTP server (if it dies, we stop)
-    let http_task = tokio::spawn(async move {
-        axum::serve(listener, app).await
-    });
+    let http_task = tokio::spawn(async move { axum::serve(listener, app).await });
 
     // run manager loop (if it dies, we stop)
     let manager_task = tokio::spawn(run_manager_loop(
@@ -474,7 +471,9 @@ async fn run_manager_loop(
                         Ok(info) => break Some(info),
                         Err(e) => {
                             attempts += 1;
-                            eprintln!("[manager] get_mempool_info attempt {attempts} failed: {e:?}");
+                            eprintln!(
+                                "[manager] get_mempool_info attempt {attempts} failed: {e:?}"
+                            );
 
                             if attempts >= 3 {
                                 eprintln!(

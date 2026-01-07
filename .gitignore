@@ -13,6 +13,20 @@
 services/pool-verifier/data/
 **/*.log
 
-# Local-only config (if you have it)
+# Local-only config 
 config/local/
+
+# build + runtime junk
+target/
+**/target/
+
+# demo artifacts / logs / local state
+artifacts/
+services/pool-verifier/data/
+*.log
+*.ndjson
+
+# local operator configs
+config/policy.toml
+config/*.local.toml
  
