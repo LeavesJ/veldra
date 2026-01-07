@@ -1,21 +1,67 @@
-MIT License
+VELDRA SOURCE AVAILABLE LICENSE
+Version 1.0
 
-Copyright (c) 2025 Veldra
+Copyright (c) 2026 Veldra, Inc. and Jarron Wan Deng. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This license governs access to and use of the software, documentation, and other materials made available in this repository (the “Materials”).
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+BY ACCESSING, DOWNLOADING, VIEWING, OR USING ANY MATERIALS, YOU AGREE TO THIS LICENSE.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. DEFINITIONS
+“Owner” means the copyright holder(s) identified above.
+“You” means an individual or legal entity exercising permissions under this license.
+“Internal Evaluation” means reviewing, compiling, and running the Materials solely for learning, admissions review, recruiting evaluation, due diligence, or internal technical assessment. Internal Evaluation excludes using the Materials to operate, support, or improve any product, system, or service offered to any third party, whether paid or free.
+“Production Use” means use in a live environment, on mainnet, with real users, or for operational decision making, or any use intended to provide ongoing value beyond Internal Evaluation.
+
+2. OWNERSHIP
+The Materials are owned by Owner and protected by copyright and other laws. Owner retains all rights not expressly granted in this license.
+
+3. LIMITED LICENSE FOR VIEWING AND INTERNAL EVALUATION
+Subject to your compliance with this license, Owner grants you a limited, revocable, non exclusive, non transferable, non sublicensable license to:
+(a) access and view the Materials, including through GitHub’s user interface
+(b) download and make copies of the Materials strictly as necessary for Internal Evaluation
+(c) compile the Materials and run resulting binaries strictly for Internal Evaluation in non production environments
+
+4. NO PRODUCTION OR COMMERCIAL USE
+You may not use the Materials, in whole or in part, for Production Use or for any commercial purpose, without a separate written license from Owner. For clarity, you may not use the Materials to operate or validate a mining pool, template manager, verifier, or related infrastructure for real world operations.
+
+5. RESTRICTIONS
+Except as expressly permitted in Section 3, you may not:
+(a) copy, reproduce, distribute, publish, sublicense, sell, rent, lease, lend, or otherwise make the Materials available to any third party
+(b) modify, translate, adapt, create derivative works of, or prepare patches for the Materials
+(c) reverse engineer, decompile, or disassemble any compiled artifacts distributed by Owner, except to the extent prohibited by applicable law
+(d) remove or alter copyright, trademark, or attribution notices
+(e) use the Materials to train, fine tune, or improve machine learning models, or to generate code, policies, or rules intended to reproduce substantially similar functionality
+
+6. FEEDBACK AND CONTRIBUTIONS
+Do not submit pull requests or code contributions unless Owner agrees otherwise in writing.
+If You submit feedback or a contribution (including code, documentation, or suggestions), You grant Owner a perpetual, worldwide, irrevocable, royalty free, sublicensable license to use, reproduce, modify, distribute, and create derivative works from that feedback or contribution for any purpose, under any terms Owner chooses.
+
+7. THIRD PARTY MATERIALS
+The Materials may include or depend on third party software subject to separate license terms. Those terms govern your use of third party software. This license grants rights only to the extent of Owner’s rights in the Materials, and does not restrict rights granted to you by third party licenses.
+
+8. TRADEMARKS
+“Veldra” and related names, logos, and marks are trademarks of Owner. No trademark rights are granted under this license.
+
+9. TERMINATION
+This license remains effective until terminated. Owner may terminate it immediately upon your breach.
+Upon termination, you must cease all use of the Materials and delete all copies in your possession or control, except where retention is required by law. Sections 2, 5, 6, 7, 8, 10, 11, 13, and 14 survive termination.
+
+10. NO WARRANTY
+THE MATERIALS ARE PROVIDED “AS IS” AND “AS AVAILABLE.”
+OWNER DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON INFRINGEMENT.
+
+11. LIMITATION OF LIABILITY
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, OWNER WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR EXEMPLARY DAMAGES, OR FOR LOSS OF PROFITS, REVENUE, DATA, OR GOODWILL, ARISING OUT OF OR RELATED TO THE MATERIALS OR THIS LICENSE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+OWNER’S TOTAL LIABILITY FOR ANY CLAIM RELATING TO THE MATERIALS OR THIS LICENSE WILL NOT EXCEED USD $100.
+
+12. COMPLIANCE WITH LAWS
+You are responsible for complying with applicable laws and regulations, including export control laws.
+
+13. GOVERNING LAW AND VENUE
+This license is governed by the laws of the State of Delaware, USA, without regard to conflict of law principles.
+Any dispute will be brought exclusively in the state or federal courts located in New Castle County, Delaware, and you consent to their jurisdiction.
+
+14. CONTACT AND COMMERCIAL LICENSING
+For commercial licensing, Production Use, partnerships, or permissions not granted here, contact:
+jarrondeng@gmail.com
