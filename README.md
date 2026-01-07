@@ -456,7 +456,7 @@ For maximum flexibility without forking:
 ---
 
 ## License
-`<License: MIT (see LICENSE)>`
+`<License: VELDRA SOURCE AVAILABLE LICENSE (see LICENSE)>`
 
 ---
 
