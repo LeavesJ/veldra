@@ -9,7 +9,8 @@ This repo is a **beta prototype** intended to be legible, testable, and easy for
 ## Demo and repo links
 - **Repo:** `<https://github.com/LeavesJ/veldra>`
 - **Website:** `<https://veldra.org>`
-- **Contact:** `<jarrondeng@gmail.com>`
+- **Contact (personal):** `<jarrondeng@gmail.com>`
+- **Contact (work):** `<jarrondeng@veldra.org>`
 
 ---
 
