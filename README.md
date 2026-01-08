@@ -463,5 +463,5 @@ For maximum flexibility without forking:
 ## Maintainer
 Veldra, ReserveGrid OS
 `<Jarron Deng>`  
-`<jarrondeng@gmail.com>`  
+`<jarrondeng@veldra.org>`  
 
