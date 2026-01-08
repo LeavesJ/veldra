@@ -8,7 +8,7 @@ This repo is a **beta prototype** intended to be legible, testable, and easy for
 
 ## Demo and repo links
 - **Repo:** `<https://github.com/LeavesJ/veldra>`
-- **Demo (dashboard video):** `<https://youtu.be/lDIIl7Oe73Y>`
+- **Website:** `<https://veldra.org>`
 - **Contact:** `<jarrondeng@gmail.com>`
 
 ---
