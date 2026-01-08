@@ -1,32 +1,30 @@
 # Rust build output
-/target/
-**/target/
-
-# macOS noise
-.DS_Store
-
-# Editor folders
-.vscode/
-.idea/
-
-# Runtime generated data and logs
-services/pool-verifier/data/
-**/*.log
-
-# Local-only config 
-config/local/
-
-# build + runtime junk
 target/
 **/target/
 
-# demo artifacts / logs / local state
-artifacts/
-services/pool-verifier/data/
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Env files (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
+# Logs / traces
 *.log
 *.ndjson
 
-# local operator configs
-config/policy.toml
+# Runtime generated data
+services/pool-verifier/data/
+artifacts/
+
+# Local-only config overrides
+config/local/
 config/*.local.toml
- 
+config/policy.toml
+
+# Optional build/demo artifacts
+dist/
+.tmp/
