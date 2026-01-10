@@ -12,14 +12,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-use axum::{routing::get, Extension, Json, Router};
+use axum::{Extension, Json, Router, routing::get};
 use bitcoincore_rpc::json::{
     GetBlockTemplateCapabilities, GetBlockTemplateModes, GetBlockTemplateRules,
 };
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use serde::Serialize;
 
-use rg_protocol::{TemplatePropose, TemplateVerdict, PROTOCOL_VERSION};
+use rg_protocol::{PROTOCOL_VERSION, TemplatePropose, TemplateVerdict};
 
 mod config;
 use config::TemplateManagerConfig;
