@@ -2,7 +2,7 @@
 
 **ReserveGrid OS** is Veldra’s policy driven verification layer for Bitcoin mining pools. It inspects candidate block templates against an operator defined policy and returns an **ACCEPT** or **REJECT** verdict with a machine readable reason code and policy context, plus an operator facing dashboard for observability.
 
-This repository is a **beta prototype** optimized for legibility and fast evaluation. It is designed to be swapped into a pool pipeline with minimal ceremony.
+This repository is a **pilot-stage product** optimized for legibility and fast evaluation. It is designed to be swapped into a pool pipeline with minimal ceremony.
 
 ---
 
