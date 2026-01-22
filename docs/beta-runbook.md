@@ -1,366 +1,397 @@
-# Veldra Pool Verifier Beta Runbook
+# Veldra Pool Verifier Runbook (v0.2.0)
 
-This runbook explains how to bring up the Veldra pool verifier stack, what each component does, how to interpret the dashboard, and how to run basic drills on regtest before touching a live pool.
+This runbook explains how to bring up the Veldra pool verifier stack, what each component does, how to interpret the dashboard, and how to run basic drills on regtest before touching any live pool infrastructure.
 
 ---
 
 ## 1. Architecture at a glance
 
-The prototype stack has three main pieces:
+The v0.2.0 prototype stack has three main pieces:
 
-1. bitcoind or Stratum backend  
+1. Backend template source
 
-   - Either Bitcoin Core on regtest or testnet  
-   - Or a Stratum v2 bridge that supplies candidate block templates  
+   - Regtest: Bitcoin Core (bitcoind) provides candidate templates and mempool snapshots.
+   - Stratum synthetic mode: an sv2 bridge emits synthetic templates over a local Stratum style endpoint.
 
-2. template manager  
+2. Template manager
 
-   - Pulls templates from the backend  
-   - Wraps them into Veldra `TemplatePropose` messages  
-   - Sends each template to the pool verifier over TCP JSON  
-   - Logs templates and mempool snapshots for the dashboard  
+   - Pulls templates from the backend
+   - Wraps each template into a Veldra `TemplatePropose` message
+   - Sends each template to the pool verifier over TCP JSON
+   - Exposes HTTP endpoints for health, recent templates, and mempool snapshots (backend dependent)
 
-3. pool verifier  
+3. Pool verifier
 
-   - Loads `policy.toml` into an internal `PolicyConfig`  
-   - For each proposed template, decides `Accept` or `Reject` plus a reason  
-   - Logs every verdict along with fee tier information  
-   - Serves an HTML dashboard and JSON endpoints for stats  
+   - Loads a policy TOML into an internal `PolicyConfig`
+   - For each proposed template, decides `Accept` or `Reject`
+   - Emits stable, machine readable `reason_code` plus a human oriented `reason_detail`
+   - Logs verdicts for auditability and serves an operator dashboard and HTTP APIs
 
 Very short chain:
 
-bitcoind or Stratum source → template manager → pool verifier → dashboard and logs
+backend source → template manager → pool verifier → dashboard and logs
 
 ---
 
 ## 2. Quickstart on regtest
 
-This is the reference path that should always work on your development machine.
+This is the reference path and should be the default for local development.
 
 ### 2.1 Prerequisites
 
-- A Unix like environment  
-- `bitcoind` installed and on `PATH`  
-- Rust toolchain and `cargo` installed  
-- `git` installed  
+- Unix like environment
+- `bitcoind` and `bitcoin-cli` installed and on `PATH`
+- Rust toolchain and `cargo`
+- `git`
 
 ### 2.2 Start the full stack
 
-From your repo root (the `Veldra` directory):
+From repo root:
 
-    cd Veldra
     ./scripts/dev-regtest.sh
 
-The script does roughly the following:
+What the script does:
 
-1. Sets `ROOT_DIR` to the repo directory  
-2. Starts `bitcoind` in regtest mode  
-3. Ensures a wallet exists, currently named `veldra_wallet`  
-4. Builds `pool-verifier` and `template-manager` in dev profile  
-5. Starts `pool-verifier`  
-6. Starts `template-manager`  
-7. Wires them together for a closed regtest loop  
+1. Starts `bitcoind` in regtest mode using a dedicated demo datadir
+2. Ensures a wallet exists (default name: `veldra_wallet`)
+3. Waits for RPC readiness
+4. Builds `pool-verifier` and `template-manager` (dev profile)
+5. Starts `pool-verifier` (HTTP and TCP)
+6. Starts `template-manager` (bitcoind backend)
+7. Mines initial blocks so demo scripts can spend immediately
 
-To stop the stack, interrupt the script in the terminal. The helper script also has cleanup logic that kills child processes. If any process survives, you can kill it manually or restart the script.
+Stop the stack by interrupting the script. It terminates child processes and stops the regtest bitcoind instance for the demo datadir.
 
----
+### 2.3 Demo traffic scripts
 
-## 3. Configuration and environment
+After `dev-regtest.sh` is running, choose one:
 
-All service configuration is controlled through environment variables with a `VELDRA_` prefix plus `policy.toml`.
+Deterministic staged outcomes:
 
-Key points:
+    ./scripts/dev-demo-phases.sh
 
-- The regtest script already sets reasonable defaults.  
-- For a real deployment you will edit that script or use your own systemd units with explicit `Environment=` lines.  
+Continuous noisy mempool dynamics:
 
-You do not need to guess exact variable names from memory. For each binary, from its service directory:
+    ./scripts/dev-traffic.sh
 
-    cargo run -- --help
+Manual regtest interaction uses the wrapper:
 
-Use the help output and the `config` source files in each service to confirm the current list of environment variables and flags. New config will continue this pattern.
-
-Things you will typically configure for a live pilot:
-
-- Network selection such as `regtest`, `testnet`, `mainnet`.  
-- RPC endpoint and credentials for Bitcoin Core if you use direct `getblocktemplate`.  
-- Host and port for Stratum sources if you use a Stratum bridge.  
-- Location of `policy.toml`.  
-- Bind address and port for the verifier HTTP dashboard.  
-- Log directory and log level.  
-
-The exact variable names come from the code and help output. Treat those as the source of truth.
+    ./scripts/dev-bitcoin-cli.sh getbalance
 
 ---
 
-## 4. `policy.toml` and dynamic fee tiers
+## 3. Quickstart in Stratum synthetic mode
 
-The verifier reads a policy file on startup. That file defines:
+This path runs without bitcoind templates. It is meant for synthetic Stratum style template flow and verifier UI testing.
 
-- General acceptance rules.  
-- Dynamic fee tiers.  
-- Other structural constraints that we add later.  
+Start:
 
-The current prototype supports dynamic fee tiers. Internally the policy includes values similar to:
+    ./scripts/dev-stratum.sh
 
-- `min_avg_fee_lo`  
-- `min_avg_fee_mid`  
-- `min_avg_fee_hi`  
+This brings up:
 
-The verifier computes an `effective_min_avg_fee` for each template based on mempool conditions and the tier thresholds. That value is recorded in the verdict log as `min_avg_fee_used` along with the tier.
+- `pool-verifier` (HTTP + TCP)
+- `sv2-bridge` (synthetic template source)
+- `template-manager` in Stratum backend mode
 
-### 4.1 Location
+Regtest traffic scripts do not apply in this mode. Load is controlled by the bridge parameters and the manager Stratum config.
 
-Typical locations:
+---
 
-- For development, a `policy.toml` in the repo root or a `config` directory.  
-- For production, a dedicated config path, mounted or managed by your ops tools.  
+## 4. Configuration and environment
 
-The verifier binary accepts a flag or environment variable pointing to this file. Confirm the exact configuration knob with `--help`.
+The stack is configured through `VELDRA_` environment variables plus a policy TOML.
 
-### 4.2 Example schematic policy
+### 4.1 Pool verifier env vars
 
-This example shows the shape rather than exact field names. Use it as a mental model and adapt it to what your current `PolicyConfig` expects.
+Common knobs:
+
+- `VELDRA_HTTP_ADDR`  
+  Dashboard and HTTP API bind, e.g. `127.0.0.1:8080`
+
+- `VELDRA_VERIFIER_ADDR`  
+  TCP JSON bind for verifier requests, e.g. `127.0.0.1:5001`
+
+- `VELDRA_POLICY_FILE`  
+  Absolute path to the policy TOML
+
+- `VELDRA_MEMPOOL_URL`  
+  Mempool stats source URL (typically the template manager `/mempool` endpoint)  
+  In Stratum synthetic mode you can set this to empty to disable mempool dependency.
+
+- `VELDRA_DASH_MODE`  
+  Mode badge string displayed in the dashboard
+
+Treat the service `config.rs` plus `--help` output as authoritative for the exact config set.
+
+### 4.2 Template manager env vars
+
+Common knobs:
+
+- `VELDRA_MANAGER_CONFIG`  
+  Absolute path to manager TOML config
+
+- `VELDRA_MANAGER_HTTP_ADDR`  
+  Manager HTTP bind, e.g. `127.0.0.1:8081`
+
+- `VELDRA_VERIFIER_ADDR`  
+  Verifier TCP address to send `TemplatePropose` to
+
+### 4.3 sv2 bridge env vars (Stratum synthetic mode)
+
+Common knobs:
+
+- `VELDRA_BRIDGE_ADDR`  
+  Bridge bind, e.g. `127.0.0.1:3333`
+
+Other bridge parameters are defined in `services/sv2-bridge`. Use that service’s help output or source as the reference.
+
+---
+
+## 5. Policy TOML (v0.2.0 flat schema)
+
+The verifier reads a policy TOML at startup. v0.2.0 uses a flat schema under a single `[policy]` table.
+
+Key semantics:
+
+- `protocol_version` is an explicit compatibility boundary and must match the running build.
+- Dynamic fee tiers compute an effective minimum average fee per template based on mempool conditions and tier thresholds.
+- Degraded mode when mempool stats are missing is controlled by `unknown_mempool_as_high`.
+- `reject_coinbase_zero` allows optional enforcement of coinbase value sanity checks.
+
+### 5.1 Canonical policy shape
+
+Example policy (shape matches v0.2.0):
 
     [policy]
-    name        = "default"
-    description = "Baseline dynamic fee tier policy for Veldra"
-    mode        = "regtest"  # or "live"
+    protocol_version = 2
+    required_prevhash_len = 64
 
-    [policy.fee_tiers]
-    # Minimum average fee in sats per vbyte for each tier
-    min_avg_fee_lo  = 1.0
-    min_avg_fee_mid = 5.0
-    min_avg_fee_hi  = 15.0
+    min_total_fees = 0
+    max_tx_count = 10000
+    min_avg_fee = 0
 
-    [policy.mempool_tiers]
-    # How the mempool size controls which fee tier is active
-    lo_max_txs  = 5_000
-    mid_max_txs = 50_000
-    # above mid_max_txs, the high tier applies
+    low_mempool_tx = 5
+    high_mempool_tx = 20
 
-    [policy.safety]
-    max_weight_ratio       = 0.999
+    tx_count_mid_threshold = 0
+    tx_count_hi_threshold = 50
+
+    min_avg_fee_lo = 5
+    min_avg_fee_mid = 15
+    min_avg_fee_hi = 20
+
+    max_weight_ratio = 0.999
     reject_empty_templates = true
 
-If your running build rejects this file on startup, read the error message and adjust the field names or structure until validation passes. The `PolicyConfig` type in the verifier code is the authoritative reference.
+    unknown_mempool_as_high = true
+    reject_coinbase_zero = false
+
+If the verifier rejects your policy at startup, the error message is authoritative. Fix the field names or values until the policy validates.
+
+### 5.2 Policy profiles in `config/`
+
+Recommended minimal set:
+
+- `config/policy.toml`  
+  Default baseline policy
+
+- `config/demo-showcase-policy.toml`  
+  Tuned for `dev-demo-phases.sh` outcomes
+
+Optional profiles if you actively use them:
+
+- `config/demo-open-policy.toml`  
+  Permissive baseline throughput and UI
+
+- `config/demo-strict-policy.toml`  
+  Deliberately strict to demonstrate rejects under stress
 
 ---
 
-## 5. Dashboard overview
+## 6. Dashboard and HTTP endpoints
 
-The pool verifier exposes a live HTML dashboard. The binary prints the listening address on startup, for example:
+The pool verifier serves an HTML dashboard and HTTP endpoints. When running locally, the verifier prints its bind address, for example:
 
     HTTP server listening on http://127.0.0.1:8080
 
-Visit that address in a browser. The page aggregates information from:
+### 6.1 Mode badge
 
-- Template verdict logs.  
-- Mempool snapshots.  
-- Policy metadata.  
+The dashboard shows a mode badge such as `regtest` or `stratum-synthetic`. Treat this as a deployment sanity check.
 
-You should expect several logical panels or cards.
+### 6.2 Throughput and verdict counts
 
-### 5.1 Mode badge
+Expect a summary section showing:
 
-At the top of the page you will see a badge that reflects the current operating mode. Examples:
+- Total templates processed
+- Accept and reject counts
+- Recent activity window, depending on the current UI
 
-- `regtest`  
-- `sim`  
-- `live`  
+This indicates whether the verifier is keeping up and whether policy is overly strict.
 
-Treat that badge as a sanity check. When attached to a real pool you want that to match your intention.
+### 6.3 Latest verdict detail
 
-### 5.2 Throughput and verdict counts
+The latest verdict section typically includes:
 
-A throughput or summary card shows:
+- Template id or fingerprint prefix
+- Backend type (bitcoind or Stratum)
+- Template average fee
+- Verdict decision: Accept or Reject
+- `reason_code` (stable machine readable label)
+- `reason_detail` (human oriented detail)
+- Fee tier and effective fee requirement used for the decision
 
-- Templates per second or per minute.  
-- Total templates processed.  
-- Accepted and rejected counts.  
-- Possibly a moving window such as the last hundred templates.  
+### 6.4 Mempool panel and staleness
 
-This tells you whether the verifier is keeping up with the template firehose and what fraction of templates fail policy.
+In regtest bitcoind mode, template manager provides periodic mempool snapshots. The dashboard reflects:
 
-### 5.3 Effective fee tier panel
+- Mempool tx count and size
+- Snapshot age
+- Staleness indicator
 
-This panel reflects the dynamic fee tier logic:
+Healthy: snapshots update frequently. If snapshots stall, the staleness indicator should trend toward stale or dead, and tier decisions should follow degraded mode logic.
 
-- Current mempool transaction count from `MempoolStats`.  
-- Current active tier label, such as `low`, `mid`, `high`.  
-- Corresponding `min_avg_fee_used` value in sats per vbyte.  
-- The boundaries that separate tiers.  
+### 6.5 Recent templates table
 
-If mempool size increases beyond a threshold, expect the active tier to jump and the minimum fee requirement to rise. If mempool drains, it should relax.
+A table of recent templates is used to spot patterns:
 
-### 5.4 Latest verdict card
+- Repeated rejects by the same `reason_code`
+- Tier transitions correlating with mempool growth
+- Differences between bitcoind and Stratum sourced templates
 
-This card shows details for the most recent template:
+### 6.6 Aggregate stats
 
-- Timestamp.  
-- Template identifier or hash, truncated.  
-- Backend type, for example `bitcoind` or `stratum`.  
-- Average fee per vbyte in the template.  
-- Verdict: `Accept` or `Reject`.  
-- Detailed reason code if rejected.  
-- `min_avg_fee_used` and fee tier for the decision.  
+The stats aggregation is designed to be stable:
 
-Use this to spot obvious misconfigurations. If `min_avg_fee_used` is very high and almost everything is rejected, your policy is too strict for current mempool conditions.
+- Buckets prefer `reason_code` first
+- Falls back to legacy `reason` only if required
+- Keeps metrics stable across wording changes
 
-### 5.5 Mempool panel with staleness indicator
+### 6.7 Bounded export endpoints
 
-The template manager takes periodic snapshots from `bitcoind` when it is using the `bitcoind` backend. The dashboard exposes:
+The verifier provides bounded exports for operator safety:
 
-- Transaction count.  
-- Mempool size in bytes and optionally megabytes.  
-- Age of the latest snapshot.  
-- A staleness status such as `fresh`, `stale`, `dead`.  
+- `/verdicts/log?tail=N` returns the last N log lines and is hard capped to prevent huge responses
+- `/verdicts.csv?limit=N` returns a bounded CSV export
 
-Expected behavior:
-
-- `fresh` means snapshots are recent and the mempool feed is healthy.  
-- `stale` means snapshots are delayed and you should check connectivity to `bitcoind`.  
-- `dead` means the verifier has not seen a usable mempool update in a long time.  
-
-During a drill where you intentionally kill `bitcoind`, this card should move out of the `fresh` state and clearly communicate that templates are assessed with outdated or missing mempool information.
-
-### 5.6 Recent templates table
-
-A table lists the most recent templates.
-
-Columns typically include:
-
-- Time.  
-- Template id or hash prefix.  
-- Backend name.  
-- Average fee per vbyte.  
-- Fee tier used.  
-- Verdict.  
-- Reason.  
-
-Look here for patterns. For example:
-
-- If many consecutive templates are rejected for `fee_too_low` during a congested period, the policy is doing its job.  
-- If rejections are due to unexpected reasons, such as a weight limit that seems wrong, you may have a bug or misconfigured threshold.  
-
-### 5.7 Aggregate stats by reason and by tier
-
-The stats endpoint feeds an aggregate view that the dashboard renders. It counts:
-
-- Verdict reasons such as `ok`, `fee_too_low`, `policy_error`.  
-- Templates per fee tier, to show how often each tier is active.  
-
-Use these aggregates in two ways:
-
-- As a health check: templates should fall into expected buckets.  
-- As feedback for policy adjustment: if the high tier is active most of the time, your thresholds for mempool congestion may be too conservative.  
+Exact caps are enforced by the server.
 
 ---
 
-## 6. Regtest drills
+## 7. Regtest drills
 
-Before plugging into any real pool infrastructure, run these drills until they feel boring.
+Run these drills until the behavior is boring and predictable.
 
-### 6.1 Basic bring up and block generation
+### 7.1 Basic bring up and sanity
 
 1. Start the stack:
 
-       cd Veldra
        ./scripts/dev-regtest.sh
 
-2. In another terminal, create a fresh address from the regtest wallet:
+2. Open the dashboard:
 
-       bitcoin-cli -regtest -rpcwallet=veldra_wallet getnewaddress
+       http://127.0.0.1:8080
 
-3. Mine 101 blocks to mature coinbase:
+3. Confirm:
 
-       bitcoin-cli -regtest -rpcwallet=veldra_wallet generatetoaddress 101 "<address>"
+   - Mode badge shows regtest mode
+   - Templates and verdicts appear
+   - Mempool feed is present and not stale
 
-4. Watch the dashboard.
+### 7.2 Deterministic staged demo
 
-   - The mode badge should show a regtest mode.  
-   - Templates and verdicts should start to appear.  
-   - Mempool should be mostly empty and in a relaxed fee tier.  
+1. Start regtest stack in one terminal:
 
-### 6.2 Mempool congestion drill
+       ./scripts/dev-regtest.sh
 
-1. Use the same wallet to create many small transactions:
+2. In another terminal, run:
 
-       for i in $(seq 1 50); do
-         bitcoin-cli -regtest -rpcwallet=veldra_wallet sendtoaddress "<address>" 0.1
-       done
+       ./scripts/dev-demo-phases.sh
 
-2. Do not mine blocks for a short while. Let the mempool fill.
+3. Observe:
 
-3. Watch the dashboard.
+   - Empty mempool behavior (policy dependent)
+   - Fee based rejects under low fee batches
+   - Accepts under high fee batches (if policy thresholds are tuned accordingly)
+   - Tier transitions under larger load
+   - Tx count rejects if demo policy constrains `max_tx_count`
 
-   - Mempool transaction count should increase.  
-   - The active fee tier may climb from low to mid or high.  
-   - If your policy sets strict `min_avg_fee` for the higher tiers, some templates should start to fail for `fee_too_low` reasons.  
+### 7.3 Noisy mempool dynamics drill
 
-4. Mine a few more blocks and confirm that the mempool drains and the fee tier relaxes again.
+1. Start regtest stack:
 
-### 6.3 Bitcoind failure and recovery drill
+       ./scripts/dev-regtest.sh
 
-1. Start the stack normally. Confirm that mempool status is fresh.  
+2. Run continuous traffic:
 
-2. Kill `bitcoind` manually:
+       ./scripts/dev-traffic.sh
 
-       pkill -f bitcoind
+3. Observe:
 
-3. Keep the verifier and template manager running. The dashboard should show:
+   - Mempool growth and partial clearing
+   - Tier transitions and corresponding `min_avg_fee` enforcement
+   - Stable aggregation by `reason_code`
 
-   - Mempool staleness climbing.  
-   - A transition from fresh to stale or worse.  
+### 7.4 Backend failure and recovery drill (regtest)
 
-4. Restart `bitcoind` and let the stack reconnect. Confirm that:
+This drill checks staleness visibility and degraded mode behavior.
 
-   - New mempool snapshots appear.  
-   - Staleness drops back to normal.  
-   - The verifier continues to process templates after recovery.  
+1. Start regtest stack and confirm mempool is fresh.
 
-This drill verifies that the retry and reconnection logic behaves correctly from an operator perspective.
+2. Kill bitcoind for the demo datadir (method depends on your script implementation).
 
-### 6.4 Policy sensitivity drill
+3. Observe:
 
-1. Open `policy.toml` and change the high tier minimum fee to an absurdly high value, for example:
+   - Mempool staleness increases
+   - Tier selection uses `unknown_mempool_as_high` behavior
 
-       min_avg_fee_hi = 1000.0
+4. Restart the stack and confirm:
 
-2. Restart the verifier so it reloads the policy.  
+   - Mempool snapshots resume
+   - Staleness returns to fresh
+   - Templates continue to be processed
 
-3. Repeat the mempool congestion drill. Observe that when the high tier activates almost all templates are rejected for `fee_too_low`.  
+### 7.5 Policy sensitivity drill
 
-4. Restore reasonable values and restart.  
+1. Increase fee thresholds in the active policy:
 
-This builds intuition for how policy settings change system behavior.
+   - Raise `min_avg_fee_hi` above typical demo fees
+
+2. Restart the verifier so it reloads policy.
+
+3. Run a congestion or staged demo and confirm:
+
+   - Rejections move into fee related `reason_code` buckets
+   - Stats aggregation remains stable
+
+4. Restore reasonable values and restart.
 
 ---
 
-## 7. Notes for future production pilots
+## 8. Notes for future production pilots
 
-For a pool pilot, you will adjust these aspects beyond the regtest script.
+### 8.1 Network and backend
 
-### 7.1 Network and backend
+- Choose testnet or a controlled mainnet slice for early trials.
+- Decide whether template manager should pull from bitcoind or receive templates via Stratum v2 infrastructure.
 
-- Decide on `testnet` or a small subset of mainnet hashpower for early trials.  
-- Choose whether template manager talks directly to `bitcoind` with `getblocktemplate` or to a Stratum v2 bridge that receives candidate templates from your existing infrastructure.  
+### 8.2 Policy management discipline
 
-### 7.2 Policy management
+- Keep policy TOMLs in version control.
+- Require review for policy changes once incentives are real.
+- Track policy changes as releases, not ad hoc edits.
 
-- Keep `policy.toml` in version control.  
-- Treat it like any other production config.  
-- Require code review for policy changes once money is at stake.  
+### 8.3 Deployment and observability
 
-### 7.3 Deployment and observability
+For a pilot:
 
-- Package each service as a systemd unit or container image.  
-- Feed the JSON stats endpoints into your observability stack.  
-- Set alerts for:
-
-  - Mempool staleness.  
-  - Template backlog.  
-  - Unexpected spikes in rejection rates.  
-  - Dashboard unavailability.  
-
-Once this runbook matches what you see locally, it becomes the baseline document that an external pool operator can follow for a beta deployment, with only pool specific wiring changed.
+- Package services as systemd units or containers.
+- Monitor:
+  - Mempool feed staleness
+  - Template processing rate
+  - Reject rates by `reason_code`
+  - Dashboard availability
+- Alert on:
+  - sustained staleness
+  - spikes in rejects
+  - sustained drop in throughput

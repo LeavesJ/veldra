@@ -1,34 +1,46 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::state::{AppState, load_initial_policy};
+use crate::state::AppState;
 
 use axum::{
     Json, Router,
-    extract::{Extension, State},
+    body::Bytes,
+    extract::{Extension, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
 };
 
-use axum::body::Bytes;
-
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::time::{Duration, timeout};
 
-use pool_verifier::policy::{PolicyConfig, VerdictReason};
-use rg_protocol::{PROTOCOL_VERSION, TemplatePropose, TemplateVerdict};
+use pool_verifier::policy::{PolicyConfig, VerdictReason as LocalReason};
+use rg_protocol::{
+    PROTOCOL_VERSION, PolicyContext, TemplatePropose, TemplateVerdict, VerdictReason as WireReason,
+};
 
 mod mempool_client;
 mod state;
-use mempool_client::{fetch_mempool_tx_count, mempool_url_from_env};
+use mempool_client::mempool_url_from_env;
+
+#[derive(Deserialize)]
+struct TailQuery {
+    tail: Option<usize>, // lines
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<usize>, // rows
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct LoggedVerdict {
@@ -38,12 +50,20 @@ struct LoggedVerdict {
     pub total_fees: u64,
     pub tx_count: u32,
     pub accepted: bool,
+
+    // Back-compat + UI
     pub reason: Option<String>,
+
+    // New structured fields (old NDJSON lines will still parse)
+    #[serde(default)]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub reason_detail: Option<String>,
+
     pub timestamp: u64,
 
-    pub min_avg_fee_used: u64, // floor used for this decision
-    pub fee_tier: String,      // "low" | "mid" | "high"
-
+    pub min_avg_fee_used: u64,
+    pub fee_tier: String, // "low" | "mid" | "high"
     pub avg_fee_sats_per_tx: u64,
 }
 
@@ -71,7 +91,12 @@ struct ApplyPolicyReq {
 type VerdictLog = Arc<Mutex<Vec<LoggedVerdict>>>;
 type LogIdCounter = Arc<AtomicU64>;
 
+static LOG_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 const VERDICT_LOG_PATH: &str = "data/verdicts.log";
+const VERDICT_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
+const VERDICT_LOG_ROTATIONS: usize = 5;
 
 fn load_verdict_log() -> (VerdictLog, LogIdCounter) {
     let mut list = Vec::new();
@@ -85,9 +110,7 @@ fn load_verdict_log() -> (VerdictLog, LogIdCounter) {
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<LoggedVerdict>(line) {
-                if v.log_id > max_id {
-                    max_id = v.log_id;
-                }
+                max_id = max_id.max(v.log_id);
                 list.push(v);
             }
         }
@@ -98,6 +121,15 @@ fn load_verdict_log() -> (VerdictLog, LogIdCounter) {
     (log, counter)
 }
 
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_millis(900))
+            .build()
+            .expect("reqwest client")
+    })
+}
+
 fn compute_avg_fee_sats_per_tx(t: &TemplatePropose) -> u64 {
     if t.tx_count == 0 {
         0
@@ -106,41 +138,77 @@ fn compute_avg_fee_sats_per_tx(t: &TemplatePropose) -> u64 {
     }
 }
 
+fn rotate_verdict_log_if_needed() -> std::io::Result<()> {
+    let meta = match std::fs::metadata(VERDICT_LOG_PATH) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+
+    if meta.len() < VERDICT_LOG_MAX_BYTES {
+        return Ok(());
+    }
+
+    for i in (1..=VERDICT_LOG_ROTATIONS).rev() {
+        let src = if i == 1 {
+            VERDICT_LOG_PATH.to_string()
+        } else {
+            format!("{}.{}", VERDICT_LOG_PATH, i - 1)
+        };
+        let dst = format!("{}.{}", VERDICT_LOG_PATH, i);
+
+        if std::path::Path::new(&src).exists() {
+            let _ = std::fs::remove_file(&dst);
+            let _ = std::fs::rename(&src, &dst);
+        }
+    }
+
+    Ok(())
+}
+
 fn append_verdict_to_disk(v: &LoggedVerdict) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(VERDICT_LOG_PATH)
-        && let Ok(line) = serde_json::to_string(v)
-    {
-        let _ = writeln!(file, "{}", line);
+    let res = (|| {
+        rotate_verdict_log_if_needed()?;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(VERDICT_LOG_PATH)?;
+
+        let line = serde_json::to_string(v)?;
+        writeln!(file, "{line}")?;
+
+        file.flush()?;
+        file.sync_data()?;
+
+        Ok::<(), anyhow::Error>(())
+    })();
+
+    if res.is_err() {
+        LOG_WRITE_ERRORS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // addresses from env, with defaults
     let tcp_addr =
         env::var("VELDRA_VERIFIER_ADDR").unwrap_or_else(|_| "127.0.0.1:5001".to_string());
     let http_addr = env::var("VELDRA_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
-    // UI / mode label
     let ui_mode = env::var("VELDRA_DASH_MODE").unwrap_or_else(|_| "unknown".to_string());
 
-    // load policy from file or default
     let policy_path =
         env::var("VELDRA_POLICY_FILE").unwrap_or_else(|_| "config/policy.toml".to_string());
 
     println!("Using policy file: {}", policy_path);
 
-    let policy_holder =
-        load_initial_policy(&policy_path).expect("Failed to load or construct initial policy");
+    std::fs::create_dir_all("data")?;
+
+    let policy_holder = crate::state::safe_initial_policy(&policy_path);
 
     let app_state = AppState {
         policy: Arc::new(RwLock::new(policy_holder)),
     };
 
-    // shared in-memory log
     let (verdict_log, log_id_counter) = load_verdict_log();
     println!(
         "Loaded {} verdicts from disk, next log_id={}",
@@ -155,11 +223,9 @@ async fn main() -> anyhow::Result<()> {
     let http_ui_mode = ui_mode.clone();
     let http_state = app_state.clone();
 
-    // read mempool url once (template-manager /mempool endpoint)
     let mempool_url = mempool_url_from_env();
     let tcp_mempool_url = mempool_url.clone();
 
-    // TCP server task
     let tcp_task = tokio::spawn(async move {
         if let Err(e) = run_tcp_server(
             tcp_state,
@@ -174,7 +240,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // HTTP server task
     let http_task = tokio::spawn(async move {
         if let Err(e) = run_http_server(http_addr, http_log, http_ui_mode, http_state).await {
             eprintln!("http server error: {e:?}");
@@ -182,8 +247,121 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let _ = tokio::join!(tcp_task, http_task);
-
     Ok(())
+}
+
+fn map_local_to_wire(
+    reason: &LocalReason,
+    fee_tier: &str,
+    min_avg_fee_used: u64,
+    cfg: &PolicyConfig,
+) -> (Option<WireReason>, Option<String>, Option<PolicyContext>) {
+    if matches!(reason, LocalReason::Ok) {
+        return (
+            None,
+            None,
+            Some(PolicyContext {
+                fee_tier: Some(fee_tier.to_string()),
+                min_avg_fee_used: Some(min_avg_fee_used),
+                min_total_fees_used: Some(cfg.min_total_fees),
+                reject_coinbase_zero: Some(cfg.reject_coinbase_zero),
+                unknown_mempool_as_high: Some(cfg.unknown_mempool_as_high),
+            }),
+        );
+    }
+
+    let (code, detail) = match reason {
+        LocalReason::ProtocolVersionMismatch { got, expected } => (
+            WireReason::ProtocolVersionMismatch,
+            format!("protocol_version got={} expected={}", got, expected),
+        ),
+        LocalReason::PrevHashLenMismatch { len, expected } => (
+            WireReason::PrevHashLenMismatch,
+            format!("prev_hash len={} expected={}", len, expected),
+        ),
+        LocalReason::InvalidPrevHash => (
+            WireReason::InvalidPrevHash,
+            "prev_hash contains non-hex characters".to_string(),
+        ),
+        LocalReason::EmptyTemplateRejected => (
+            WireReason::EmptyTemplateRejected,
+            "empty template rejected by policy".to_string(),
+        ),
+        LocalReason::CoinbaseValueZeroRejected => (
+            WireReason::CoinbaseValueZeroRejected,
+            "coinbase_value=0 rejected by policy".to_string(),
+        ),
+        LocalReason::TxCountExceeded { count, max_allowed } => (
+            WireReason::TxCountExceeded,
+            format!("tx_count={} > max_tx_count={}", count, max_allowed),
+        ),
+        LocalReason::TotalFeesBelowMinimum {
+            total,
+            min_required,
+        } => (
+            WireReason::TotalFeesBelowMinimum,
+            format!("total_fees={} < min_total_fees={}", total, min_required),
+        ),
+        LocalReason::AvgFeeBelowMinimum { avg, min_required } => (
+            WireReason::AvgFeeBelowMinimum,
+            format!("avg_fee={} < min_avg_fee_used={}", avg, min_required),
+        ),
+        LocalReason::Ok => unreachable!(),
+    };
+
+    let ctx = PolicyContext {
+        fee_tier: Some(fee_tier.to_string()),
+        min_avg_fee_used: Some(min_avg_fee_used),
+        min_total_fees_used: Some(cfg.min_total_fees),
+        reject_coinbase_zero: Some(cfg.reject_coinbase_zero),
+        unknown_mempool_as_high: Some(cfg.unknown_mempool_as_high),
+    };
+
+    (Some(code), Some(detail), Some(ctx))
+}
+
+fn wire_reason_code_str(r: &WireReason) -> &'static str {
+    match r {
+        WireReason::ProtocolVersionMismatch => "protocol_version_mismatch",
+        WireReason::PrevHashLenMismatch => "prev_hash_len_mismatch",
+        WireReason::InvalidPrevHash => "invalid_prev_hash",
+        WireReason::EmptyTemplateRejected => "empty_template_rejected",
+        WireReason::CoinbaseValueZeroRejected => "coinbase_value_zero_rejected",
+        WireReason::TxCountExceeded => "tx_count_exceeded",
+        WireReason::TotalFeesBelowMinimum => "total_fees_below_minimum",
+        WireReason::AvgFeeBelowMinimum => "avg_fee_below_minimum",
+
+        // New rg-protocol variants (must be covered)
+        WireReason::PolicyLoadError => "policy_load_error",
+        WireReason::MempoolBackendUnavailable => "mempool_backend_unavailable",
+        WireReason::InternalError => "internal_error",
+    }
+}
+
+/// Normalize legacy `reason` strings (old NDJSON) into canonical snake_case reason codes.
+fn normalize_reason_key(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return "unknown".to_string();
+    }
+
+    // Already snake_case style in most of your new logs.
+    if s.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return s.to_string();
+    }
+
+    match s {
+        "Ok" | "OK" | "Accepted" | "ACCEPT" => "ok".to_string(),
+
+        "PolicyLoadError" => "policy_load_error".to_string(),
+        "MempoolBackendUnavailable" => "mempool_backend_unavailable".to_string(),
+        "InternalError" => "internal_error".to_string(),
+
+        // Fall through: preserve unknown legacy strings rather than dropping signal.
+        _ => s.to_string(),
+    }
 }
 
 async fn run_tcp_server(
@@ -211,7 +389,7 @@ async fn run_tcp_server(
             loop {
                 line.clear();
                 let _n = match reader.read_line(&mut line).await {
-                    Ok(0) => break, // EOF
+                    Ok(0) => break,
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("read error: {e:?}");
@@ -227,83 +405,50 @@ async fn run_tcp_server(
                     }
                 };
 
-                // fetch mempool tx_count from template-manager (if configured)
-                let mempool_tx_count = if let Some(ref url) = url_clone {
-                    fetch_mempool_tx_count(url).await
+                let mempool_tx_count: Option<u64> = if let Some(ref url) = url_clone {
+                    timeout(
+                        Duration::from_millis(600),
+                        mempool_client::fetch_mempool_tx_count(url),
+                    )
+                    .await
+                    .ok() // Result<Option<u64>, Elapsed> -> Option<Option<u64>>
+                    .flatten() // Option<Option<u64>> -> Option<u64>
                 } else {
                     None
                 };
 
-                // read live policy for each decision
-                // Grab current policy snapshot
                 let cfg = {
                     let holder = state_clone.policy.read().unwrap();
                     holder.config.clone()
                 };
 
-                let (min_avg_fee_used, fee_tier) =
-                    cfg.effective_min_avg_fee_dynamic(mempool_tx_count);
+                let (reason_enum, fee_tier, min_avg_fee_used) =
+                    pool_verifier::policy::evaluate_dynamic(&propose, &cfg, mempool_tx_count);
+
+                let accepted = matches!(reason_enum, LocalReason::Ok);
+
+                let (wire_code, wire_detail, wire_ctx) =
+                    map_local_to_wire(&reason_enum, fee_tier.as_str(), min_avg_fee_used, &cfg);
+
+                let reason_code_str: Option<String> = wire_code
+                    .as_ref()
+                    .map(|c| wire_reason_code_str(c).to_string());
+
+                let reason_detail_str: Option<String> = wire_detail.clone();
 
                 let avg_fee = compute_avg_fee_sats_per_tx(&propose);
-
-                let mut accepted = true;
-                let mut reason_enum = VerdictReason::Ok;
-
-                // 0) reject empty templates if policy says so
-                if accepted && cfg.reject_empty_templates && propose.tx_count == 0 {
-                    accepted = false;
-                    reason_enum = VerdictReason::EmptyTemplate;
-                }
-
-                // 0.5) real CoinbaseZero check
-                if accepted && propose.coinbase_value == 0 {
-                    accepted = false;
-                    reason_enum = VerdictReason::CoinbaseZero;
-                }
-
-                // 1) Global min_total_fees
-                if accepted && propose.total_fees < cfg.min_total_fees {
-                    accepted = false;
-                    reason_enum = VerdictReason::TotalFeesTooLow {
-                        total: propose.total_fees,
-                        min_required: cfg.min_total_fees,
-                    };
-                }
-
-                // 2) Max tx count
-                if accepted && (propose.tx_count as u32) > cfg.max_tx_count {
-                    accepted = false;
-                    reason_enum = VerdictReason::TooManyTransactions {
-                        count: propose.tx_count,
-                        max_allowed: cfg.max_tx_count,
-                    };
-                }
-
-                // 3) Tiered fee floor
-                if accepted && avg_fee < min_avg_fee_used {
-                    accepted = false;
-                    reason_enum = VerdictReason::AverageFeeTooLow {
-                        avg: avg_fee,
-                        min_required: min_avg_fee_used,
-                    };
-                }
-
-                let reason_str = if matches!(reason_enum, VerdictReason::Ok) {
-                    None
-                } else {
-                    Some(format!("{reason_enum:?}"))
-                };
 
                 let verdict = TemplateVerdict {
                     version: PROTOCOL_VERSION,
                     id: propose.id,
                     accepted,
-                    reason: reason_str.clone(),
+                    reason_code: wire_code,
+                    reason_detail: wire_detail.clone(),
+                    policy_context: wire_ctx,
                 };
 
-                let log_id = id_ctr.fetch_add(1, Ordering::Relaxed);
+                let log_id: u64 = id_ctr.fetch_add(1, Ordering::Relaxed);
 
-                // build one LoggedVerdict
                 let logged = LoggedVerdict {
                     log_id,
                     template_id: propose.id,
@@ -311,8 +456,18 @@ async fn run_tcp_server(
                     total_fees: propose.total_fees,
                     tx_count: propose.tx_count,
                     accepted,
-                    reason: reason_str,
+
+                    // UI string: prefer reason_code; fallback to detail; fallback to ok.
+                    reason: reason_code_str
+                        .clone()
+                        .or_else(|| reason_detail_str.clone())
+                        .or(Some("ok".to_string())),
+
+                    reason_code: reason_code_str,
+                    reason_detail: reason_detail_str,
+
                     timestamp: current_timestamp(),
+
                     min_avg_fee_used,
                     fee_tier: fee_tier.as_str().to_string(),
                     avg_fee_sats_per_tx: avg_fee,
@@ -323,11 +478,15 @@ async fn run_tcp_server(
                     guard.push(logged.clone());
                     const MAX_LOG: usize = 1000;
                     if guard.len() > MAX_LOG {
-                        guard.remove(0);
+                        let excess = guard.len() - MAX_LOG;
+                        guard.drain(0..excess);
                     }
                 }
 
-                append_verdict_to_disk(&logged);
+                let logged_for_disk = logged.clone();
+                tokio::task::spawn_blocking(move || {
+                    append_verdict_to_disk(&logged_for_disk);
+                });
 
                 let json = match serde_json::to_string(&verdict) {
                     Ok(j) => j,
@@ -337,16 +496,13 @@ async fn run_tcp_server(
                     }
                 };
 
-                if let Err(e) = writer.write_all(json.as_bytes()).await {
-                    eprintln!("write error: {e:?}");
+                if writer.write_all(json.as_bytes()).await.is_err() {
                     break;
                 }
-                if let Err(e) = writer.write_all(b"\n").await {
-                    eprintln!("write error: {e:?}");
+                if writer.write_all(b"\n").await.is_err() {
                     break;
                 }
-                if let Err(e) = writer.flush().await {
-                    eprintln!("flush error: {e:?}");
+                if writer.flush().await.is_err() {
                     break;
                 }
             }
@@ -756,7 +912,7 @@ static INDEX_HTML: &str = r##"<!doctype html>
 
         <div style="margin-top:10px;font-size:11px;">
           Mempool stats for regtest stay exposed as raw JSON at
-          <a class="link" href="http://127.0.0.1:8081/mempool" target="_blank" rel="noreferrer">/mempool</a>.
+          <a class="link" href="/mempool" target="_blank" rel="noreferrer">/mempool</a>.
         </div>
 
         <div style="margin-top:10px;font-size:11px;">
@@ -944,13 +1100,31 @@ static INDEX_HTML: &str = r##"<!doctype html>
       var lines = [];
       lines.push("# Generated by Veldra dashboard wizard");
       lines.push("[policy]");
-      if (low  != null)   lines.push("low_mempool_tx = "   + low);
-      if (high != null)   lines.push("high_mempool_tx = "  + high);
-      if (flo  != null)   lines.push("min_avg_fee_lo = "   + flo);
-      if (fmid != null)   lines.push("min_avg_fee_mid = "  + fmid);
-      if (fhi  != null)   lines.push("min_avg_fee_hi = "   + fhi);
-      if (minT != null)   lines.push("min_total_fees = "   + minT);
-      if (maxTx != null)  lines.push("max_tx_count = "     + maxTx);
+      lines.push("protocol_version = " + String(2));
+      lines.push("required_prevhash_len = " + String(64));
+
+      // defaults when inputs are empty
+      function or0(x) { return (x == null || !isFinite(x)) ? 0 : Math.floor(x); }
+      function orMaxU32(x) { return (x == null || !isFinite(x)) ? 4294967295 : Math.floor(x); }
+
+      lines.push("min_total_fees = " + String(or0(minT)));
+      lines.push("max_tx_count = " + String(orMaxU32(maxTx)));
+
+      // tier thresholds and floors
+      lines.push("low_mempool_tx = " + String(or0(low)));
+      lines.push("high_mempool_tx = " + String(or0(high)));
+      lines.push("min_avg_fee_lo = " + String(or0(flo)));
+      lines.push("min_avg_fee_mid = " + String(or0(fmid)));
+      lines.push("min_avg_fee_hi = " + String(or0(fhi)));
+
+      // flags and safety (keep explicit so export is complete)
+      lines.push("reject_empty_templates = true");
+      lines.push("reject_coinbase_zero = false");
+      lines.push("unknown_mempool_as_high = true");
+
+      lines.push("");
+      lines.push("[policy.safety]");
+      lines.push("max_weight_ratio = 0.999");
 
       var toml = lines.join("\n");
 
@@ -1098,7 +1272,7 @@ static INDEX_HTML: &str = r##"<!doctype html>
           var ratio = v.avg_fee_sats_per_tx / v.min_avg_fee_used;
           ratioText = ratio.toFixed(2);
         } else {
-          ratioText = "n/a";  // or "∞", or leave blank
+          ratioText = "n/a";
         }
 
         tdRatio.textContent = ratioText;
@@ -1126,7 +1300,6 @@ static INDEX_HTML: &str = r##"<!doctype html>
 
     async function refresh() {
         try {
-        // Fetch everything in parallel
         const [resStats, resVerdicts, resPolicy, resMempool, resMeta] = await Promise.all([
         fetch("/stats"),
         fetch("/verdicts"),
@@ -1138,29 +1311,24 @@ static INDEX_HTML: &str = r##"<!doctype html>
         if (!resStats.ok)   throw new Error("stats HTTP "    + resStats.status);
         if (!resVerdicts.ok) throw new Error("verdicts HTTP " + resVerdicts.status);
         if (!resPolicy.ok)   throw new Error("policy HTTP "   + resPolicy.status);
-        // mempool and meta are allowed to fail, we handle null below
 
         const data     = await resStats.json();
         const verdicts = await resVerdicts.json();
         latestVerdicts = Array.isArray(verdicts) ? verdicts.slice() : [];
 
         const slice = showAllLog
-          ? latestVerdicts.slice().reverse()            // all
-          : latestVerdicts.slice(-LATEST_LIMIT).reverse(); // last N
+          ? latestVerdicts.slice().reverse()
+          : latestVerdicts.slice(-LATEST_LIMIT).reverse();
 
-        // update the "last X" badge text on every refresh
         const lastBadge = document.getElementById("badge-last");
         if (lastBadge) {
-          // cap at LATEST_LIMIT regardless of showAllLog
           const count = Math.min(LATEST_LIMIT, latestVerdicts.length);
           lastBadge.textContent = "last " + count;
         }
 
-        // render the table rows
         renderLatest(slice);
 
         const policy   = await resPolicy.json();
-
         populateWizardFromPolicy(policy);
 
         let mempool = null;
@@ -1181,7 +1349,6 @@ static INDEX_HTML: &str = r##"<!doctype html>
         }
         }
 
-        // ---------- basic stats ----------
         const total    = data.total    || 0;
         const accepted = data.accepted || 0;
         const rejected = data.rejected || 0;
@@ -1201,8 +1368,6 @@ static INDEX_HTML: &str = r##"<!doctype html>
         renderTable("table-tiers",   byTier,   "no tiers yet");
         renderPillsForTiers(byTier);
 
-    
-        // ---------- latest verdict card ----------
         if (last) {
         const labelTier = last.fee_tier || "unknown";
         const labelFeeUsed =
@@ -1237,7 +1402,6 @@ static INDEX_HTML: &str = r##"<!doctype html>
         setText("pill-latest-height",      "height n/a");
         }
 
-        // ---------- policy debug block ----------
         const pEl = document.getElementById("policy-debug");
         if (pEl) {
         if (policy) {
@@ -1251,26 +1415,12 @@ static INDEX_HTML: &str = r##"<!doctype html>
 
             if (typeof lo === "number" && typeof hi === "number") {
               const rows = [
-                {
-                  tier: "low",
-                  window: "mempool < " + lo + " tx",
-                  floor: "floor " + flo + " sats/tx",
-                },
-                {
-                  tier: "mid",
-                  window: lo + " ≤ mempool < " + hi + " tx",
-                  floor: "floor " + fmid + " sats/tx",
-                },
-                {
-                  tier: "high",
-                  window: "mempool ≥ " + hi + " tx",
-                  floor: "floor " + fhi + " sats/tx",
-                },
+                { tier: "low",  window: "mempool < " + lo + " tx",        floor: "floor " + flo + " sats/tx" },
+                { tier: "mid",  window: lo + " ≤ mempool < " + hi + " tx", floor: "floor " + fmid + " sats/tx" },
+                { tier: "high", window: "mempool ≥ " + hi + " tx",        floor: "floor " + fhi + " sats/tx" },
               ];
 
-              function pad(str, width) {
-                return str + " ".repeat(Math.max(0, width - str.length));
-              }
+              function pad(str, width) { return str + " ".repeat(Math.max(0, width - str.length)); }
 
               const col1 = Math.max("tier".length, ...rows.map(r => r.tier.length));
               const col2 = Math.max("window".length, ...rows.map(r => r.window.length));
@@ -1278,51 +1428,20 @@ static INDEX_HTML: &str = r##"<!doctype html>
 
               lines.push("Tier logic (by mempool tx count)");
               lines.push("");
-              lines.push(
-                "  " +
-                  pad("tier", col1) +
-                  "   " +
-                  pad("window", col2) +
-                  "   " +
-                  pad("floor", col3)
-              );
-              lines.push(
-                "  " +
-                  "-".repeat(col1) +
-                  "   " +
-                  "-".repeat(col2) +
-                  "   " +
-                  "-".repeat(col3)
-              );
-
-              rows.forEach(r => {
-                lines.push(
-                  "  " +
-                    pad(r.tier, col1) +
-                    "   " +
-                    pad(r.window, col2) +
-                    "   " +
-                    pad(r.floor, col3)
-                );
-              });
+              lines.push("  " + pad("tier", col1) + "   " + pad("window", col2) + "   " + pad("floor", col3));
+              lines.push("  " + "-".repeat(col1) + "   " + "-".repeat(col2) + "   " + "-".repeat(col3));
+              rows.forEach(r => lines.push("  " + pad(r.tier, col1) + "   " + pad(r.window, col2) + "   " + pad(r.floor, col3)));
             }
 
             if (typeof policy.min_total_fees === "number") {
               lines.push("");
               lines.push("Other constraints");
-              lines.push(
-                "  min_total_fees = " +
-                  policy.min_total_fees +
-                  " sats"
-              );
-              lines.push(
-                "  max_tx_count   = " +
-                  policy.max_tx_count
-              );
+              lines.push("  min_total_fees = " + policy.min_total_fees + " sats");
+              lines.push("  max_tx_count   = " + policy.max_tx_count);
             }
 
             if (lines.length === 0 && typeof policy.debug === "string") {
-            lines.push(policy.debug);
+              lines.push(policy.debug);
             }
 
             pEl.textContent = lines.join("\n");
@@ -1331,7 +1450,6 @@ static INDEX_HTML: &str = r##"<!doctype html>
         }
         }
 
-        // ---------- mempool card ----------
         const txEl    = document.getElementById("metric-mempool-tx");
         const bytesEl = document.getElementById("metric-mempool-bytes");
         const tierEl  = document.getElementById("pill-mempool-tier");
@@ -1352,17 +1470,13 @@ static INDEX_HTML: &str = r##"<!doctype html>
             usageStr = "bytes n/a";
           }
 
-          // staleness check
           let staleInfo = "";
           if (typeof mempool.timestamp === "number") {
             const nowSec = Date.now() / 1000;
             const ageSec = nowSec - mempool.timestamp;
             const ageText = ageSec.toFixed(0);
-            if (ageSec > 30) {
-              staleInfo = " • stale " + ageText + "s ago";
-            } else {
-              staleInfo = " • updated " + ageText + "s ago";
-            }
+            if (ageSec > 30) staleInfo = " • stale " + ageText + "s ago";
+            else staleInfo = " • updated " + ageText + "s ago";
           }
 
           if (txEl)    txEl.textContent    = String(tx);
@@ -1379,65 +1493,27 @@ static INDEX_HTML: &str = r##"<!doctype html>
             }
           }
 
-          if (tierEl) {
-            tierEl.textContent = "expected tier " + tierLabel;
-          }
+          if (tierEl) tierEl.textContent = "expected tier " + tierLabel;
         } else {
           if (txEl)    txEl.textContent    = "n/a";
           if (bytesEl) bytesEl.textContent = "no mempool backend";
           if (tierEl)  tierEl.textContent  = "tier n/a";
         }
 
-
-        // ---------- mode badge ----------
         const badge = document.getElementById("badge-mode");
-        if (badge && meta && meta.mode) {
-        badge.textContent = "mode: " + meta.mode;
-        }
+        if (badge && meta && meta.mode) badge.textContent = "mode: " + meta.mode;
 
-        // ---------- status line ----------
         const status = document.getElementById("status-line");
         if (status) {
         const now = new Date();
-        status.innerHTML = "Last update: <span>" +
-            now.toLocaleTimeString() +
-            "</span>";
+        status.innerHTML = "Last update: <span>" + now.toLocaleTimeString() + "</span>";
         }
     } catch (err) {
         const status = document.getElementById("status-line");
-        if (status) {
-        status.innerHTML = "Last update: <span>error</span>";
-        }
+        if (status) status.innerHTML = "Last update: <span>error</span>";
         console.error("refresh failed", err);
       }
   }
-
-    function updateLogModeBadge() {
-      const badge = document.getElementById("badge-log-mode");
-      if (!badge) return;
-      if (showAllLog) {
-        badge.textContent = "showing all";
-      } else {
-        const n = latestVerdicts.length;
-        const label = n <= 15 ? "last " + n : "last 15";
-        badge.textContent = label;
-      }
-    }
-
-    function toggleLogMode() {
-      showAllLog = !showAllLog;
-      const btn = document.getElementById("btn-toggle-log");
-      if (btn) {
-        btn.textContent = showAllLog ? "show last 15" : "show all";
-      }
-
-      const slice = showAllLog
-        ? latestVerdicts.slice().reverse()
-        : latestVerdicts.slice(-15).reverse();
-
-      renderLatest(slice);
-      updateLogModeBadge();
-    }
 
     document.addEventListener("DOMContentLoaded", function () {
       const badgeLast     = document.getElementById("badge-last");
@@ -1509,8 +1585,8 @@ async fn get_verdicts(Extension(log): Extension<VerdictLog>) -> Json<Vec<LoggedV
     Json(log.clone())
 }
 
-async fn get_verdict_log() -> impl IntoResponse {
-    let file = match File::open(VERDICT_LOG_PATH) {
+async fn get_verdict_log(Query(q): Query<TailQuery>) -> impl IntoResponse {
+    let f = match File::open(VERDICT_LOG_PATH) {
         Ok(f) => f,
         Err(_) => {
             let body = "no verdicts yet\n".to_string();
@@ -1518,11 +1594,20 @@ async fn get_verdict_log() -> impl IntoResponse {
         }
     };
 
-    let reader = StdBufReader::new(file);
+    let tail = q.tail.unwrap_or(2000).min(50_000);
 
-    let mut out = String::new();
+    let reader = StdBufReader::new(f);
+    let mut buf: VecDeque<String> = VecDeque::with_capacity(tail);
 
     for line in reader.lines().map_while(Result::ok) {
+        if buf.len() == tail {
+            buf.pop_front();
+        }
+        buf.push_back(line);
+    }
+
+    let mut out = String::new();
+    for line in buf {
         out.push_str(&line);
         out.push('\n');
     }
@@ -1534,23 +1619,33 @@ async fn get_verdict_log() -> impl IntoResponse {
     )
 }
 
-async fn get_verdicts_csv(Extension(log): Extension<VerdictLog>) -> impl IntoResponse {
+async fn get_verdicts_csv(
+    Query(q): Query<LimitQuery>,
+    Extension(log): Extension<VerdictLog>,
+) -> impl IntoResponse {
     let log = log.lock().unwrap();
+    let limit = q.limit.unwrap_or(1000).min(50_000);
+    let start = log.len().saturating_sub(limit);
 
     let mut out = String::new();
+    out.push_str("log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,min_avg_fee_used,avg_fee_sats_per_tx,reason_code,reason_detail,reason,timestamp\n");
 
-    // header
-    out.push_str("log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,min_avg_fee_used,avg_fee_sats_per_tx,reason,timestamp\n");
+    for v in log.iter().skip(start) {
+        let reason_code = v
+            .reason_code
+            .as_deref()
+            .unwrap_or(if v.accepted { "ok" } else { "" });
+        let reason_detail = v.reason_detail.as_deref().unwrap_or("");
+        let escaped_code = reason_code.replace('"', "\"\"");
+        let escaped_detail = reason_detail.replace('"', "\"\"");
 
-    for v in log.iter() {
-        let reason = v.reason.as_deref().unwrap_or("Ok");
-        // escape double quotes in reason and wrap in quotes
+        let reason = v.reason.as_deref().unwrap_or("ok");
         let escaped_reason = reason.replace('"', "\"\"");
 
         use std::fmt::Write as _;
         let _ = writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},\"{}\",{}\n",
+            "{},{},{},{},{},{},{},{},{},\"{}\",\"{}\",\"{}\",{}",
             v.log_id,
             v.template_id,
             v.height,
@@ -1560,6 +1655,8 @@ async fn get_verdicts_csv(Extension(log): Extension<VerdictLog>) -> impl IntoRes
             v.fee_tier,
             v.min_avg_fee_used,
             v.avg_fee_sats_per_tx,
+            escaped_code,
+            escaped_detail,
             escaped_reason,
             v.timestamp,
         );
@@ -1572,13 +1669,11 @@ async fn apply_policy(
     State(app_state): State<AppState>,
     Json(req): Json<ApplyPolicyReq>,
 ) -> impl IntoResponse {
-    // Start from current config
     let base_cfg = {
         let holder = app_state.policy.read().unwrap();
         holder.config.clone()
     };
 
-    // Apply changes to a local copy
     let mut cfg = base_cfg;
     if let Some(v) = req.low_mempool_tx {
         cfg.low_mempool_tx = v;
@@ -1602,7 +1697,6 @@ async fn apply_policy(
         cfg.max_tx_count = v;
     }
 
-    // Validate before committing
     if let Err(e) = cfg.validate() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1610,12 +1704,18 @@ async fn apply_policy(
         );
     }
 
-    // Commit into AppState
+    #[derive(Serialize)]
+    struct Wrapper<'a> {
+        policy: &'a PolicyConfig,
+    }
+
+    let toml_text = toml::to_string_pretty(&Wrapper { policy: &cfg })
+        .unwrap_or_else(|_| "# policy serialization failed\n".to_string());
+
     {
         let mut holder = app_state.policy.write().unwrap();
         holder.config = cfg;
-        // Best effort debug text (you can improve this later if you care about exact TOML)
-        holder.toml_text = format!("# updated via wizard\n# {:#?}", holder.config);
+        holder.toml_text = toml_text;
     }
 
     (StatusCode::OK, "ok".to_string())
@@ -1626,12 +1726,11 @@ async fn get_policy(State(app_state): State<AppState>) -> Json<serde_json::Value
     let policy = &holder.config;
     let dbg = format!("{policy:?}");
 
-    let body = serde_json::json!({
+    let body = json!({
         "protocol_version": policy.protocol_version,
         "required_prevhash_len": policy.required_prevhash_len,
         "min_total_fees": policy.min_total_fees,
         "max_tx_count": policy.max_tx_count,
-        "min_avg_fee": policy.min_avg_fee,
 
         "low_mempool_tx": policy.low_mempool_tx,
         "high_mempool_tx": policy.high_mempool_tx,
@@ -1639,8 +1738,10 @@ async fn get_policy(State(app_state): State<AppState>) -> Json<serde_json::Value
         "min_avg_fee_mid": policy.min_avg_fee_mid,
         "min_avg_fee_hi": policy.min_avg_fee_hi,
 
-        "max_weight_ratio": policy.max_weight_ratio,
+        "max_weight_ratio": policy.safety.max_weight_ratio,
         "reject_empty_templates": policy.reject_empty_templates,
+        "reject_coinbase_zero": policy.reject_coinbase_zero,
+        "unknown_mempool_as_high": policy.unknown_mempool_as_high,
 
         "debug": dbg
     });
@@ -1649,38 +1750,26 @@ async fn get_policy(State(app_state): State<AppState>) -> Json<serde_json::Value
 }
 
 async fn get_meta(Extension(ui_mode): Extension<String>) -> Json<serde_json::Value> {
-    let body = serde_json::json!({
+    let body = json!({
         "mode": ui_mode,
+        "log_write_errors": LOG_WRITE_ERRORS.load(Ordering::Relaxed),
     });
     Json(body)
 }
 
 async fn get_mempool_proxy() -> Json<serde_json::Value> {
-    // reuse the same env source we use for fee hints
-    let url_opt = mempool_url_from_env();
-    let Some(url) = url_opt else {
-        let body = serde_json::json!({
-            "error": "VELDRA_MEMPOOL_URL not set"
-        });
-        return Json(body);
+    let Some(url) = mempool_url_from_env() else {
+        return Json(json!({ "error": "VELDRA_MEMPOOL_URL not set" }));
     };
 
-    match reqwest::get(&url).await {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(json) => Json(json),
-            Err(e) => {
-                let body = serde_json::json!({
-                    "error": format!("invalid mempool json: {e}")
-                });
-                Json(body)
-            }
-        },
-        Err(e) => {
-            let body = serde_json::json!({
-                "error": format!("mempool fetch failed: {e}")
-            });
-            Json(body)
-        }
+    let resp = match http_client().get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => return Json(json!({ "error": format!("mempool fetch failed: {}", e) })),
+    };
+
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => Json(v),
+        Err(e) => Json(json!({ "error": format!("invalid mempool json: {}", e) })),
     }
 }
 
@@ -1695,24 +1784,25 @@ async fn get_stats(Extension(log): Extension<VerdictLog>) -> Json<StatsResponse>
 
     for v in log.iter() {
         total += 1;
-
         if v.accepted {
             accepted += 1;
         } else {
             rejected += 1;
         }
 
-        let reason_key = v
-            .reason
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| "Ok".to_string());
-        *by_reason.entry(reason_key).or_insert(0) += 1;
+        let reason_key = if v.accepted {
+            "ok".to_string()
+        } else if let Some(ref code) = v.reason_code {
+            normalize_reason_key(code)
+        } else if let Some(ref legacy) = v.reason {
+            normalize_reason_key(legacy)
+        } else {
+            "unknown".to_string()
+        };
 
+        *by_reason.entry(reason_key).or_insert(0) += 1;
         *by_tier.entry(v.fee_tier.clone()).or_insert(0) += 1;
     }
-
-    let last = log.last().cloned();
 
     Json(StatsResponse {
         total,
@@ -1720,7 +1810,7 @@ async fn get_stats(Extension(log): Extension<VerdictLog>) -> Json<StatsResponse>
         rejected,
         by_reason,
         by_tier,
-        last,
+        last: log.last().cloned(),
     })
 }
 
@@ -1745,8 +1835,6 @@ async fn apply_policy_toml(State(app_state): State<AppState>, bytes: Bytes) -> i
         }
     };
 
-    // Parse TOML into PolicyConfig the same way your file loader does:
-    // the TOML shape is [policy] {...}
     #[derive(Deserialize)]
     struct Wrapper {
         policy: PolicyConfig,
@@ -1780,7 +1868,6 @@ async fn apply_policy_toml(State(app_state): State<AppState>, bytes: Bytes) -> i
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-
         holder.config = parsed.policy;
         holder.toml_text = body;
     }

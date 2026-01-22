@@ -1,27 +1,30 @@
-protocol_version = 1
+[policy]
+protocol_version = 2
+required_prevhash_len = 64
 
-required_prevhash_len = 32
+min_total_fees = 0
 
-# Make empty templates reject on demand (easy reason diversity)
-reject_empty_templates = true
+# Don’t cap at 12 for demo; it causes lots of tx_count_exceeded noise.
+max_tx_count = 250
 
-# Keep this on if you want, but Phase 1 makes it irrelevant
-reject_coinbase_zero = false
-
-# These create predictable reject reasons
-min_total_fees = 5000
-max_tx_count = 12
-min_avg_fee = 0
-
-# Fee tiers. Keep these low enough that "high fee" batches pass.
-low_mempool_tx  = 5
+# Tier windows (tx count in mempool)
+low_mempool_tx = 5
 high_mempool_tx = 20
 
-tx_count_mid_threshold = 0
-tx_count_hi_threshold = 50
+# Floors are sats per tx (total_fees / tx_count).
+# Keep them modest so “normal” fee_rate traffic clears.
+min_avg_fee_lo  = 200
+min_avg_fee_mid = 1200
+min_avg_fee_hi  = 3500
 
-min_avg_fee_lo  = 10
-min_avg_fee_mid = 100
-min_avg_fee_hi  = 200
+# Demo: don’t kill empty templates; regtest often empties.
+reject_empty_templates = true
 
-max_weight_ratio = 1.00
+# Optional enforcement knob; fine either way for demo.
+reject_coinbase_zero = true
+
+# If mempool fetch fails, don’t silently go “high strict”.
+unknown_mempool_as_high = false
+
+[policy.safety]
+max_weight_ratio = 0.999

@@ -1,36 +1,36 @@
-# Veldra — ReserveGrid OS 
+# Veldra — ReserveGrid OS
 
-**ReserveGrid OS** is Veldra’s policy driven verification layer for Bitcoin mining pools. It inspects candidate block templates against an operator defined policy and returns an **ACCEPT** or **REJECT** verdict with a machine readable reason, plus an operator facing dashboard for observability.
+**ReserveGrid OS** is Veldra’s policy driven verification layer for Bitcoin mining pools. It inspects candidate block templates against an operator defined policy and returns an **ACCEPT** or **REJECT** verdict with a machine readable reason code and policy context, plus an operator facing dashboard for observability.
 
-This repo is a **beta prototype** intended to be legible, testable, and easy for a pool operator to evaluate. It is built to be swapped into a pool pipeline with minimal ceremony.
+This repository is a **beta prototype** optimized for legibility and fast evaluation. It is designed to be swapped into a pool pipeline with minimal ceremony.
 
 ---
 
 ## Demo and repo links
-- **Repo:** `<https://github.com/LeavesJ/veldra>`
-- **Website:** `<https://veldra.org>`
-- **Contact (personal):** `<jarrondeng@gmail.com>`
-- **Contact (work):** `<jarrondeng@veldra.org>`
+- **Repo:** https://github.com/LeavesJ/veldra
+- **Website:** https://veldra.org
+- **Contact (personal):** jarrondeng@gmail.com
+- **Contact (work):** jarrondeng@veldra.org
 
 ---
 
 ## What ReserveGrid OS does
-- Evaluates incoming block templates against a configurable `policy.toml`
-- Returns a verdict over a simple TCP JSON protocol (TemplatePropose -> TemplateVerdict)
-- Records verdicts to disk as NDJSON for audit and debugging
-- Exposes an operator dashboard with:
+- Evaluates candidate block templates against a configurable `policy.toml`
+- Returns a verdict over a simple TCP line delimited JSON protocol: `TemplatePropose -> TemplateVerdict`
+- Logs verdicts to disk as NDJSON for audit and debugging
+- Provides an operator dashboard with:
   - throughput and accept rate
-  - fee tier behavior driven by mempool conditions
-  - aggregates by reject reason and tier
-  - current active policy view
-  - policy wizard UI (generate and optionally apply a policy)
+  - dynamic fee tier behavior driven by mempool conditions
+  - aggregates by reject reason code and tier
+  - current active policy view and policy validation errors
+  - bounded exports for logs and CSV
 
 ---
 
 ## What ReserveGrid OS does not do
 - It does not mine blocks
-- It does not replace a pool’s payout system
-- It does not force pool policy on chain
+- It does not replace a pool payout system
+- It does not force policy on chain
 - It is not a consensus change
 - It is not a custody product
 
@@ -39,33 +39,41 @@ ReserveGrid OS is an ops layer control surface. Pools remain in control.
 ---
 
 ## Services
-ReserveGrid OS consists of two primary services plus shared protocol types.
+ReserveGrid OS consists of two services plus shared protocol types.
 
-1. **pool-verifier**
-   - TCP server: receives templates and returns verdicts
-   - HTTP server: dashboard, stats, policy endpoints, log export
-   - Holds the active policy in memory and can be updated at runtime
+### 1. pool verifier
+- TCP server that receives `TemplatePropose` and returns `TemplateVerdict`
+- HTTP server for dashboard and operator endpoints
+- Loads an initial policy from TOML and holds the active policy in memory
+- Emits stable, machine readable reject reason codes with supporting policy context
 
-2. **template-manager**
-   - Fetches templates from a backend (regtest `bitcoind` in this prototype)
-   - Sends templates to `pool-verifier` over TCP
-   - Exposes a small HTTP endpoint for mempool stats used for tier selection
+### 2. template manager
+- Fetches templates from a backend and forwards them to the verifier
+- Backends:
+  - `bitcoind` via `getblocktemplate` (regtest demo path)
+  - `stratum` via a local bridge that emits `TemplatePropose` as line delimited JSON
+- Exposes a small HTTP endpoint for mempool stats used by the verifier tier logic
+- Uses an HTTP bind as a single instance lock to prevent duplicate senders
 
-3. **rg_protocol**
-   - Shared message structs and protocol versioning
+### 3. rg protocol
+- Shared protocol structs and versioning
+- `TemplatePropose` and `TemplateVerdict` message types
+- Protocol version constant used across services
 
 ---
 
 ## Repository layout
-Typical layout in this repo:
-
 - `services/pool-verifier/`
-  - `src/main.rs` (HTTP dashboard, TCP server, log export)
-  - `src/policy.rs` (PolicyConfig, VerdictReason, validation logic)
-  - `src/state.rs` (shared app state, policy holder, load and update)
-  - `data/` (verdict log output)
+  - `src/main.rs` (HTTP dashboard, TCP server, bounded exports)
+  - `src/policy.rs` (PolicyConfig, validation, evaluation, reason codes)
+  - `src/state.rs` (shared app state and policy holder)
+  - `data/` (verdict logs at runtime, excluded from git)
 - `services/template-manager/`
-  - bitcoind backend prototype and mempool endpoint
+  - `src/main.rs` (backends, manager loop, HTTP server)
+  - `src/config.rs` (manager config)
+  - `manager.toml` (example config)
+- `services/rg-protocol/`
+  - shared message structs and protocol versioning
 - `config/`
   - `beta-policy.toml` (example policy file used in regtest)
 - `scripts/`
@@ -78,30 +86,29 @@ Typical layout in this repo:
 ## Architecture overview
 High level flow:
 
-~~~text
-(bitcoind or stratum bridge)
-          |
-          v
-   template-manager
-   (fetch templates)
-          |
-          |  TCP JSON: TemplatePropose
-          v
-     pool-verifier  -------->  HTTP dashboard (/)
-     (evaluate)              HTTP API (/stats, /policy, /verdicts, exports)
-          |
-          |  TCP JSON: TemplateVerdict
-          v
- (template-manager accepts or rejects template upstream)
-~~~
+    (bitcoind or stratum bridge)
+              |
+              v
+       template-manager
+       (fetch templates)
+              |
+              |  TCP line delimited JSON: TemplatePropose
+              v
+         pool-verifier  -------->  HTTP dashboard (/)
+         (evaluate)              HTTP API (/stats, /policy, exports)
+              |
+              |  TCP line delimited JSON: TemplateVerdict
+              v
+    (template-manager accepts or rejects upstream)
 
 Where this sits in a real pool:
-- Between the pool’s template source (bitcoind, stratum bridge, custom builder) and the pool’s job distribution system
-- Or as a sidecar that must approve templates before the pool publishes jobs to miners
+- Between the pool template source and the pool job distribution system
+- Or as a sidecar gate that must approve templates before jobs are published to miners
 
 ---
 
 ## Quickstart
+
 ### 1. Prerequisites
 - Rust toolchain (stable)
 - `bitcoind` and `bitcoin-cli` installed locally
@@ -110,359 +117,263 @@ Where this sits in a real pool:
 ### 2. Build
 From repo root:
 
-~~~bash
-cargo build
-~~~
+    cargo build
 
-Or build individual services:
+Or build services individually:
 
-~~~bash
-cd services/pool-verifier && cargo build
-cd services/template-manager && cargo build
-~~~
+    cd services/pool-verifier && cargo build
+    cd services/template-manager && cargo build
 
 ---
 
 ## 3. Run the regtest demo
+
 ### 3.1 One command start
-From the repository root:
+From repo root:
 
-~~~bash
-./scripts/dev-regtest.sh
-~~~
+    ./scripts/dev-regtest.sh
 
-This script is expected to:
-1. Start `bitcoind` in regtest mode
-2. Ensure a regtest wallet exists
-3. Build `pool-verifier` and `template-manager`
-4. Start `pool-verifier`:
-   - HTTP on `127.0.0.1:8080`
-   - TCP on `127.0.0.1:5001`
-5. Start `template-manager` on `127.0.0.1:8081`
-6. Generate a repeating pattern of low fee and high fee batches (optional, depending on your script version)
+Expected behavior:
+1. Starts `bitcoind` in regtest mode
+2. Ensures a regtest wallet exists
+3. Builds `pool-verifier` and `template-manager`
+4. Starts `pool-verifier`
+   - HTTP at `127.0.0.1:8080`
+   - TCP at `127.0.0.1:5001`
+5. Starts `template-manager`
+   - HTTP at `127.0.0.1:8081`
+6. Optional traffic generator patterns depending on your script version
 
 ### 3.2 Open the dashboard
 Open:
 
-~~~text
-http://127.0.0.1:8080
-~~~
+- http://127.0.0.1:8080
 
 You should see:
 - throughput increasing
 - recent templates updating
 - aggregates changing as accepts and rejects happen
 
-### 3.3 Start the full regtest stack
-If you want to run services manually instead of the script:
+### 3.3 Manual run
 
-1) Start bitcoind regtest:
+#### 3.3.1 Start bitcoind (regtest)
+    bitcoind -regtest \
+      -server=1 \
+      -rpcuser=veldra \
+      -rpcpassword=very_secure_password \
+      -rpcport=18443 \
+      -fallbackfee=0.0001 \
+      -maxmempool=300
 
-~~~bash
-bitcoind -regtest \
-  -server=1 \
-  -rpcuser=veldra \
-  -rpcpassword=very_secure_password \
-  -rpcport=18443 \
-  -fallbackfee=0.0001 \
-  -maxmempool=300 \
-~~~
+#### 3.3.2 Start template manager
+    cd services/template-manager
 
-2) Start `template-manager`:
+    export VELDRA_MANAGER_HTTP_ADDR="127.0.0.1:8081"
+    export VELDRA_VERIFIER_ADDR="127.0.0.1:5001"
+    export VELDRA_MANAGER_CONFIG="./manager.toml"
 
-~~~bash
-cd services/template-manager
-export VELDRA_MANAGER_HTTP_ADDR="127.0.0.1:8081"
-export VELDRA_VERIFIER_ADDR="127.0.0.1:5001"
-export VELDRA_MANAGER_CONFIG="./manager.toml"
-cargo run
-~~~
+    cargo run
 
-3) Start `pool-verifier`:
+#### 3.3.3 Start pool verifier
+    cd services/pool-verifier
+    mkdir -p data
 
-~~~bash
-cd services/pool-verifier
-mkdir -p data
+    export VELDRA_HTTP_ADDR="127.0.0.1:8080"
+    export VELDRA_VERIFIER_ADDR="127.0.0.1:5001"
+    export VELDRA_MEMPOOL_URL="http://127.0.0.1:8081/mempool"
+    export VELDRA_DASH_MODE="regtest-bitcoind"
+    export VELDRA_POLICY_FILE="../../config/beta-policy.toml"
 
-export VELDRA_HTTP_ADDR="127.0.0.1:8080"
-export VELDRA_VERIFIER_ADDR="127.0.0.1:5001"
-export VELDRA_MEMPOOL_URL="http://127.0.0.1:8081/mempool"
-export VELDRA_DASH_MODE="regtest-bitcoind"
-export VELDRA_POLICY_FILE="../../config/beta-policy.toml"
+    cargo run
 
-cargo run
-~~~
-
-4) Confirm endpoints:
-
-~~~bash
-curl -s http://127.0.0.1:8080/health
-curl -s http://127.0.0.1:8080/meta
-curl -s http://127.0.0.1:8080/policy
-curl -s http://127.0.0.1:8080/stats
-~~~
+#### 3.3.4 Sanity checks
+    curl -s "http://127.0.0.1:8080/health"
+    curl -s "http://127.0.0.1:8080/meta"
+    curl -s "http://127.0.0.1:8080/policy"
+    curl -s "http://127.0.0.1:8080/stats"
 
 ---
 
 ## 4. Policy management
+
 ### 4.1 Policy file
-ReserveGrid OS reads an initial policy from:
+The verifier reads an initial policy from:
 
-- `VELDRA_POLICY_FILE` (path to `policy.toml`)
+- `VELDRA_POLICY_FILE` (path to a TOML file)
 
-The verifier validates the policy on startup. If validation fails, it refuses to run.
+On startup:
+- the policy is parsed
+- validated
+- installed as the active policy
+- the verifier refuses to run if validation fails
 
 ### 4.2 Dynamic fee tiers
-The verifier can choose an effective minimum average fee floor based on mempool conditions:
-- It fetches mempool tx count from `VELDRA_MEMPOOL_URL` (template-manager endpoint)
-- It selects `low`, `mid`, or `high` tier based on configured thresholds
-- It applies the tier specific `min_avg_fee_*` floor
+ReserveGrid OS supports dynamic fee tiers:
+- the verifier fetches mempool tx count from `VELDRA_MEMPOOL_URL` (template-manager endpoint)
+- it selects a tier based on thresholds
+- it applies the tier specific fee floor
+
+Degraded mode behavior:
+- when mempool fetch fails, the verifier chooses a conservative tier based on `unknown_mempool_as_high`
 
 ### 4.3 Policy wizard
-The dashboard includes a **Policy wizard**:
-- It displays the current policy
-- It lets you modify thresholds and fee floors
-- It generates a TOML block
-- Optionally, it can POST the generated TOML to the verifier to apply live (if enabled in your build)
+The dashboard includes a policy wizard that:
+- edits tier thresholds and fee floors
+- generates TOML
+- can optionally apply policy live (if enabled in your build)
 
-Important behavior:
-- The wizard should not reset your inputs every refresh
-- The dashboard “Current policy” view should reflect the actual active policy in the verifier
-
-If the wizard applies policy live, it should:
+Intended apply flow:
 1. Parse TOML into `PolicyConfig`
-2. Validate it
-3. Swap it into shared app state
-4. Cause subsequent template verdicts to use the new policy
+2. Validate
+3. Swap into shared state
+4. Subsequent verdicts use the new policy
 
 ---
 
 ## 5. Policy schema
-Your actual `PolicyConfig` is the source of truth. This is the intended shape.
+`PolicyConfig` is the source of truth. Example shape:
 
-Example `config/beta-policy.toml`:
+    [policy]
+    protocol_version = 2
+    required_prevhash_len = 64
 
-~~~toml
-[policy]
-protocol_version = 1
-required_prevhash_len = 64
+    min_avg_fee_lo  = 1
+    min_avg_fee_mid = 2000
+    min_avg_fee_hi  = 5000
 
-# Fee floors are in sats per tx in this prototype (avg fee per tx)
-min_avg_fee_lo  = 1
-min_avg_fee_mid = 2000
-min_avg_fee_hi  = 5000
+    low_mempool_tx  = 0
+    high_mempool_tx = 50
 
-# Tier selection driven by mempool tx count
-low_mempool_tx  = 0
-high_mempool_tx = 50
+    min_total_fees = 0
+    max_tx_count   = 10000
 
-# Optional constraints
-min_total_fees = 0
-max_tx_count   = 10000
+    reject_empty_templates = true
+    max_weight_ratio = 0.999
 
-# Optional safety controls (if enabled in your policy.rs)
-reject_empty_templates = true
-max_weight_ratio = 0.999
-~~~
+    unknown_mempool_as_high = true
+    reject_coinbase_zero = true
 
 Notes:
-- The “avg fee” is currently computed as `total_fees / tx_count` (sats per tx)
-- If `tx_count == 0`, avg fee is treated as 0 by default, unless you choose to hard reject empty templates
+- In this prototype, “avg fee” is computed as `total_fees / tx_count` (sats per tx)
+- If `tx_count == 0`, avg fee is treated as 0 unless you reject empty templates
 
 ---
 
-## 6. HTTP API (pool-verifier)
-Base: `http://127.0.0.1:8080`
+## 6. HTTP API
+Base: http://127.0.0.1:8080
 
-- `/` and `/ui`
-  - HTML dashboard
-- `/health`
-  - liveness check
-- `/stats`
-  - counts and last verdict summary
-- `/verdicts`
-  - JSON list of recent verdicts in memory
-- `/verdicts/log`
-  - NDJSON export from disk log
-- `/verdicts.csv`
-  - CSV export of current in memory log window
-- `/policy`
-  - current policy as JSON (the active policy)
-- `/mempool`
-  - proxy to template-manager mempool endpoint (best effort)
-- `/meta`
-  - dashboard mode label, useful for demos
-- `/wizard`
-  - optional GET and POST endpoints for wizard integration, depending on your build
+Common endpoints:
+- `/`  
+  HTML dashboard
+- `/health`  
+  liveness check
+- `/meta`  
+  dashboard mode label
+- `/stats`  
+  aggregate counters and last verdict summary
+- `/policy`  
+  active policy (the policy actually used for evaluation)
+- `/verdicts`  
+  in memory verdict window (JSON)
+- `/verdicts/log?tail=N`  
+  NDJSON export from disk log, bounded by a hard cap
+- `/verdicts.csv?limit=N`  
+  CSV export, bounded by a hard cap
+- `/mempool`  
+  best effort proxy to template-manager mempool endpoint
+
+Terminal note:
+- When calling URLs with `?tail=` or `?limit=` in zsh, quote the URL to avoid wildcard expansion.
 
 ---
 
-## 7. TCP protocol (template-manager to pool-verifier)
-The verifier speaks a simple line delimited JSON protocol.
+## 7. TCP protocol
+ReserveGrid OS uses a line delimited JSON protocol over TCP.
 
-### 7.1 TemplatePropose (request)
-Fields typically include:
+### 7.1 TemplatePropose
+Typical fields:
 - `version`
 - `id`
 - `block_height`
-- `prevhash`
+- `prev_hash`
+- `coinbase_value`
 - `tx_count`
 - `total_fees`
-- any other fields you choose to include later (weight, sigops, txids)
+- optional fields as you extend the protocol
 
-### 7.2 TemplateVerdict (response)
+### 7.2 TemplateVerdict
+Typical fields:
 - `version`
 - `id`
-- `accepted` (bool)
-- `reason` (optional string)
+- `accepted`
+- `reason_code` (stable machine readable string when rejected)
+- `reason_detail` (optional operator detail)
+- `policy_context` (optional structured context)
 
 ---
 
 ## 8. Verdict reasons
-ReserveGrid OS already supports multiple reasons (your `VerdictReason` enum). You only see a subset if your evaluation logic only checks one thing.
 
-Common reasons you can emit:
-- `UnsupportedVersion`
-- `PrevHashWrongLen`
-- `CoinbaseZero`
-- `TotalFeesTooLow`
-- `TooManyTransactions`
-- `AverageFeeTooLow`
-- and more as you add constraints
+Veldra returns one primary `reason_code` per rejected template. `reason_code` is the stable contract (snake_case). UI labels and internal enum names may change without notice.
 
-### Which reason shows if multiple checks fail?
-ReserveGrid OS returns **one** reason per verdict in the current prototype. The reason is whichever check your code chooses to evaluate first.
+Examples:
+- `protocol_version_mismatch`
+- `prev_hash_len_mismatch`
+- `invalid_prev_hash`
+- `empty_template_rejected`
+- `coinbase_value_zero_rejected`
+- `total_fees_below_minimum`
+- `tx_count_exceeded`
+- `avg_fee_below_minimum`
 
-If you want multiple reasons:
-- Option A: return a list of reasons in the verdict
-- Option B: keep one primary reason (fast path) and log secondary reasons in debug data
-- Option C: define a priority ordering (safety first, then economics)
-
-Pools typically want a single primary reason for fast operational triage, with optional secondary detail.
+Priority behavior:
+- One primary reason is emitted for fast triage
+- `policy_context` carries relevant thresholds and computed values (e.g., `fee_tier`, `min_avg_fee_used`, `min_total_fees_used`, `reject_coinbase_zero`, `unknown_mempool_as_high`)
 
 ---
 
-## 9. Dashboard interpretation notes
-### 9.1 Ratio column
-The “ratio” shown in the Recent templates table is:
+## 9. Troubleshooting
 
-~~~text
-ratio = avg_fee_sats_per_tx / min_avg_fee_used
-~~~
-
-Why it can look repetitive:
-- If your traffic generator produces two stable fee regimes, you will see the same avg fee values and ratios repeating.
-- If `avg_fee_sats_per_tx` is 0, ratio is 0.
-- If `min_avg_fee_used` is 0, the ratio needs a safe guard (avoid divide by zero). Many builds show 0.00 or treat ratio as 0 in that case.
-
-If you want more varied ratios, your traffic generator must vary fee rates and tx counts more.
-
-### 9.2 Why you saw total_fees = 0
-In regtest, templates can show `total_fees = 0` when:
-- the mempool is empty and the candidate template has only coinbase
-- your tx generation did not actually land spendable transactions in mempool
-- your script mined blocks too aggressively, clearing the mempool before templates were fetched
-- your tx creation commands failed silently
-
-When fees are 0, fee based policies become a blunt instrument. That is expected in synthetic regtest unless you deliberately maintain a mempool backlog.
-
----
-
-## 10. Troubleshooting
-### 10.1 bitcoind RPC auth failures
-If you see:
-- “Authorization failed”
-- “Incorrect rpcuser or rpcpassword”
-
-Confirm your script matches your bitcoind args:
+### 9.1 bitcoind RPC auth failures
+If you see auth failures, confirm:
 - `-rpcuser=veldra`
 - `-rpcpassword=very_secure_password`
 - `-rpcport=18443`
 
-Also confirm your wrapper script `dev-bitcoin-cli.sh` uses the same values.
+### 9.2 avoid_reuse type error
+If you see: JSON value of type number is not of expected type bool
 
-### 10.2 Wrong type passed: avoid_reuse
-If you see:
-- “JSON value of type number is not of expected type bool” for `avoid_reuse`
+A command is passing `avoid_reuse` as `0` or `1`.  
+Fix: pass `true` or `false`, or omit the argument.
 
-That means a command is passing `avoid_reuse` as `0` or `1` instead of `true` or `false`.
+### 9.3 Fees appear as 0 in regtest
+Common causes:
+- mempool is empty
+- tx creation did not land transactions in mempool
+- blocks mined too aggressively, clearing mempool before templates were fetched
 
-Fix: pass `true` or `false`, or remove the arg and use the default.
-
-### 10.3 Wizard TOML parse error: missing protocol_version
-If the wizard generates TOML that fails parsing, ensure it includes required fields.
-If `PolicyConfig` requires `protocol_version`, then the wizard output must include it.
-
-Fix: include:
-
-~~~toml
-[policy]
-protocol_version = 1
-~~~
-
-### 10.4 Dashboard shows old policy after wizard apply
-This means the verifier is not actually swapping the policy used by:
-- the TCP evaluation path
-- the `/policy` endpoint
-
-Fix: the TCP evaluation should read from a shared policy holder (Arc RwLock) instead of cloning a static `PolicyConfig` at startup.
+Regtest requires deliberate mempool maintenance to exercise fee policy.
 
 ---
 
-## 11. Pool integration notes
-### Minimal integration contract
-A pool integrating ReserveGrid OS needs to:
-1. Produce or access candidate templates
-2. Send `TemplatePropose` to `pool-verifier`
-3. Receive `TemplateVerdict`
-4. If accepted, continue normal job publication
-5. If rejected, request a new template or adjust template builder policy
-
-### What pools can customize
-Pools can implement their own policy constraints by:
-- extending `PolicyConfig`
-- extending `VerdictReason`
-- extending the validation logic that produces the verdict
-
-The dashboard will display whatever `reason` string is returned in the verdict.
-
-### Future direction for pool defined reasons
-For maximum flexibility without forking:
-- define a plugin interface (dynamic library, wasm, or policy DSL)
-- allow policies to define custom reason codes and messages
-- keep the dashboard generic: it renders reason strings and aggregates by key
-
----
-
-## 12. Security and operational notes
-- The regtest credentials in scripts are for local demos only
-- Do not expose the HTTP dashboard publicly without auth
-- Treat verdict logs as operational telemetry, they can leak policy structure
-- Production deployments should include:
+## 10. Security and operational notes
+- Regtest credentials in scripts are for local demos only
+- Do not expose the HTTP dashboard publicly without auth and TLS
+- Verdict logs are operational telemetry and may leak policy structure
+- Production deployments should add:
   - TLS termination
-  - auth on admin endpoints (wizard apply, log download)
-  - bounded memory and log retention policies
-  - structured logs and metrics export (Prometheus or similar)
-
----
-
-## 13. Roadmap (high signal)
-- Stronger policy validation with actionable errors
-- Cleaner policy wizard UX and policy export workflow
-- Stratum v2 integration path for real pool pipelines
-- Richer template fields: weight, sigops, ancestor stats, package feerate
-- Multi reason verdict option with priority ordering
-- Operator runbook hardening: “no questions asked” install and demo flow
+  - auth on admin endpoints and exports
+  - log retention and rotation
+  - structured metrics export
 
 ---
 
 ## License
-`<License: VELDRA SOURCE AVAILABLE LICENSE (see LICENSE)>`
+VELDRA SOURCE AVAILABLE LICENSE (see `LICENSE`)
 
 ---
 
 ## Maintainer
-Veldra, ReserveGrid OS
-`<Jarron Deng>`  
-`<jarrondeng@veldra.org>`  
-
+Veldra, Inc.
+Jarron Deng  
+jarrondeng@veldra.org

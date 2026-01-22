@@ -2,15 +2,15 @@ use std::{
     collections::hash_map::DefaultHasher,
     env,
     hash::{Hash, Hasher},
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::sync::{RwLock, mpsc};
+use tokio::time::{Duration, sleep, timeout};
 
 use axum::{Extension, Json, Router, routing::get};
 use bitcoincore_rpc::json::{
@@ -24,10 +24,12 @@ use rg_protocol::{PROTOCOL_VERSION, TemplatePropose, TemplateVerdict};
 mod config;
 use config::TemplateManagerConfig;
 
+use async_trait::async_trait;
+
 /// Source of block templates.
+#[async_trait]
 trait TemplateSource: Send {
-    /// Returns Some(template) if there is a new template, or None if nothing changed.
-    fn next_template(&mut self) -> Result<Option<TemplatePropose>>;
+    async fn next_template(&mut self) -> Result<Option<TemplatePropose>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,49 +62,70 @@ fn block_subsidy_sats(height: u32) -> u64 {
     (50u64 * 100_000_000u64) >> halvings
 }
 
+fn stable_template_id(fp: &TemplateFingerprint) -> u64 {
+    let mut h = DefaultHasher::new();
+    fp.height.hash(&mut h);
+    fp.prev_hash.hash(&mut h);
+    fp.tx_count.hash(&mut h);
+    fp.total_fees.hash(&mut h);
+    fp.txids_hash.hash(&mut h);
+    h.finish()
+}
+
+fn build_bitcoind_client(cfg: &TemplateManagerConfig) -> anyhow::Result<Arc<Client>> {
+    let url = cfg
+        .rpc_url
+        .clone()
+        .unwrap_or_else(|| "http://127.0.0.1:18443".to_string());
+    let user = cfg.rpc_user.clone().unwrap_or_else(|| "veldra".to_string());
+    let pass = cfg
+        .rpc_pass
+        .clone()
+        .unwrap_or_else(|| "very_secure_password".to_string());
+
+    let auth = Auth::UserPass(user, pass);
+    let client = Client::new(&url, auth).context("failed to create bitcoind RPC client")?;
+    Ok(Arc::new(client))
+}
+
 /// Bitcoind-backed template source using getblocktemplate.
 struct BitcoindTemplateSource {
-    client: Client,
-    next_id: u64,
+    client: Arc<Client>,
     last_fp: Option<TemplateFingerprint>,
     had_rpc_error: bool,
 }
 
 impl BitcoindTemplateSource {
-    fn from_config(cfg: &TemplateManagerConfig) -> Self {
-        let url = cfg
-            .rpc_url
-            .clone()
-            .unwrap_or_else(|| "http://127.0.0.1:18443".to_string());
-        let user = cfg.rpc_user.clone().unwrap_or_else(|| "veldra".to_string());
-        let pass = cfg
-            .rpc_pass
-            .clone()
-            .unwrap_or_else(|| "very_secure_password".to_string());
-
-        let auth = Auth::UserPass(user, pass);
-        let client = Client::new(&url, auth).expect("failed to create bitcoind RPC client");
-
+    fn new(client: Arc<Client>) -> Self {
         Self {
             client,
-            next_id: 1,
             last_fp: None,
             had_rpc_error: false,
         }
     }
 }
 
+#[async_trait]
 impl TemplateSource for BitcoindTemplateSource {
-    fn next_template(&mut self) -> Result<Option<TemplatePropose>> {
+    async fn next_template(&mut self) -> Result<Option<TemplatePropose>> {
         let mut attempts = 0;
+
         let tpl_opt = loop {
-            match self.client.get_block_template(
-                GetBlockTemplateModes::Template,
-                &[GetBlockTemplateRules::SegWit],
-                &[] as &[GetBlockTemplateCapabilities],
-            ) {
-                Ok(t) => break Some(t),
-                Err(e) => {
+            let client = self.client.clone();
+
+            // blocking RPC inside spawn_blocking
+            let res = tokio::task::spawn_blocking(move || {
+                client.get_block_template(
+                    GetBlockTemplateModes::Template,
+                    &[GetBlockTemplateRules::SegWit],
+                    &[] as &[GetBlockTemplateCapabilities],
+                )
+            })
+            .await;
+
+            match res {
+                Ok(Ok(t)) => break Some(t),
+                Ok(Err(e)) => {
                     attempts += 1;
                     eprintln!("[manager] get_block_template attempt {attempts} failed: {e:?}");
 
@@ -114,7 +137,20 @@ impl TemplateSource for BitcoindTemplateSource {
                         break None;
                     }
 
-                    std::thread::sleep(Duration::from_millis(200));
+                    sleep(Duration::from_millis(200)).await;
+                }
+                Err(join_err) => {
+                    attempts += 1;
+                    eprintln!(
+                        "[manager] get_block_template spawn_blocking join error attempt {attempts}: {join_err:?}"
+                    );
+
+                    if attempts >= 3 {
+                        self.had_rpc_error = true;
+                        break None;
+                    }
+
+                    sleep(Duration::from_millis(200)).await;
                 }
             }
         };
@@ -165,12 +201,12 @@ impl TemplateSource for BitcoindTemplateSource {
         if self.last_fp.as_ref() == Some(&fp) {
             return Ok(None);
         }
+
+        // stable id BEFORE moving fp
+        let id: u64 = stable_template_id(&fp);
         self.last_fp = Some(fp);
 
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let proposal = TemplatePropose {
+        Ok(Some(TemplatePropose {
             version: PROTOCOL_VERSION,
             id,
             block_height,
@@ -178,9 +214,9 @@ impl TemplateSource for BitcoindTemplateSource {
             coinbase_value,
             tx_count,
             total_fees,
-        };
-
-        Ok(Some(proposal))
+            observed_weight: None,
+            created_at_unix_ms: Some(now_unix_ms()),
+        }))
     }
 }
 
@@ -199,8 +235,9 @@ impl StratumTemplateSource {
         let auth = cfg.stratum_auth.clone();
 
         println!(
-            "StratumTemplateSource connecting to Stratum V2 bridge at {} auth={:?}",
-            addr, auth
+            "StratumTemplateSource connecting to Stratum V2 bridge at {} auth_set={}",
+            addr,
+            auth.is_some()
         );
 
         let (tx, rx) = mpsc::channel::<TemplatePropose>(16);
@@ -228,7 +265,12 @@ impl StratumTemplateSource {
                                 break;
                             }
 
-                            match serde_json::from_str::<TemplatePropose>(&line) {
+                            let s = line.trim();
+                            if s.is_empty() {
+                                continue;
+                            }
+
+                            match serde_json::from_str::<TemplatePropose>(s) {
                                 Ok(tpl) => {
                                     if tx.send(tpl).await.is_err() {
                                         eprintln!(
@@ -239,7 +281,8 @@ impl StratumTemplateSource {
                                 }
                                 Err(e) => {
                                     eprintln!(
-                                        "failed to parse TemplatePropose JSON from Stratum V2 bridge: {e:?}"
+                                        "failed to parse TemplatePropose JSON from Stratum V2 bridge: {e:?} line={:?}",
+                                        s
                                     );
                                 }
                             }
@@ -258,16 +301,12 @@ impl StratumTemplateSource {
     }
 }
 
+#[async_trait]
 impl TemplateSource for StratumTemplateSource {
-    fn next_template(&mut self) -> Result<Option<TemplatePropose>> {
-        use tokio::sync::mpsc::error::TryRecvError;
-
-        match self.rx.try_recv() {
-            Ok(tpl) => Ok(Some(tpl)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => {
-                anyhow::bail!("Stratum V2 bridge template channel disconnected")
-            }
+    async fn next_template(&mut self) -> Result<Option<TemplatePropose>> {
+        match self.rx.recv().await {
+            Some(tpl) => Ok(Some(tpl)),
+            None => anyhow::bail!("Stratum V2 bridge template channel disconnected"),
         }
     }
 }
@@ -293,24 +332,40 @@ struct MempoolStats {
     timestamp: u64,
 }
 
-type TemplateLog = Arc<Mutex<Vec<LoggedTemplate>>>;
-type MempoolLog = Arc<Mutex<Option<MempoolStats>>>;
+type TemplateLog = Arc<RwLock<Vec<LoggedTemplate>>>;
+type MempoolLog = Arc<RwLock<Option<MempoolStats>>>;
 
 const TEMPLATE_LOG_CAP: usize = 500;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg_path = env::var("VELDRA_MANAGER_CONFIG").unwrap_or_else(|_| "manager.toml".to_string());
+    let cfg_path =
+        env::var("VELDRA_MANAGER_CONFIG").unwrap_or_else(|_| "config/manager.toml".to_string());
+
     let cfg = TemplateManagerConfig::from_path(&cfg_path)?;
     println!("Loaded manager config from {}: {:?}", cfg_path, cfg);
 
-    let verifier_addr =
-        env::var("VELDRA_VERIFIER_ADDR").unwrap_or_else(|_| "127.0.0.1:5001".to_string());
+    let verifier_addr = env::var("VELDRA_VERIFIER_ADDR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            cfg.verifier_tcp_addr
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "127.0.0.1:5001".to_string());
 
     let poll_secs: u64 = cfg.poll_interval_secs.unwrap_or(5).max(1);
 
-    let http_addr =
-        env::var("VELDRA_MANAGER_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
+    let http_addr = env::var("VELDRA_MANAGER_HTTP_ADDR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            cfg.http_listen_addr
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "127.0.0.1:8081".to_string());
 
     println!(
         "Template manager backend={} polling every {}s, sending to verifier {}, HTTP at {}",
@@ -325,37 +380,34 @@ async fn main() -> Result<()> {
     })?;
     println!("Template manager HTTP listening on {}", http_addr);
 
-    // choose backend
-    let source: Box<dyn TemplateSource> = match cfg.backend.as_str() {
-        "bitcoind" => Box::new(BitcoindTemplateSource::from_config(&cfg)),
-        "stratum" => Box::new(StratumTemplateSource::from_config(&cfg)),
+    // choose backend + build shared bitcoind RPC client once
+    let (source, backend_name, bitcoind_arc): (
+        Box<dyn TemplateSource>,
+        String,
+        Option<Arc<Client>>,
+    ) = match cfg.backend.trim().to_ascii_lowercase().as_str() {
+        "bitcoind" => {
+            let client: Arc<Client> = build_bitcoind_client(&cfg)?; // NOTE the `?`
+
+            (
+                Box::new(BitcoindTemplateSource::new(client.clone())) as Box<dyn TemplateSource>,
+                "bitcoind".to_string(),
+                Some(client),
+            )
+        }
+        "stratum" => (
+            Box::new(StratumTemplateSource::from_config(&cfg)) as Box<dyn TemplateSource>,
+            "stratum".to_string(),
+            None,
+        ),
         other => anyhow::bail!(
             "Unsupported backend {:?} (expected \"bitcoind\" or \"stratum\")",
             other
         ),
     };
 
-    let backend_name = cfg.backend.clone();
-
-    let bitcoind_client = if backend_name == "bitcoind" {
-        let url = cfg
-            .rpc_url
-            .clone()
-            .unwrap_or_else(|| "http://127.0.0.1:18443".to_string());
-        let user = cfg.rpc_user.clone().unwrap_or_else(|| "veldra".to_string());
-        let pass = cfg
-            .rpc_pass
-            .clone()
-            .unwrap_or_else(|| "very_secure_password".to_string());
-
-        let auth = Auth::UserPass(user, pass);
-        Some(Client::new(&url, auth).expect("failed to create bitcoind RPC client for mempool"))
-    } else {
-        None
-    };
-
-    let template_log: TemplateLog = Arc::new(Mutex::new(Vec::new()));
-    let mempool_log: MempoolLog = Arc::new(Mutex::new(None));
+    let template_log: TemplateLog = Arc::new(RwLock::new(Vec::new()));
+    let mempool_log: MempoolLog = Arc::new(RwLock::new(None));
 
     // build router once
     let app = build_router(template_log.clone(), mempool_log.clone());
@@ -368,10 +420,10 @@ async fn main() -> Result<()> {
         source,
         verifier_addr,
         poll_secs,
-        backend_name,
+        backend_name.clone(),
         template_log,
         mempool_log,
-        bitcoind_client,
+        bitcoind_arc,
     ));
 
     // If either task exits, fail loudly. In a demo product, silent partial failure is poison.
@@ -397,6 +449,48 @@ fn build_router(template_log: TemplateLog, mempool_log: MempoolLog) -> Router {
         .layer(Extension(mempool_log))
 }
 
+async fn fetch_mempool_info_with_retries(
+    client: Arc<Client>,
+    mempool_had_rpc_error: &mut bool,
+) -> Option<bitcoincore_rpc::json::GetMempoolInfoResult> {
+    let mut attempts = 0;
+
+    loop {
+        let client2 = client.clone();
+        let res = tokio::task::spawn_blocking(move || client2.get_mempool_info()).await;
+
+        match res {
+            Ok(Ok(info)) => {
+                if *mempool_had_rpc_error {
+                    eprintln!("[manager] get_mempool_info RPC recovered");
+                    *mempool_had_rpc_error = false;
+                }
+                return Some(info);
+            }
+            Ok(Err(e)) => {
+                attempts += 1;
+                eprintln!("[manager] get_mempool_info attempt {attempts} failed: {e:?}");
+            }
+            Err(join_err) => {
+                attempts += 1;
+                eprintln!(
+                    "[manager] get_mempool_info spawn_blocking join error attempt {attempts}: {join_err:?}"
+                );
+            }
+        }
+
+        if attempts >= 3 {
+            eprintln!(
+                "[manager] get_mempool_info giving up for this poll after {attempts} attempts (will retry next tick)"
+            );
+            *mempool_had_rpc_error = true;
+            return None;
+        }
+
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn run_manager_loop(
     mut source: Box<dyn TemplateSource>,
     verifier_addr: String,
@@ -404,14 +498,17 @@ async fn run_manager_loop(
     backend_name: String,
     template_log: TemplateLog,
     mempool_log: MempoolLog,
-    bitcoind_client: Option<Client>,
+    bitcoind_client: Option<Arc<Client>>,
 ) -> Result<()> {
     let mut mempool_had_rpc_error = false;
 
+    let connect_timeout = Duration::from_secs(2);
+    let verdict_timeout = Duration::from_secs(4);
+
     loop {
         // ---- template handling ----
-        match source.next_template() {
-            Ok(Some(mut propose)) => {
+        match source.next_template().await {
+            Ok(Some(propose)) => {
                 println!(
                     "New template backend={} id={} height={} prev_hash={} coinbase_value={} total_fees={} tx_count={}",
                     backend_name,
@@ -423,32 +520,36 @@ async fn run_manager_loop(
                     propose.tx_count,
                 );
 
-                match TcpStream::connect(&verifier_addr).await {
-                    Ok(stream) => {
-                        if let Err(e) = send_and_receive(stream, &mut propose).await {
-                            eprintln!(
+                match timeout(connect_timeout, TcpStream::connect(&verifier_addr)).await {
+                    Ok(Ok(stream)) => {
+                        match timeout(verdict_timeout, send_and_receive(stream, &propose)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => eprintln!(
                                 "[manager] error sending template id={} to verifier {}: {e:?}",
                                 propose.id, verifier_addr
-                            );
+                            ),
+                            Err(_) => eprintln!(
+                                "[manager] verifier timed out (send/recv) id={} addr={}",
+                                propose.id, verifier_addr
+                            ),
                         }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "[manager] failed to connect to verifier {}: {e:?}",
-                            verifier_addr
-                        );
-                    }
+                    Ok(Err(e)) => eprintln!(
+                        "[manager] failed to connect to verifier {}: {e:?}",
+                        verifier_addr
+                    ),
+                    Err(_) => eprintln!("[manager] connect timeout to verifier {}", verifier_addr),
                 }
 
                 // store for /templates
                 {
-                    let mut log = template_log.lock().unwrap();
+                    let mut log = template_log.write().await;
                     log.push(LoggedTemplate {
                         id: propose.id,
                         height: propose.block_height,
                         total_fees: propose.total_fees,
                         backend: backend_name.clone(),
-                        timestamp: current_timestamp(),
+                        timestamp: now_unix_secs(),
                     });
                     if log.len() > TEMPLATE_LOG_CAP {
                         let drain = log.len() - TEMPLATE_LOG_CAP;
@@ -457,43 +558,16 @@ async fn run_manager_loop(
                 }
             }
             Ok(None) => {}
-            Err(e) => {
-                eprintln!("[manager] error getting template from source: {e:?}");
-            }
+            Err(e) => eprintln!("[manager] error getting template from source: {e:?}"),
         }
 
         // ---- mempool snapshot when backend == bitcoind ----
         if backend_name == "bitcoind" {
             if let Some(ref client) = bitcoind_client {
-                let mut attempts = 0;
-                let info_opt = loop {
-                    match client.get_mempool_info() {
-                        Ok(info) => break Some(info),
-                        Err(e) => {
-                            attempts += 1;
-                            eprintln!(
-                                "[manager] get_mempool_info attempt {attempts} failed: {e:?}"
-                            );
-
-                            if attempts >= 3 {
-                                eprintln!(
-                                    "[manager] get_mempool_info giving up for this poll after {attempts} attempts (will retry next tick)"
-                                );
-                                mempool_had_rpc_error = true;
-                                break None;
-                            }
-
-                            std::thread::sleep(Duration::from_millis(200));
-                        }
-                    }
-                };
-
-                if let Some(info) = info_opt {
-                    if mempool_had_rpc_error {
-                        eprintln!("[manager] get_mempool_info RPC recovered");
-                        mempool_had_rpc_error = false;
-                    }
-
+                if let Some(info) =
+                    fetch_mempool_info_with_retries(client.clone(), &mut mempool_had_rpc_error)
+                        .await
+                {
                     let stats = MempoolStats {
                         loaded_from: "bitcoind".to_string(),
                         tx_count: info.size as u64,
@@ -501,10 +575,10 @@ async fn run_manager_loop(
                         usage: info.usage as u64,
                         max: info.max_mempool as u64,
                         min_relay_fee: info.mempool_min_fee.to_sat(),
-                        timestamp: current_timestamp(),
+                        timestamp: now_unix_secs(),
                     };
 
-                    let mut slot = mempool_log.lock().unwrap();
+                    let mut slot = mempool_log.write().await;
                     *slot = Some(stats);
                 }
             } else {
@@ -512,35 +586,31 @@ async fn run_manager_loop(
             }
         }
 
-        sleep(Duration::from_secs(poll_secs)).await;
+        if backend_name == "bitcoind" {
+            sleep(Duration::from_secs(poll_secs)).await;
+        }
     }
 }
 
-async fn send_and_receive(mut stream: TcpStream, propose: &mut TemplatePropose) -> Result<()> {
+async fn send_and_receive(mut stream: TcpStream, propose: &TemplatePropose) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
 
-    let json = serde_json::to_string(&propose)?;
-    writer.write_all(json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-
-    println!(
-        "Sent TemplatePropose id={} height={}",
-        propose.id, propose.block_height
-    );
+    let json = serde_json::to_string(propose)?;
+    timeout(Duration::from_secs(2), writer.write_all(json.as_bytes())).await??;
+    timeout(Duration::from_secs(2), writer.write_all(b"\n")).await??;
+    timeout(Duration::from_secs(2), writer.flush()).await??;
 
     let mut line = String::new();
-    let bytes_read = reader.read_line(&mut line).await?;
+    let bytes_read = timeout(Duration::from_secs(3), reader.read_line(&mut line)).await??;
     if bytes_read == 0 {
-        println!("Verifier closed connection without sending a verdict");
-        return Ok(());
+        anyhow::bail!("verifier closed connection without sending a verdict");
     }
 
-    let verdict: TemplateVerdict = serde_json::from_str(&line)?;
+    let verdict: TemplateVerdict = serde_json::from_str(line.trim())?;
     println!(
-        "Received TemplateVerdict id={} accepted={} reason={:?}",
-        verdict.id, verdict.accepted, verdict.reason
+        "Received TemplateVerdict id={} accepted={} reason_code={:?} detail={:?}",
+        verdict.id, verdict.accepted, verdict.reason_code, verdict.reason_detail,
     );
 
     Ok(())
@@ -553,12 +623,12 @@ async fn health_check() -> &'static str {
 }
 
 async fn get_templates(Extension(log): Extension<TemplateLog>) -> Json<Vec<LoggedTemplate>> {
-    let log = log.lock().unwrap();
+    let log = log.read().await;
     Json(log.clone())
 }
 
 async fn get_mempool(Extension(mem): Extension<MempoolLog>) -> Json<MempoolStats> {
-    let mem = mem.lock().unwrap();
+    let mem = mem.read().await;
 
     let snapshot = mem.clone().unwrap_or_else(|| MempoolStats {
         loaded_from: "unknown".to_string(),
@@ -567,15 +637,22 @@ async fn get_mempool(Extension(mem): Extension<MempoolLog>) -> Json<MempoolStats
         usage: 0,
         max: 0,
         min_relay_fee: 0,
-        timestamp: current_timestamp(),
+        timestamp: now_unix_secs(),
     });
 
     Json(snapshot)
 }
 
-fn current_timestamp() -> u64 {
+fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }

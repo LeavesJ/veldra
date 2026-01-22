@@ -860,7 +860,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "pool-verifier"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1084,9 +1084,11 @@ dependencies = [
 
 [[package]]
 name = "rg-protocol"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
+ "anyhow",
  "serde",
+ "toml",
 ]
 
 [[package]]
@@ -1260,15 +1262,15 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.145"
+version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "402a6f66d8c709116cf22f558eab210f5a50187f702eb4d7e5ef38d9a7f1c79c"
+checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
  "itoa",
  "memchr",
- "ryu",
  "serde",
  "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -1354,7 +1356,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sv2-bridge"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rg-protocol",
@@ -1430,9 +1432,10 @@ dependencies = [
 
 [[package]]
 name = "template-manager"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bitcoincore-rpc",
  "rg-protocol",
@@ -2143,3 +2146,9 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfcd145825aace48cff44a8844de64bf75feec3080e0aa5cdbde72961ae51a65"

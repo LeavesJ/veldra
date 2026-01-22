@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
-use rg_protocol::{TemplatePropose, PROTOCOL_VERSION};
+use rg_protocol::{PROTOCOL_VERSION, TemplatePropose};
 
 #[derive(Clone)]
 struct BridgeConfig {
@@ -17,6 +17,10 @@ struct BridgeConfig {
     start_height: u32,
     tx_count: u32,
     total_fees: u64,
+
+    // Optional override. If set, used as the block subsidy (sats), independent of height.
+    // Coinbase value will be subsidy + total_fees.
+    subsidy_override_sats: Option<u64>,
 }
 
 impl BridgeConfig {
@@ -42,7 +46,14 @@ impl BridgeConfig {
         let total_fees = env::var("VELDRA_BRIDGE_TOTAL_FEES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(100); // low on purpose so current strict policy rejects
+            .unwrap_or(100); // low on purpose so strict policy rejects
+
+        // If you want “current mainnet-era” demo behavior, set:
+        //   VELDRA_BRIDGE_SUBSIDY_SATS=312500000  (3.125 BTC)
+        // Otherwise, we compute subsidy by height (regtest at height=500 -> 50 BTC).
+        let subsidy_override_sats = env::var("VELDRA_BRIDGE_SUBSIDY_SATS")
+            .ok()
+            .and_then(|s| s.parse().ok());
 
         BridgeConfig {
             listen_addr,
@@ -50,6 +61,7 @@ impl BridgeConfig {
             start_height,
             tx_count,
             total_fees,
+            subsidy_override_sats,
         }
     }
 }
@@ -59,8 +71,15 @@ async fn main() -> Result<()> {
     let cfg = BridgeConfig::from_env();
 
     println!(
-        "sv2-bridge listening on {} (interval={}s, start_height={}, tx_count={}, total_fees={})",
-        cfg.listen_addr, cfg.interval_secs, cfg.start_height, cfg.tx_count, cfg.total_fees
+        "sv2-bridge listening on {} (interval={}s, start_height={}, tx_count={}, total_fees={}, subsidy_override_sats={})",
+        cfg.listen_addr,
+        cfg.interval_secs,
+        cfg.start_height,
+        cfg.tx_count,
+        cfg.total_fees,
+        cfg.subsidy_override_sats
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none(height-derived)".to_string()),
     );
 
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
@@ -81,9 +100,22 @@ async fn handle_client(mut stream: TcpStream, cfg: BridgeConfig) -> Result<()> {
     let mut height: u32 = cfg.start_height;
 
     let prev_hash = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
-    let coinbase_value: u64 = 6_2500_0000; // 6.25 BTC in sats
 
     loop {
+        let now_ms: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+
+        let subsidy_sats = cfg
+            .subsidy_override_sats
+            .unwrap_or_else(|| block_subsidy_sats(height));
+
+        // In Bitcoin Core getblocktemplate, coinbasevalue includes subsidy + fees.
+        let coinbase_value: u64 = subsidy_sats.saturating_add(cfg.total_fees);
+
         let tpl = TemplatePropose {
             version: PROTOCOL_VERSION,
             id,
@@ -92,6 +124,10 @@ async fn handle_client(mut stream: TcpStream, cfg: BridgeConfig) -> Result<()> {
             coinbase_value,
             tx_count: cfg.tx_count,
             total_fees: cfg.total_fees,
+
+            // v0.2.0 forward-compatible fields
+            observed_weight: None,
+            created_at_unix_ms: Some(now_ms),
         };
 
         let json = serde_json::to_string(&tpl)?;
@@ -100,19 +136,31 @@ async fn handle_client(mut stream: TcpStream, cfg: BridgeConfig) -> Result<()> {
         stream.flush().await?;
 
         println!(
-            "[{}] sent template id={} height={} total_fees={} tx_count={}",
+            "[{}] sent template id={} height={} subsidy_sats={} total_fees={} coinbase_value={} tx_count={}",
             now_secs(),
             id,
             height,
+            subsidy_sats,
             cfg.total_fees,
+            coinbase_value,
             cfg.tx_count
         );
 
         id += 1;
-        height += 1;
+        height = height.saturating_add(1);
 
         sleep(Duration::from_secs(cfg.interval_secs)).await;
     }
+}
+
+fn block_subsidy_sats(height: u32) -> u64 {
+    // Mainnet schedule; regtest follows the same halving schedule unless chain params changed.
+    // 50 BTC at height 0, halves every 210_000 blocks.
+    let halvings = height / 210_000;
+    if halvings >= 64 {
+        return 0;
+    }
+    (50u64 * 100_000_000u64) >> halvings
 }
 
 fn now_secs() -> u64 {

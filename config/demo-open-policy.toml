@@ -1,5 +1,5 @@
 [policy]
-protocol_version = 1
+protocol_version = 2
 required_prevhash_len = 64
 
 min_total_fees = 0
@@ -18,3 +18,7 @@ min_avg_fee_hi = 15
 
 max_weight_ratio = 0.999
 reject_empty_templates = true
+
+unknown_mempool_as_high = true
+reject_coinbase_zero = false
+

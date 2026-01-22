@@ -1,20 +1,23 @@
 [policy]
-protocol_version = 1
+protocol_version = 2
 required_prevhash_len = 64
 
 min_total_fees = 0
-max_tx_count = 10000
-min_avg_fee = 0
+max_tx_count = 12
 
-low_mempool_tx = 0
-high_mempool_tx = 50
+low_mempool_tx = 5
+high_mempool_tx = 20
 
-tx_count_mid_threshold = 10
-tx_count_hi_threshold = 50
+# avg fee floors are sats/tx (NOT sat/vB)
+# ~1 sat/vB  => ~150-250 sats/tx (reject)
+# ~25 sat/vB => ~3_750-6_250 sats/tx (accept)
+min_avg_fee_lo  = 900
+min_avg_fee_mid = 1900
+min_avg_fee_hi  = 4200
 
-min_avg_fee_lo = 50
-min_avg_fee_mid = 500
-min_avg_fee_hi = 2000
+reject_empty_templates = false
+reject_coinbase_zero = false
+unknown_mempool_as_high = true
 
+[policy.safety]
 max_weight_ratio = 0.999
-reject_empty_templates = true

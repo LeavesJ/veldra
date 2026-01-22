@@ -1,17 +1,23 @@
 [policy]
-protocol_version = 1
+protocol_version = 2
 required_prevhash_len = 64
 min_total_fees = 0
 max_tx_count = 100
 min_avg_fee = 0
-low_mempool_tx = 0
-high_mempool_tx = 0
+
+low_mempool_tx = 50
+high_mempool_tx = 500
+
+# required by PolicyConfig (even if you don't use them yet)
 tx_count_mid_threshold = 10
 tx_count_hi_threshold = 50
+
 min_avg_fee_lo = 0
 min_avg_fee_mid = 0
 min_avg_fee_hi = 0
 
-[policy.safety]
 max_weight_ratio = 0.999
+
 reject_empty_templates = true
+reject_coinbase_zero = false
+unknown_mempool_as_high = true

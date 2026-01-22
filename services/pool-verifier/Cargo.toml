@@ -1,11 +1,11 @@
 [package]
 name = "pool-verifier"
-version = "0.1.1"
-edition = "2024"
-rust-version = "1.92"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
 toml = "0.8"
 axum = "0.7"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
