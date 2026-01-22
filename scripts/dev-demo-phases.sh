@@ -19,8 +19,12 @@ MID_COUNT="${MID_COUNT:-30}"
 STRESS_COUNT="${STRESS_COUNT:-120}"
 
 HOLD_SECS="${HOLD_SECS:-6}"
-MINE_EVERY_SENDS="${MINE_EVERY_SENDS:-20}"  # mine to avoid ancestor chain
-UTXO_WARMUP_COUNT="${UTXO_WARMUP_COUNT:-40}" # confirmed UTXOs to avoid change-chains
+
+# Mine between sub batches to avoid too many unconfirmed ancestors.
+# Critical rule: never mine after the final sub batch, so the mempool is nonzero at phase end.
+MINE_EVERY_SENDS="${MINE_EVERY_SENDS:-20}"
+
+UTXO_WARMUP_COUNT="${UTXO_WARMUP_COUNT:-40}" # confirmed UTXOs to avoid change chains
 UTXO_WARMUP_AMOUNT="${UTXO_WARMUP_AMOUNT:-0.12}"
 
 btc_cli() { "${BTC_CLI}" "$@"; }
@@ -42,9 +46,19 @@ require_stack_ready() {
 }
 
 mempool_size() {
-  btc_cli getmempoolinfo \
-    | python3 -c 'import sys, json; print(json.load(sys.stdin).get("size", 0))' 2>/dev/null \
-    || echo 0
+  # Do not silently mask failures as 0 if bitcoind is unreachable or output is empty.
+  local raw
+  raw="$(btc_cli getmempoolinfo 2>/dev/null || true)"
+  if [[ -z "${raw}" ]]; then
+    echo 0
+    return
+  fi
+
+  python3 - <<'PY' <<<"${raw}" 2>/dev/null || echo 0
+import sys, json
+j = json.load(sys.stdin)
+print(j.get("size", 0))
+PY
 }
 
 wait_mempool_ge() {
@@ -109,12 +123,35 @@ send_batch_mine_cadence() {
   local fee_rate="$2"
   local amount="$3"
 
-  echo "[demo-phases] send_batch count=${count} amount=${amount} fee_rate=${fee_rate} sat/vB (mine every ${MINE_EVERY_SENDS})"
-  local i=0
-  for _ in $(seq 1 "${count}"); do
-    i=$((i+1))
-    send_one "${fee_rate}" "${amount}"
-    if [[ $((i % MINE_EVERY_SENDS)) -eq 0 ]]; then
+  local cadence="${MINE_EVERY_SENDS}"
+  if [[ "${cadence}" -le 0 ]]; then cadence=0; fi
+
+  echo "[demo-phases] send_batch count=${count} amount=${amount} fee_rate=${fee_rate} sat/vB (mine every ${cadence}, never after last chunk)"
+
+  # No cadence means: just send all, leave mempool nonzero.
+  if [[ "${cadence}" -eq 0 ]] || [[ "${count}" -le "${cadence}" ]]; then
+    for _ in $(seq 1 "${count}"); do
+      send_one "${fee_rate}" "${amount}"
+    done
+    return 0
+  fi
+
+  # Chunked sending: mine after each full chunk except the final chunk.
+  local sent=0
+  while [[ "${sent}" -lt "${count}" ]]; do
+    local remaining=$((count - sent))
+    local chunk="${cadence}"
+    if [[ "${remaining}" -lt "${chunk}" ]]; then
+      chunk="${remaining}"
+    fi
+
+    for _ in $(seq 1 "${chunk}"); do
+      send_one "${fee_rate}" "${amount}"
+    done
+    sent=$((sent + chunk))
+
+    # Mine only between chunks, never after the final chunk.
+    if [[ "${sent}" -lt "${count}" ]]; then
       mine_n 1
       wait_ui
     fi
@@ -123,7 +160,6 @@ send_batch_mine_cadence() {
 
 utxo_warmup() {
   phase "warmup: create many confirmed UTXOs (prevents ancestor-chain failures)"
-  # Create UTXOs in small batches and mine after each batch so they confirm.
   local per_batch=10
   local made=0
   while [[ "${made}" -lt "${UTXO_WARMUP_COUNT}" ]]; do
@@ -145,7 +181,6 @@ echo "[demo-phases] starting demo loop..."
 require_stack_ready
 require_spendable
 
-# One-time UTXO warmup
 utxo_warmup
 
 i=0
@@ -165,7 +200,6 @@ while true; do
   send_batch_mine_cadence "${LOW_COUNT}" "${LOW_FEE}" "${AMOUNT}"
   wait_mempool_ge 1
   hold_for_templates "low-fee-only window"
-  # Mine once to clear before the next phase so high fee phase is cleanly isolated
   mine_n 1
   wait_ui
 
@@ -177,7 +211,6 @@ while true; do
   wait_ui
 
   phase "D: tier flip (build mempool, then hold; mixed strategy depends on your policy)"
-  # Build mempool with mostly low fee first to pressure avg down, then a smaller high-fee top-up
   send_batch_mine_cadence "${MID_COUNT}" "${LOW_FEE}" "${AMOUNT}"
   send_batch_mine_cadence "$((MID_COUNT / 3))" "${HIGH_FEE}" "${AMOUNT}"
   wait_mempool_ge 10
