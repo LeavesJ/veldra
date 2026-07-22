@@ -1226,10 +1226,15 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     let mut pending_sweep_ticker = tokio::time::interval(pending_sweep_interval);
     pending_sweep_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // M-5 fix: proactive upstream staleness timer. Fires on a fixed
-    // interval so the guard does not depend on arriving messages.
+    // M-5 fix: proactive upstream staleness timer. PB-16: this must be
+    // a persistent interval created once, outside the loop. A fresh
+    // `sleep` future built inside `select!` is dropped and recreated on
+    // every other arm's completion, so share traffic arriving faster
+    // than the interval starves the check forever and `fail_closed`
+    // never fires when the template feed dies under active mining.
     let upstream_stale_check_interval =
         Duration::from_millis(cfg.gateway.upstream_stale_max_ms.max(1000) / 2);
+    let mut upstream_stale_check_ticker = upstream_stale_ticker(upstream_stale_check_interval);
 
     // Automatic inline-to-observe degradation state.
     // When the verifier becomes unreachable for longer than
@@ -1242,6 +1247,9 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     let mut degraded_since: Option<Instant> = None;
     let mut unenforced_jobs: u64 = 0;
     let mut last_verifier_ack = Instant::now();
+    // PB-17: verdict starvation clock; see `StarvationClock` for the
+    // anchor lifecycle rules.
+    let mut verdict_starved = StarvationClock::new();
     // PB-15 D2: why we degraded decides how we recover. Heartbeat-triggered
     // degrades recover on the next `HeartbeatAck`; verdict-starvation
     // degrades recover only when a verdict actually arrives, so a verifier
@@ -1306,6 +1314,10 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 if cfg.mode.enforces_verdicts() && !degraded {
                     // Inline mode (enforcing): store template as pending,
                     // wait for verdict before broadcasting.
+                    // PB-17: capture emptiness before eviction; the
+                    // capacity loop never empties the set (stops at
+                    // len 1), so this is the true transition signal.
+                    let pending_was_empty = pending_templates.is_empty();
                     // Evict oldest (FIFO) if at capacity (2).
                     while pending_templates.len() >= 2 {
                         if let Some(oldest_id) = pending_order.pop_front() {
@@ -1324,6 +1336,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                         template,
                         received_at: Instant::now(),
                     });
+                    verdict_starved.on_enqueue(pending_was_empty, Instant::now());
                 } else {
                     // Observe mode or degraded inline: broadcast immediately.
                     broadcast_job_from_template(
@@ -1451,6 +1464,11 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                                 debug!(template_id = v.id, "verdict for unknown or evicted template");
                             }
                         }
+
+                        // PB-17: any verdict proves the service answers;
+                        // restart the starvation clock, anchored now if
+                        // proposals remain outstanding.
+                        verdict_starved.on_verdict(pending_templates.is_empty(), Instant::now());
                     }
                     Ok(sv2_gateway::verifier_stream::VerifierInbound::HeartbeatAck) => {
                         last_verifier_ack = Instant::now();
@@ -1706,8 +1724,9 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 }
             }
 
-            // M-5 fix: proactive upstream staleness timer.
-            () = tokio::time::sleep(upstream_stale_check_interval) => {
+            // M-5 fix: proactive upstream staleness timer (PB-16: a
+            // persistent ticker; see its construction above the loop).
+            _ = upstream_stale_check_ticker.tick() => {
                 let stale_elapsed = last_template_received.elapsed();
                 if stale_elapsed > Duration::from_millis(cfg.gateway.upstream_stale_max_ms) {
                     #[allow(clippy::cast_possible_truncation)]
@@ -1743,9 +1762,16 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     .front()
                     .and_then(|id| pending_templates.get(id))
                     .map(|pt| pt.received_at.elapsed());
+                // PB-17: the clock only counts while proposals are
+                // outstanding; a transiently empty pending set (sweep
+                // just fired, next poll not yet landed) must not
+                // trigger on a stale anchor.
+                let verdict_starved_elapsed = verdict_starved
+                    .elapsed_while_outstanding(pending_order.is_empty(), Instant::now());
                 let trigger = degrade_trigger_for(
                     last_verifier_ack.elapsed(),
                     oldest_pending_age,
+                    verdict_starved_elapsed,
                     auto_degrade_threshold,
                 );
                 if auto_degrade_enabled && !degraded && trigger.is_some() {
@@ -1772,6 +1798,8 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     }
                     pending_templates.clear();
                     stale_hold_deadline = None;
+                    // PB-17: nothing outstanding after the flush.
+                    verdict_starved.on_flush();
                     gw_metrics
                         .mode_transitions_total
                         .get_or_create(&ModeTransitionLabels {
@@ -1791,6 +1819,8 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     }
                     let oldest_pending_ms = oldest_pending_age
                         .map(|a| u64::try_from(a.as_millis()).unwrap_or(u64::MAX));
+                    let verdict_starved_ms = verdict_starved_elapsed
+                        .map(|a| u64::try_from(a.as_millis()).unwrap_or(u64::MAX));
                     error!(
                         heartbeat_elapsed_ms =
                             u64::try_from(
@@ -1798,6 +1828,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                             )
                             .unwrap_or(u64::MAX),
                         oldest_pending_ms = ?oldest_pending_ms,
+                        verdict_starved_ms = ?verdict_starved_ms,
                         threshold_ms =
                             cfg.gateway.auto_degrade_after_ms,
                         trigger = degrade_trigger.map_or("none", DegradeTrigger::as_str),
@@ -1851,22 +1882,98 @@ impl DegradeTrigger {
     }
 }
 
-/// Pure decision for the auto-degrade check (PB-15 D2). Heartbeat staleness
-/// takes precedence (dead link subsumes starved service); verdict starvation
-/// catches the heartbeat-alive, verdict-silent upstream that R-173 warns
-/// about: liveness signals are not the data invariant.
+/// Pure decision for the auto-degrade check (PB-15 D2, PB-17). Heartbeat
+/// staleness takes precedence (dead link subsumes starved service); verdict
+/// starvation catches the heartbeat-alive, verdict-silent upstream that
+/// R-173 warns about: liveness signals are not the data invariant.
+///
+/// Two independent starvation signals, either one triggers (PB-17): the
+/// oldest pending template's age (blind to capacity eviction, which churns
+/// it back under the threshold on busy chains) and the starvation clock
+/// (time since the last verdict while proposals are outstanding, immune to
+/// that churn). `verdict_starved_elapsed` must be `None` when nothing is
+/// outstanding so a stale anchor cannot trigger on a quiet chain.
 fn degrade_trigger_for(
     heartbeat_age: Duration,
     oldest_pending_age: Option<Duration>,
+    verdict_starved_elapsed: Option<Duration>,
     threshold: Duration,
 ) -> Option<DegradeTrigger> {
     if heartbeat_age > threshold {
         return Some(DegradeTrigger::HeartbeatStale);
     }
-    if oldest_pending_age.is_some_and(|age| age > threshold) {
+    if oldest_pending_age.is_some_and(|age| age > threshold)
+        || verdict_starved_elapsed.is_some_and(|e| e > threshold)
+    {
         return Some(DegradeTrigger::VerdictStarved);
     }
     None
+}
+
+/// PB-16: construct the upstream staleness ticker. Persistent across loop
+/// iterations by construction; the caller stores it OUTSIDE the select loop
+/// and awaits `.tick()` as an arm. `MissedTickBehavior::Delay` matches the
+/// other periodic arms. The first tick completes immediately, which is
+/// harmless: at boot the upstream elapsed time is near zero.
+fn upstream_stale_ticker(interval: Duration) -> tokio::time::Interval {
+    let mut t = tokio::time::interval(interval);
+    t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    t
+}
+
+/// PB-17: verdict starvation clock. Owns the anchor lifecycle so every
+/// pending-set transition routes through one place.
+///
+/// Rules:
+/// - An enqueue onto an EMPTY pending set re-anchors unconditionally, so
+///   an anchor can never accumulate wall time across a gap with nothing
+///   outstanding (the sweep can empty the set without a clock event;
+///   preserving the old anchor there would fire a spurious
+///   `VerdictStarved` against a healthy verifier, the adversarial-review
+///   finding on the first cut of this fix).
+/// - An enqueue onto a non-empty set keeps the original anchor: capacity
+///   eviction on a busy chain never empties the set, so the churn that
+///   defeats `oldest_pending_age` cannot defeat the clock (the PB-17
+///   core).
+/// - Any arriving verdict restarts the clock: anchored now while work
+///   remains outstanding, cleared when drained.
+/// - The degrade flush clears it (nothing outstanding afterwards).
+/// - Reads gate on outstanding work: `None` whenever the pending set is
+///   empty, regardless of the stored anchor.
+struct StarvationClock(Option<Instant>);
+
+impl StarvationClock {
+    const fn new() -> Self {
+        Self(None)
+    }
+
+    /// A propose was enqueued. `pending_was_empty` is the pending-set
+    /// state BEFORE the insert.
+    fn on_enqueue(&mut self, pending_was_empty: bool, now: Instant) {
+        if pending_was_empty || self.0.is_none() {
+            self.0 = Some(now);
+        }
+    }
+
+    /// A verdict arrived. `pending_now_empty` is the pending-set state
+    /// AFTER the verdict was applied.
+    fn on_verdict(&mut self, pending_now_empty: bool, now: Instant) {
+        self.0 = if pending_now_empty { None } else { Some(now) };
+    }
+
+    /// The degrade transition flushed every pending template.
+    fn on_flush(&mut self) {
+        self.0 = None;
+    }
+
+    /// Time since the anchor while work is outstanding; `None` when the
+    /// pending set is empty.
+    fn elapsed_while_outstanding(&self, pending_empty: bool, now: Instant) -> Option<Duration> {
+        if pending_empty {
+            return None;
+        }
+        self.0.map(|anchor| now.saturating_duration_since(anchor))
+    }
 }
 
 /// PB-15 D2 flap guard: heartbeat-triggered degrades recover on heartbeat;
@@ -2785,24 +2892,44 @@ mod pb15_tests {
 
     #[test]
     fn degrade_trigger_prefers_heartbeat_then_catches_starvation() {
+        // PB-15 semantics preserved through the PB-17 signature change:
+        // starvation clock None everywhere reproduces the old behavior.
         let t = Duration::from_secs(10);
         assert_eq!(
-            degrade_trigger_for(Duration::from_secs(11), None, t),
+            degrade_trigger_for(Duration::from_secs(11), None, None, t),
             Some(DegradeTrigger::HeartbeatStale)
         );
         assert_eq!(
-            degrade_trigger_for(Duration::from_secs(11), Some(Duration::from_secs(99)), t),
+            degrade_trigger_for(
+                Duration::from_secs(11),
+                Some(Duration::from_secs(99)),
+                None,
+                t
+            ),
             Some(DegradeTrigger::HeartbeatStale)
         );
         assert_eq!(
-            degrade_trigger_for(Duration::from_secs(1), Some(Duration::from_secs(11)), t),
+            degrade_trigger_for(
+                Duration::from_secs(1),
+                Some(Duration::from_secs(11)),
+                None,
+                t
+            ),
             Some(DegradeTrigger::VerdictStarved)
         );
         assert_eq!(
-            degrade_trigger_for(Duration::from_secs(1), Some(Duration::from_secs(2)), t),
+            degrade_trigger_for(
+                Duration::from_secs(1),
+                Some(Duration::from_secs(2)),
+                None,
+                t
+            ),
             None
         );
-        assert_eq!(degrade_trigger_for(Duration::from_secs(1), None, t), None);
+        assert_eq!(
+            degrade_trigger_for(Duration::from_secs(1), None, None, t),
+            None
+        );
     }
 
     #[test]
@@ -2814,5 +2941,178 @@ mod pb15_tests {
         assert!(!heartbeat_recovery_allowed(Some(
             DegradeTrigger::VerdictStarved
         )));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pb16_pb17_tests {
+    use super::*;
+
+    /// PB-16: the upstream staleness guard must fire even when other
+    /// select arms are busier than its interval. The recreated-sleep
+    /// pattern this replaces was reset by every arriving share event,
+    /// so under active mining the check never executed. A persistent
+    /// interval keeps its deadline across loop iterations.
+    #[tokio::test(start_paused = true)]
+    async fn upstream_stale_ticker_fires_under_sub_interval_event_load() {
+        let mut ticker = upstream_stale_ticker(Duration::from_secs(15));
+        // Consume the interval's immediate first tick so the assertion
+        // below proves a scheduled tick under load, not the freebie.
+        ticker.tick().await;
+
+        // Flood arm: an event every 5 simulated seconds, three times
+        // faster than the 15s check interval. The old pattern starves
+        // forever under this load; the ticker must still fire.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(4);
+        tokio::spawn(async move {
+            loop {
+                if tx.send(1).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let mut ticks = 0u32;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while tokio::time::Instant::now() < deadline && ticks == 0 {
+            tokio::select! {
+                _ = ticker.tick() => { ticks += 1; }
+                _ = rx.recv() => {}
+            }
+        }
+        assert!(
+            ticks >= 1,
+            "staleness ticker was starved by sub-interval event load"
+        );
+    }
+
+    /// PB-17: capacity eviction churns `oldest_pending_age` back under
+    /// the threshold on a busy chain (new template every poll evicts
+    /// the oldest pending at ~2x poll age), so the age signal alone
+    /// never crosses the threshold. The starvation clock, anchored at
+    /// the first unanswered propose and reset only by an arriving
+    /// verdict, survives the churn and must trigger the degrade.
+    #[test]
+    fn verdict_starvation_clock_survives_capacity_eviction() {
+        let t = Duration::from_secs(10);
+        // Eviction keeps the oldest pending young (6s < 10s) while the
+        // clock says no verdict for 11s: must degrade.
+        assert_eq!(
+            degrade_trigger_for(
+                Duration::from_secs(1),
+                Some(Duration::from_secs(6)),
+                Some(Duration::from_secs(11)),
+                t
+            ),
+            Some(DegradeTrigger::VerdictStarved)
+        );
+        // Verdicts flowing (clock young), pendings young: healthy.
+        assert_eq!(
+            degrade_trigger_for(
+                Duration::from_secs(1),
+                Some(Duration::from_secs(6)),
+                Some(Duration::from_secs(2)),
+                t
+            ),
+            None
+        );
+        // No outstanding proposals: the clock alone must not trigger
+        // (quiet chain with nothing to enforce; heartbeat guard covers
+        // a dead link).
+        assert_eq!(
+            degrade_trigger_for(Duration::from_secs(1), None, None, t),
+            None
+        );
+        // Heartbeat death still takes precedence over starvation.
+        assert_eq!(
+            degrade_trigger_for(
+                Duration::from_secs(11),
+                Some(Duration::from_secs(6)),
+                Some(Duration::from_secs(11)),
+                t
+            ),
+            Some(DegradeTrigger::HeartbeatStale)
+        );
+        // The pre-PB-17 signal still works: an un-evicted pending aging
+        // past the threshold triggers even if the clock was just reset.
+        assert_eq!(
+            degrade_trigger_for(
+                Duration::from_secs(1),
+                Some(Duration::from_secs(11)),
+                Some(Duration::from_secs(1)),
+                t
+            ),
+            Some(DegradeTrigger::VerdictStarved)
+        );
+    }
+
+    #[test]
+    fn starvation_clock_re_anchors_after_pending_emptied_gap() {
+        // Adversarial-review scenario: a verdict is lost, the sweep
+        // empties pending (no clock event by design), minutes pass,
+        // then a new propose lands on the empty set. The anchor must
+        // be NOW, not the stale one, or a healthy verifier eats a
+        // spurious VerdictStarved degrade in the window before its
+        // verdict arrives.
+        let t0 = Instant::now();
+        let mut clock = StarvationClock::new();
+        clock.on_enqueue(true, t0);
+        // While emptied, reads must gate to None despite the anchor.
+        assert_eq!(
+            clock.elapsed_while_outstanding(true, t0 + Duration::from_secs(200)),
+            None
+        );
+        let t300 = t0 + Duration::from_secs(300);
+        clock.on_enqueue(true, t300);
+        assert_eq!(
+            clock.elapsed_while_outstanding(false, t300 + Duration::from_secs(2)),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn starvation_clock_holds_anchor_across_capacity_eviction() {
+        // Busy chain: every new propose evicts the oldest but the set
+        // never empties; the anchor must survive the churn (the PB-17
+        // core).
+        let t0 = Instant::now();
+        let mut clock = StarvationClock::new();
+        clock.on_enqueue(true, t0);
+        for i in 1..=3u64 {
+            clock.on_enqueue(false, t0 + Duration::from_secs(3 * i));
+        }
+        assert_eq!(
+            clock.elapsed_while_outstanding(false, t0 + Duration::from_secs(11)),
+            Some(Duration::from_secs(11))
+        );
+    }
+
+    #[test]
+    fn starvation_clock_resets_on_verdict_and_clears_on_drain_and_flush() {
+        let t0 = Instant::now();
+        let mut clock = StarvationClock::new();
+        clock.on_enqueue(true, t0);
+        // Verdict with one propose still outstanding: clock restarts.
+        let t5 = t0 + Duration::from_secs(5);
+        clock.on_verdict(false, t5);
+        assert_eq!(
+            clock.elapsed_while_outstanding(false, t5 + Duration::from_secs(3)),
+            Some(Duration::from_secs(3))
+        );
+        // Verdict drains the set: cleared.
+        clock.on_verdict(true, t5 + Duration::from_secs(4));
+        assert_eq!(
+            clock.elapsed_while_outstanding(true, t5 + Duration::from_secs(60)),
+            None
+        );
+        // Degrade flush clears an armed clock.
+        clock.on_enqueue(true, t5 + Duration::from_secs(70));
+        clock.on_flush();
+        assert_eq!(
+            clock.elapsed_while_outstanding(true, t5 + Duration::from_secs(80)),
+            None
+        );
     }
 }

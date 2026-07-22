@@ -228,17 +228,24 @@ pub struct GatewaySection {
     pub template_url: String,
 
     /// Enable automatic inline-to-observe degradation when the verifier
-    /// becomes unreachable. When enabled and the verifier health probe
-    /// exceeds `auto_degrade_after_ms`, the gateway temporarily suspends
-    /// verdict enforcement and broadcasts templates immediately (observe
-    /// equivalent). Enforcement resumes when the verifier reconnects and
-    /// sends a heartbeat ack. Default true.
+    /// stops serving verdicts. Two triggers (PB-15 D2, PB-17): heartbeat
+    /// loss beyond `auto_degrade_after_ms` (dead link), or verdict
+    /// starvation beyond the same threshold while proposals are
+    /// outstanding (live link, mute verdict service; detected via the
+    /// oldest pending template's age plus an eviction-proof starvation
+    /// clock). While degraded the gateway suspends verdict enforcement
+    /// and broadcasts templates immediately (observe equivalent).
+    /// Recovery depends on the trigger: heartbeat-loss degrades recover
+    /// on the next heartbeat ack; starvation degrades recover only when
+    /// a verdict actually arrives. Default true.
     #[serde(default = "default_auto_degrade")]
     pub auto_degrade: bool,
 
-    /// Milliseconds without a verifier heartbeat ack before the gateway
-    /// transitions to degraded mode. Only effective when `auto_degrade`
-    /// is true and the configured mode is inline. Default 10000.
+    /// Milliseconds before the gateway transitions to degraded mode,
+    /// applied to both degrade signals: time without a verifier
+    /// heartbeat ack, and time without a verdict while proposals are
+    /// outstanding. Only effective when `auto_degrade` is true and the
+    /// configured mode is inline. Default 10000.
     #[serde(default = "default_auto_degrade_after_ms")]
     pub auto_degrade_after_ms: u64,
 }
@@ -701,6 +708,9 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
     // template can outlive auto_degrade_after_ms before the SEC-004 sweep
     // evicts it at max_template_age_ms and releases its dedup entry, which
     // resets the age clock on re-propose (R-107 ordering dependency).
+    // PB-17: still accurate with the starvation clock, which re-anchors on
+    // the empty-to-non-empty pending transition the sweep's evict/re-propose
+    // cycle produces, so neither signal outlives the sweep in this config.
     if config.gateway.auto_degrade
         && config.mode.enforces_verdicts()
         && config.gateway.auto_degrade_after_ms >= config.gateway.max_template_age_ms
