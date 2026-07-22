@@ -83,7 +83,7 @@ None at the RC layer. The 22 new `v2_invariant_*` reason codes are additive acro
 3. Add `[policy.mempool]` configuration to `config/policy.toml` if running observe or inline mode against a real bitcoind. Keep `[policy.mempool] enforce = false` to defer Phase 2 enablement until you are ready to point the verifier at a bitcoind RPC endpoint.
 4. Set `VELDRA_BITCOIND_RPC_USER` plus `VELDRA_BITCOIND_RPC_PASS` env vars on the pool-verifier service when enabling Phase 2. The verifier prefers the env var to the on-disk `[policy.mempool] rpc_pass` value to keep secrets out of `policy.toml`.
 5. Rebuild and deploy: `docker compose build && docker compose up -d`.
-6. Verify Phase 2 health on the metrics endpoint: `curl -s http://localhost:8081/metrics | grep -E 'verifier_phase2|verifier_mempool_view'`. Expect `verifier_phase2_checks_total_total{result="agreed"}` to increment, `verifier_mempool_view_age_seconds` to stay under 60, and `verifier_mempool_view_size` to be non-zero.
+6. Verify Phase 2 health on the metrics endpoint: `curl -s http://localhost:8081/metrics | grep -E 'verifier_phase2|verifier_mempool_view'`. Expect `verifier_phase2_checks_total{result="agreed"}` to increment, `verifier_mempool_view_age_seconds` to stay under 60, and `verifier_mempool_view_size` to be non-zero.
 7. Operators running the canonical one-week production observation cycle: capture the T-1 baseline via `scripts/phase2-baseline.sh` and follow the runbook at `docs/runbooks/phase2-shadow-soak.md`.
 
-See [CHANGELOG.md](https://github.com/LeavesJ/veldra/blob/main/CHANGELOG.md) for the complete list of changes.
+See [CHANGELOG.md](https://github.com/LeavesJ/ReserveGrid-OS/blob/main/CHANGELOG.md) for the complete list of changes.

@@ -88,4 +88,4 @@ Two changes require coordinated upgrades. See the deployment runbook for detaile
 4. Rebuild and deploy: `docker compose build && docker compose up -d`
 5. Verify health: `curl -s http://localhost:8081/readyz | jq .`
 
-See [CHANGELOG.md](https://github.com/LeavesJ/veldra/blob/main/CHANGELOG.md) for the complete list of changes.
+See [CHANGELOG.md](https://github.com/LeavesJ/ReserveGrid-OS/blob/main/CHANGELOG.md) for the complete list of changes.

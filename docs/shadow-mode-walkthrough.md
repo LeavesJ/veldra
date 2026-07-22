@@ -42,8 +42,8 @@ Shadow mode is intentionally key-free. You can be running verdicts in 3 minutes.
 ## Step 1. Clone and Configure
 
 ```bash
-git clone https://github.com/LeavesJ/veldra.git
-cd veldra
+git clone https://github.com/LeavesJ/ReserveGrid-OS.git
+cd ReserveGrid-OS
 cp .env.example .env
 ```
 
