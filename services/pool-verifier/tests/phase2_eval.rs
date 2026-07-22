@@ -46,11 +46,15 @@ fn fresh_snapshot(txids: Vec<[u8; 32]>) -> MempoolSnapshot {
 fn regtest_segwit_template() -> (TemplatePropose, Vec<[u8; 32]>) {
     let bytes =
         hex::decode(REGTEST_SEGWIT_BLOCK_HEX.trim()).expect("REGTEST_SEGWIT_BLOCK_HEX decodes");
-    let weight =
-        rg_consensus::re_derive_template_weight(&bytes).expect("regtest weight re-derives");
     let parsed = rg_consensus::parse_block(&bytes).expect("regtest block parses");
-    let total_sigops = rg_consensus::total_sigops(&parsed);
-    let coinbase_sigops = rg_consensus::coinbase_sigops(&parsed);
+    // PB-19 producer conventions: non-coinbase weight sum, sigops in
+    // cost units (declared as the legacy x4 floor), non-coinbase
+    // tx_count.
+    let weight = rg_consensus::non_coinbase_tx_weight(&parsed);
+    let total_sigops_cost = u32::try_from(u64::from(rg_consensus::total_sigops(&parsed)) * 4)
+        .expect("fixture sigop cost fits u32");
+    let coinbase_sigops_cost = u32::try_from(u64::from(rg_consensus::coinbase_sigops(&parsed)) * 4)
+        .expect("fixture coinbase sigop cost fits u32");
     let txids = rg_consensus::template_txids(&parsed);
 
     let coinbase_value =
@@ -62,12 +66,12 @@ fn regtest_segwit_template() -> (TemplatePropose, Vec<[u8; 32]>) {
         block_height: 102,
         prev_hash: "a".repeat(64),
         coinbase_value,
-        tx_count: 2,
+        tx_count: 1,
         total_fees: 0,
         observed_weight: None,
         created_at_unix_ms: None,
-        total_sigops: Some(total_sigops),
-        coinbase_sigops: Some(coinbase_sigops),
+        total_sigops: Some(total_sigops_cost),
+        coinbase_sigops: Some(coinbase_sigops_cost),
         template_weight: Some(weight),
         gateway_instance_id: None,
         raw_block_hex: Some(REGTEST_SEGWIT_BLOCK_HEX.trim().to_string()),

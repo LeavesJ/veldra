@@ -703,7 +703,10 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
 ///   - `WitnessCommitmentMismatch`  commitment vs computed
 ///   - `CoinbaseBip34Missing`       coinbase script begins with height push
 ///
-/// Class D (declared-mismatch, runs only when declared field is `Some`):
+/// Class D (declared-mismatch, runs only when declared field is `Some`;
+/// wire conventions per PB-19: `tx_count` and `template_weight` cover
+/// NON-coinbase transactions, sigops arrive in BIP-141 cost units and
+/// are checked one-sided against the legacy x4 provable floor):
 ///   - `CoinbaseValueMismatch`      always (declared field non-Option)
 ///   - `TemplateWeightMismatch`     when `template_weight.is_some()`
 ///   - `TxCountMismatch`            always (declared field non-Option)
@@ -848,24 +851,17 @@ fn check_invariant_shield_inner(
     }
 
     // ── Class D: TemplateWeightMismatch (when declared) ───────────
+    // Wire contract (PB-19): `template_weight` is the sum of
+    // NON-coinbase tx weights (the GBT convention every producer and
+    // the pre-shield policy layer use), so the comparison excludes
+    // the coinbase and header contributions.
     if let Some(declared) = template.template_weight {
-        match rg_consensus::re_derive_template_weight(&raw_block) {
-            Ok(re_derived) => {
-                if re_derived != declared {
-                    return ShieldOutcome::Rejected {
-                        reason: VerdictReason::V2InvariantTemplateWeightMismatch,
-                        detail: format!(
-                            "template_weight declared={declared} re_derived={re_derived}"
-                        ),
-                    };
-                }
-            }
-            Err(v) => {
-                return ShieldOutcome::Rejected {
-                    reason: consensus_violation_to_verdict_reason(&v),
-                    detail: v.to_string(),
-                };
-            }
+        let re_derived = rg_consensus::non_coinbase_tx_weight(&parsed);
+        if re_derived != declared {
+            return ShieldOutcome::Rejected {
+                reason: VerdictReason::V2InvariantTemplateWeightMismatch,
+                detail: format!("template_weight declared={declared} re_derived={re_derived}"),
+            };
         }
     }
 
@@ -894,8 +890,12 @@ fn check_invariant_shield_inner(
     }
 
     // ── Class D: TxCountMismatch (always comparable) ──────────────
+    // Wire contract (PB-19): `tx_count` counts NON-coinbase
+    // transactions (the producer convention the fee and
+    // empty-template policies already rely on), so the block body
+    // count is compared minus its coinbase.
     {
-        let re_derived = rg_consensus::tx_count(&parsed);
+        let re_derived = rg_consensus::tx_count(&parsed).saturating_sub(1);
         if re_derived != template.tx_count {
             return ShieldOutcome::Rejected {
                 reason: VerdictReason::V2InvariantTxCountMismatch,
@@ -907,24 +907,43 @@ fn check_invariant_shield_inner(
         }
     }
 
-    // ── Class D: SigopsMismatch (when declared) ───────────────────
+    // ── Class D: SigopsMismatch (when declared; one-sided) ────────
+    // Wire contract (PB-19): `total_sigops` arrives in BIP-141
+    // sigop-COST units (GBT convention). Exact cost cannot be
+    // re-derived without the spent prevouts, but legacy count x4 is
+    // a provable lower bound of true cost (P2SH and witness sigops
+    // only add), so `legacy x4 > declared` is a violation with zero
+    // false positives and still catches the real attack: declaring
+    // fewer sigops than the block provably carries.
     if let Some(declared) = template.total_sigops {
-        let re_derived = rg_consensus::total_sigops(&parsed);
-        if re_derived != declared {
+        let legacy = rg_consensus::total_sigops(&parsed);
+        let floor = u64::from(legacy).saturating_mul(4);
+        if floor > u64::from(declared) {
             return ShieldOutcome::Rejected {
                 reason: VerdictReason::V2InvariantSigopsMismatch,
-                detail: format!("total_sigops declared={declared} re_derived={re_derived}"),
+                detail: format!(
+                    "total_sigops declared_cost={declared} below provable floor={floor} \
+                     (legacy count {legacy} x4)"
+                ),
             };
         }
     }
 
-    // ── Class D: CoinbaseSigopsMismatch (when declared) ───────────
+    // ── Class D: CoinbaseSigopsMismatch (when declared; one-sided) ─
+    // Same cost-floor bound restricted to the coinbase. Residual
+    // assumption: the declared value describes a coinbase at least
+    // as sigop-heavy as the assembled one (stock Core omits
+    // `coinbasetxn`, so this check is skipped in practice today).
     if let Some(declared) = template.coinbase_sigops {
-        let re_derived = rg_consensus::coinbase_sigops(&parsed);
-        if re_derived != declared {
+        let legacy = rg_consensus::coinbase_sigops(&parsed);
+        let floor = u64::from(legacy).saturating_mul(4);
+        if floor > u64::from(declared) {
             return ShieldOutcome::Rejected {
                 reason: VerdictReason::V2InvariantCoinbaseSigopsMismatch,
-                detail: format!("coinbase_sigops declared={declared} re_derived={re_derived}"),
+                detail: format!(
+                    "coinbase_sigops declared_cost={declared} below provable floor={floor} \
+                     (legacy count {legacy} x4)"
+                ),
             };
         }
     }
@@ -1686,12 +1705,13 @@ mod tests {
     const GENESIS_BIP34_HEIGHT: u32 = 0x1d00_ffff;
 
     fn genesis_template() -> TemplatePropose {
-        let weight = genesis_weight_via_facade();
         TemplatePropose {
             coinbase_value: GENESIS_COINBASE_SATS,
-            tx_count: 1,
+            // Producer convention (PB-19): non-coinbase count and
+            // non-coinbase weight sum; genesis is coinbase-only.
+            tx_count: 0,
             block_height: GENESIS_BIP34_HEIGHT,
-            template_weight: Some(weight),
+            template_weight: Some(0),
             raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
             ..base_template()
         }
@@ -1798,8 +1818,11 @@ mod tests {
 
     #[test]
     fn shield_total_sigops_mismatch_rejects() {
+        // One-sided check (PB-19): genesis carries one legacy sigop
+        // (P2PK output), so the provable cost floor is 4; declaring
+        // 0 understates it and must reject.
         let t = TemplatePropose {
-            total_sigops: Some(99_999),
+            total_sigops: Some(0),
             ..genesis_template()
         };
         match check_invariant_shield(&t) {
@@ -1812,8 +1835,10 @@ mod tests {
 
     #[test]
     fn shield_coinbase_sigops_mismatch_rejects() {
+        // One-sided check (PB-19): the genesis coinbase carries one
+        // legacy sigop, floor 4; declaring 0 understates it.
         let t = TemplatePropose {
-            coinbase_sigops: Some(99_999),
+            coinbase_sigops: Some(0),
             ..genesis_template()
         };
         match check_invariant_shield(&t) {
@@ -1977,31 +2002,102 @@ mod tests {
         include_str!("../tests/fixtures/regtest_segwit_block.hex");
     const REGTEST_SEGWIT_BLOCK_HEIGHT: u32 = 102;
     const REGTEST_SEGWIT_COINBASE_SATS: u64 = 5_000_000_141;
-    const REGTEST_SEGWIT_TX_COUNT: u32 = 2;
+    /// Producer convention (PB-19): non-coinbase transaction count.
+    /// The fixture block body is coinbase plus one segwit tx.
+    const REGTEST_SEGWIT_TX_COUNT: u32 = 1;
 
     /// Build a `TemplatePropose` whose declared fields all agree
-    /// with the regtest segwit block fixture. Re-derive sigops via
-    /// the facade so we never hand-encode counts that drift if the
-    /// sigop accounting changes.
+    /// with the regtest segwit block fixture, in the PB-19 producer
+    /// conventions: non-coinbase tx count and weight sum, sigops in
+    /// cost units (declared here as the legacy x4 floor, the honest
+    /// lower-bound shape). Re-derive via the facade so the fixture
+    /// never drifts from the accounting.
     fn regtest_segwit_template() -> TemplatePropose {
         let bytes =
             hex::decode(REGTEST_SEGWIT_BLOCK_HEX.trim()).expect("REGTEST_SEGWIT_BLOCK_HEX decodes");
-        let weight =
-            rg_consensus::re_derive_template_weight(&bytes).expect("regtest weight re-derives");
         let parsed = rg_consensus::parse_block(&bytes).expect("regtest block parses");
-        let total = rg_consensus::total_sigops(&parsed);
-        let coinbase = rg_consensus::coinbase_sigops(&parsed);
+        let weight = rg_consensus::non_coinbase_tx_weight(&parsed);
+        let total_cost_floor = u32::try_from(u64::from(rg_consensus::total_sigops(&parsed)) * 4)
+            .expect("fixture sigop cost fits u32");
+        let coinbase_cost_floor =
+            u32::try_from(u64::from(rg_consensus::coinbase_sigops(&parsed)) * 4)
+                .expect("fixture coinbase sigop cost fits u32");
 
         TemplatePropose {
             coinbase_value: REGTEST_SEGWIT_COINBASE_SATS,
             tx_count: REGTEST_SEGWIT_TX_COUNT,
             block_height: REGTEST_SEGWIT_BLOCK_HEIGHT,
             template_weight: Some(weight),
-            total_sigops: Some(total),
-            coinbase_sigops: Some(coinbase),
+            total_sigops: Some(total_cost_floor),
+            coinbase_sigops: Some(coinbase_cost_floor),
             raw_block_hex: Some(REGTEST_SEGWIT_BLOCK_HEX.trim().to_string()),
             ..base_template()
         }
+    }
+
+    /// Legacy-serialize the coinbase template-manager's
+    /// `build_coinbase_halves` produces for height 102, a
+    /// 5,000,000,000 sat payout to `OP_TRUE`, an 8-byte zero-filled
+    /// extranonce slot, and no witness commitment. Byte-for-byte the
+    /// production shape, hand-rolled here because pool-verifier
+    /// carries no assembler of its own (R-154).
+    fn production_shaped_coinbase() -> Vec<u8> {
+        let mut cb = Vec::new();
+        cb.extend_from_slice(&2u32.to_le_bytes()); // tx version
+        cb.push(0x01); // input count
+        cb.extend_from_slice(&[0u8; 32]); // null prevout hash
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // prevout index
+        cb.push(0x0a); // scriptSig len: 2 (BIP-34 push) + 8 (extranonce)
+        cb.extend_from_slice(&[0x01, 0x66]); // BIP-34 push of height 102
+        cb.extend_from_slice(&[0u8; 8]); // zero-filled extranonce
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sequence
+        cb.push(0x01); // output count
+        cb.extend_from_slice(&5_000_000_000u64.to_le_bytes()); // payout value
+        cb.push(0x01); // script len
+        cb.push(0x51); // OP_TRUE
+        cb.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        cb
+    }
+
+    #[test]
+    fn shield_agrees_on_production_shaped_propose_end_to_end() {
+        // PB-19 contract test. A propose declared exactly the way
+        // template-manager declares its fields (tx_count and
+        // template_weight over NON-coinbase transactions, sigops in
+        // BIP-141 cost units) carrying a facade-assembled
+        // raw_block_hex must land Agreed. The three Phase 1b
+        // launch blockers (weight, tx_count, and sigops contract
+        // drift between producer and shield) were invisible to every
+        // test that did not cross this seam with production
+        // semantics.
+        let cb = production_shaped_coinbase();
+        let parts = rg_consensus::TemplateBlockParts {
+            version: 0x2000_0000,
+            prev_hash: [0x44; 32],
+            time: 1_700_000_000,
+            bits: 0x207f_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[],
+        };
+        let raw = rg_consensus::assemble_template_block(&parts).expect("assembles");
+        let t = TemplatePropose {
+            coinbase_value: 5_000_000_000,
+            // Producer semantics: non-coinbase transaction count.
+            tx_count: 0,
+            block_height: 102,
+            // Producer semantics: sum of non-coinbase tx weights.
+            template_weight: Some(0),
+            // Producer semantics: BIP-141 sigop cost of the GBT txs.
+            total_sigops: Some(0),
+            coinbase_sigops: Some(0),
+            raw_block_hex: Some(hex::encode(raw)),
+            ..base_template()
+        };
+        assert_eq!(
+            check_invariant_shield(&t),
+            ShieldOutcome::Agreed,
+            "a production-shaped propose must pass its own shield"
+        );
     }
 
     /// Find the BIP-141 witness commitment magic in a serialized

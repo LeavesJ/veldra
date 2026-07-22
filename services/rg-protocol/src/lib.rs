@@ -16,6 +16,10 @@ pub struct TemplatePropose {
     pub prev_hash: String,
 
     pub coinbase_value: u64,
+    /// Number of NON-coinbase transactions in the template (the GBT
+    /// `transactions` array length). The coinbase is never counted;
+    /// the shield's re-derivation subtracts it before comparing
+    /// (PB-19 wire contract).
     pub tx_count: u32,
     pub total_fees: u64,
 
@@ -27,12 +31,22 @@ pub struct TemplatePropose {
     pub created_at_unix_ms: Option<u64>,
 
     /// Consensus safety fields (v0.2.2). Older senders omit them.
+    ///
+    /// PB-19 wire contract: BIP-141 sigop COST units over the
+    /// non-coinbase transactions (the GBT `transactions[].sigops`
+    /// convention). The shield checks this one-sided against the
+    /// provable legacy x4 floor; exact cost is not re-derivable
+    /// without the spent prevouts.
     #[serde(default)]
     pub total_sigops: Option<u32>,
 
+    /// BIP-141 sigop cost units, coinbase only. See `total_sigops`.
     #[serde(default)]
     pub coinbase_sigops: Option<u32>,
 
+    /// Sum of NON-coinbase transaction weights in weight units (the
+    /// GBT `transactions[].weight` convention; excludes the coinbase
+    /// and header). PB-19 wire contract.
     #[serde(default)]
     pub template_weight: Option<u64>,
 

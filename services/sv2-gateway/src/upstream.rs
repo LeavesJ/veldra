@@ -46,6 +46,12 @@ pub struct TemplateResponse {
     pub total_sigops: Option<u32>,
     #[serde(default)]
     pub coinbase_sigops: Option<u32>,
+    /// PB-19 / Phase 1b: hex of the assembled raw template block,
+    /// forwarded verbatim into `TemplatePropose` so the verifier's
+    /// Invariant Shield has bytes to re-derive from. Optional for
+    /// backward compatibility with older template-managers.
+    #[serde(default)]
+    pub raw_block_hex: Option<String>,
 }
 
 /// Configuration for the template poller.
