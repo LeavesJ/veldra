@@ -16,8 +16,8 @@ coinbase, and body bytes are mutually inconsistent, and T2
 of the same `raw_block` bytes shows. Phase 1 #4b shipped on 2026-04-29
 with 11 of 18 invariants wired and tested against genesis plus a
 regtest segwit fixture, closing T1 and T2 to ~95% practical coverage.
-Phase 1.5 will extend coverage with the remaining 7 belt-and-suspenders
-checks after a production observation cycle in shadow mode.
+Phase 1.5 shipped 2026-07-22 and wired the remaining 7 Tier 3
+belt-and-suspenders checks, completing all 18 ADR-002 invariants.
 
 Phase 1 cannot close one specific attacker class:
 

@@ -375,12 +375,16 @@ fn check_template_constraints(
     }
 
     if min_avg_fee_used > 0 && template.tx_count > 0 {
-        // Ceiling division so rounding never makes a below-threshold
-        // average appear to pass. Without this, a template with
-        // total_fees=15001 and tx_count=3 yields avg=5000 (floor)
-        // instead of 5001, silently bypassing a min_avg_fee=5001 policy.
+        // Floor division is the strict direction: floor(total/tx) < min
+        // holds exactly when total < min * tx, so a true average even
+        // fractionally below the threshold rejects. Ceiling division
+        // rounds a below-threshold average up to the threshold and
+        // wrongly accepts (total_fees=15001, tx_count=3,
+        // min_avg_fee=5001: true avg 5000.33, ceil 5001, would pass).
+        // Floor also matches `compute_avg_fee_sats_per_tx`, so the
+        // logged average agrees with the decision average.
         let tx = u64::from(template.tx_count);
-        let avg = template.total_fees.div_ceil(tx);
+        let avg = template.total_fees / tx;
         if avg < min_avg_fee_used {
             return Some(EvalResult {
                 reason: Some(VerdictReason::AvgFeeBelowMinimum),
@@ -687,9 +691,9 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
 
 /// Run the v2.0 Invariant Shield pass against a template.
 ///
-/// Phase 1 #4b scope: 10 of 18 invariants wired (Tier 1 + Tier 2 per
-/// ADR-002 criticality tiering). Tier 3 belt-and-suspenders checks
-/// land in Phase 1.5.
+/// Scope: all 18 ADR-002 Phase 1 invariants wired. Tier 1 + Tier 2
+/// shipped in Phase 1 #4b; the seven Tier 3 belt-and-suspenders
+/// checks landed in Phase 1.5.
 ///
 /// Wired invariants:
 ///
@@ -706,6 +710,15 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
 ///   - `SigopsMismatch`             when `total_sigops.is_some()`
 ///   - `CoinbaseSigopsMismatch`     when `coinbase_sigops.is_some()`
 ///   - `CoinbaseHeightMismatch`     always (declared field non-Option)
+///
+/// Tier 3 (standalone consensus ceilings, Phase 1.5):
+///   - `CoinbaseScriptLength`       coinbase script 2..=100 bytes
+///   - `CoinbaseOutputCount`        coinbase must pay at least one output
+///   - `WeightExceedsMax`           4,000,000 WU ceiling (BIP-141)
+///   - `SigopsExceedMax`            80,000 sigop-cost ceiling (BIP-141)
+///   - `NonCoinbaseNullPrevout`     null prevout outside the coinbase
+///   - `HeaderVersionLow`           header version below the BIP-65 floor
+///   - `DuplicateTx`                repeated txid in the block body
 ///
 /// First violation wins, short-circuit. The shield deserializes
 /// `raw_block_hex` once via `rg_consensus::parse_block` and reuses
@@ -741,9 +754,16 @@ pub fn format_mempool_tolerance_detail(
     let mut detail =
         format!("mempool tolerance exceeded: {unknown_count}/{total} txs unknown to verifier view");
     if !txids_to_emit.is_empty() {
+        // Txids arrive in internal byte order; operators correlate
+        // against bitcoin-cli and explorers, which use display order
+        // (byte reversed). Emit display order.
         let sample_str: String = txids_to_emit
             .iter()
-            .map(hex::encode)
+            .map(|t| {
+                let mut display = *t;
+                display.reverse();
+                hex::encode(display)
+            })
             .collect::<Vec<_>>()
             .join(",");
         let _ = write!(detail, " sample=[{sample_str}]");
@@ -770,6 +790,10 @@ pub fn check_invariant_shield_with_mempool(
 ) -> ShieldOutcome {
     check_invariant_shield_inner(template, Some((mempool, tolerance_pct, per_tx_detail)))
 }
+
+/// Signature shared by every Tier 3 standalone check in the
+/// rg-consensus facade.
+type Tier3Check = fn(&rg_consensus::ParsedBlock) -> Result<(), ConsensusViolation>;
 
 #[allow(clippy::too_many_lines)]
 fn check_invariant_shield_inner(
@@ -919,6 +943,29 @@ fn check_invariant_shield_inner(
             }
         }
         Err(v) => {
+            return ShieldOutcome::Rejected {
+                reason: consensus_violation_to_verdict_reason(&v),
+                detail: v.to_string(),
+            };
+        }
+    }
+
+    // ── Tier 3: belt-and-suspenders checks (Phase 1.5) ────────────
+    // Standalone consensus ceilings and structural rules, in ADR-002
+    // table order. No declared field needed; each check reads only
+    // the parsed block. First violation wins, matching the Class S
+    // and Class D short-circuit discipline above.
+    let tier3_checks: [Tier3Check; 7] = [
+        rg_consensus::check_coinbase_script_length,
+        rg_consensus::check_coinbase_output_count,
+        rg_consensus::check_weight_max,
+        rg_consensus::check_sigops_max,
+        rg_consensus::check_non_coinbase_null_prevout,
+        rg_consensus::check_header_version,
+        rg_consensus::check_duplicate_tx,
+    ];
+    for check in tier3_checks {
+        if let Err(v) = check(&parsed) {
             return ShieldOutcome::Rejected {
                 reason: consensus_violation_to_verdict_reason(&v),
                 detail: v.to_string(),
@@ -1622,9 +1669,12 @@ mod tests {
     }
 
     /// Build a `TemplatePropose` whose declared fields all agree with
-    /// the genesis block bytes. Used by every shield happy-path test
-    /// so the Tier 1+2 invariants land Agreed instead of one of them
-    /// rejecting on a stale `base_template` default.
+    /// the genesis block bytes. Every Tier 1+2 invariant lands Agreed
+    /// on it; since Phase 1.5 the Tier 3 section rejects it with
+    /// `HeaderVersionLow` (genesis is a version-1 block), so shield
+    /// happy-path tests use `regtest_segwit_template` instead and
+    /// genesis serves the Tier 1+2 mismatch tests, which short-circuit
+    /// before Tier 3 runs.
     ///
     /// `tx_count` is 1 (genesis is coinbase-only). `block_height` is
     /// `GENESIS_BIP34_HEIGHT` because the BIP-34 decoder reads the
@@ -1648,20 +1698,82 @@ mod tests {
     }
 
     #[test]
-    fn shield_agrees_on_genesis_happy_path() {
+    fn avg_fee_rejects_below_threshold_average_at_rounding_boundary() {
+        // total_fees=15001 over tx_count=3 is a true average of
+        // 5000.33, strictly below a 5001 sats floor: must reject.
+        // Ceiling division rounds the average up to exactly the
+        // threshold and wrongly accepts; floor division is the
+        // strict direction. total_fees=15003 sits exactly at the
+        // threshold and must pass.
+        let cfg = PolicyConfig {
+            min_avg_fee_hi: 5001,
+            unknown_mempool_as_high: true,
+            ..PolicyConfig::default_with_protocol(PROTOCOL_VERSION)
+        };
+        let below = TemplatePropose {
+            total_fees: 15_001,
+            tx_count: 3,
+            ..base_template()
+        };
+        let result = evaluate(&below, &cfg);
         assert_eq!(
-            check_invariant_shield(&genesis_template()),
-            ShieldOutcome::Agreed
+            result.reason,
+            Some(VerdictReason::AvgFeeBelowMinimum),
+            "true average below the floor must reject"
         );
+
+        let at_threshold = TemplatePropose {
+            total_fees: 15_003,
+            tx_count: 3,
+            ..base_template()
+        };
+        let result = evaluate(&at_threshold, &cfg);
+        assert!(
+            result.reason.is_none(),
+            "average exactly at the floor must pass, got {:?}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn mempool_tolerance_detail_renders_txids_in_display_order() {
+        // Operators correlate rejection details against bitcoin-cli
+        // and explorers, which print txids in display order (byte
+        // reversed relative to internal order). The sample field must
+        // match that convention.
+        let mut txid = [0u8; 32];
+        txid[0] = 0xaa;
+        let detail = format_mempool_tolerance_detail(1, 10, &[txid]);
+        let mut display = txid;
+        display.reverse();
+        let expected = hex::encode(display);
+        assert!(
+            detail.contains(&expected),
+            "sample txid must render in display order, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn shield_rejects_header_version_low_on_genesis() {
+        // Genesis is a version-1 block, below the BIP-65 version-4
+        // floor. Tier 3 (Phase 1.5) turns it into the canonical
+        // header-version rejection: the wiring proof that the Tier 3
+        // section runs inside the shield.
+        match check_invariant_shield(&genesis_template()) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantHeaderVersionLow);
+            }
+            other => panic!("expected Rejected(V2InvariantHeaderVersionLow) got {other:?}"),
+        }
     }
 
     #[test]
     fn shield_agrees_when_template_weight_absent() {
         // No declared template_weight means the weight re-derivation
-        // is skipped; the other Tier 1+2 checks must still pass.
+        // is skipped; every other check must still pass.
         let t = TemplatePropose {
             template_weight: None,
-            ..genesis_template()
+            ..regtest_segwit_template()
         };
         assert_eq!(check_invariant_shield(&t), ShieldOutcome::Agreed);
     }
@@ -1733,12 +1845,12 @@ mod tests {
     #[test]
     fn shield_total_sigops_skipped_when_declared_none() {
         // Class D checks skip individually when the declared field is
-        // None. Genesis has total_sigops=None in genesis_template
-        // (base_template default), shield must reach Agreed.
+        // None; the shield must still reach Agreed on a block that
+        // passes everything else.
         let t = TemplatePropose {
             total_sigops: None,
             coinbase_sigops: None,
-            ..genesis_template()
+            ..regtest_segwit_template()
         };
         assert_eq!(check_invariant_shield(&t), ShieldOutcome::Agreed);
     }
@@ -1801,9 +1913,9 @@ mod tests {
     #[test]
     fn evaluate_dynamic_clears_shield_skipped_when_shield_runs() {
         let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
-        // Use the genesis_template() helper so all Tier 1+2 checks
-        // agree (tx_count, block_height, etc.).
-        let result = evaluate(&genesis_template(), &cfg);
+        // Use the regtest fixture so every shield check, Tier 3
+        // included, agrees (tx_count, block_height, header version).
+        let result = evaluate(&regtest_segwit_template(), &cfg);
         assert!(result.reason.is_none(), "got reason: {:?}", result.reason);
         assert!(!result.shield_skipped);
     }

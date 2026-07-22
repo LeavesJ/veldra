@@ -1,6 +1,8 @@
 # ADR-002: v2.0 Invariant Shield Scope and Parser Choice
 
-**Status:** Proposed
+**Status:** Accepted, implemented (Phase 1 shipped 2026-04-21 through
+2026-04-29; Phase 1.5 Tier 3 completion shipped 2026-07-22 — all 18
+checks wired)
 **Date:** 2026-04-21
 **Deciders:** Jarron (Veldra, Inc.)
 
@@ -426,23 +428,52 @@ verifier checks, not gateway checks). A new
    alongside the pre existing duplicate set.
 9. [ ] Benchmark cold build time delta. Report in DEVLOG. If more than 3x
    current, open a tech debt item for workspace precompilation.
-10. [ ] Update `docs/three-mode-architecture.md` with the new v2.0
+10. [x] Update `docs/three-mode-architecture.md` with the new v2.0
     Invariant Shield layer between template ingress and verdict emission.
-11. [ ] Update `docs/TESTLOG.md` with a new `CL-28: v2.0 Invariant
+    Landed with Phase 1 #4b; refreshed 2026-07-22 for the Phase 1.5
+    Tier 3 completion (wired count 18 of 18).
+11. [x] Update `docs/TESTLOG.md` with a new `CL-28: v2.0 Invariant
     Shield Re-derivation Agreement` claim covering all 18 checks against
-    known mainnet blocks.
-12. [ ] Update `docs/PRODUCTION_BLOCKERS.md` with `PB-9: Consensus
+    known mainnet blocks. CL-28 exists; historical mainnet vectors
+    beyond genesis plus the regtest segwit fixture remain a follow up.
+12. [x] Update `docs/PRODUCTION_BLOCKERS.md` with `PB-9: Consensus
     re-derivation parser` tracking Phase 1 delivery.
 13. [ ] Public documentation refresh: add the 18 new codes to the docs
     site reason code table, add the `v2_invariant_*` prefix to the
     reason code conventions section, bump hardcoded counts across
     `POSITIONING.md`, `ReserveGrid-OS-Founders-Guide.md`, and the
     veldra-site HTML and i18n JSON (R-106 plus Tier 1 #3 pattern).
+    Still open as of 2026-07-22: site i18n bundles claim 91 reason
+    codes in four keys across three locales (canonical is 95), and
+    the wired-count copy needs the 18 of 18 refresh.
 14. [ ] If Phase 1 ships, add R-154 to `docs/lessons.md` capturing the
     facade discipline: "Consensus parsing library dependencies must enter
     the workspace through a single crate that exposes only plain Rust
     types across its API boundary. No upstream consensus types leak into
     wire schemas, NDJSON exports, or reason code definitions."
+15. [x] Phase 1.5: implement and wire the seven Tier 3
+    belt-and-suspenders checks (`coinbase_script_length`,
+    `coinbase_output_count`, `weight_exceeds_max`,
+    `sigops_exceed_max`, `nontcb_null_prevout`, `header_version_low`,
+    `duplicate_tx`). Landed 2026-07-22: seven standalone check
+    functions in `rg-consensus` (coinbase script-size bounds per
+    Core's `bad-cb-length` rule, one-output floor, 4M WU ceiling,
+    80k sigop-cost ceiling via the x4 legacy scale, null-prevout
+    scan, BIP-65 version-4 floor, duplicate-txid set), wired into
+    the shield after the Class D checks in ADR table order, first
+    violation wins. Known residual Class S gap, false-negative
+    direction only and pre-existing: Core's `bad-witness-nonce-size`
+    rule is not fully mirrored (a commitment present with zero
+    witnesses anywhere, or a coinbase witness stack that is not
+    exactly one 32-byte element, can pass the shield while Core
+    rejects). Tracked as a Phase 2 refinement. Seventeen new facade unit tests plus
+    the pool-verifier wiring proof (genesis, a version-1 block, now
+    rejects `v2_invariant_header_version_low`; happy path carried by
+    the regtest segwit fixture). The same patch set fixed two shield
+    fidelity gaps found in review: the witness commitment extractor
+    now takes the highest-index match per BIP-141 (was first-match)
+    and the commitment requirement scan counts coinbase witness data
+    per Core's unexpected-witness rule (was non-coinbase only).
 
 ## Phase 2 (cross-reference)
 

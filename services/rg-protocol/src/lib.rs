@@ -443,7 +443,8 @@ mod tests {
     fn all_constant_covers_every_variant() {
         // If a variant is added to the enum but not to ALL, this count will
         // mismatch and the serde round-trip test below will not cover it.
-        // 15 original (v1.x) + 18 v2.0 Invariant Shield (ADR-002) = 33.
+        // 15 original (v1.x) + 18 v2.0 Invariant Shield (ADR-002)
+        // + 4 mempool ground truth (ADR-003 Phase 2) = 37.
         assert_eq!(
             VerdictReason::ALL.len(),
             37,
