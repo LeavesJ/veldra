@@ -21,7 +21,10 @@ pub(crate) struct PolicyReloadLabels {
 }
 
 /// Label set for v2.0 Invariant Shield Phase 2 Class M check
-/// outcome counters. `result` ∈ {agreed, rejected, skipped, stale}.
+/// outcome counters. `result` ∈ {agreed, rejected, skipped, stale,
+/// unprimed} (PB-13 added `unprimed`; PB-18 keys every label off the
+/// evaluation path's `Phase2Attribution`, so templates where Class M
+/// never ran increment nothing).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub(crate) struct Phase2CheckLabels {
     pub(crate) result: String,

@@ -6,7 +6,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::io::BufReader as StdBuf;
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
@@ -18,8 +20,8 @@ use crate::verdicts::{
     LAST_MEMPOOL_OK_UNIX, LogIdCounter, LoggedVerdict, VerdictLog, append_verdict_to_disk,
     current_timestamp, current_timestamp_ms,
 };
-use pool_verifier::mempool_view::MempoolState;
-use rg_protocol::gateway::{InternalMessage, msg_types};
+use pool_verifier::policy::Phase2Attribution;
+use rg_protocol::gateway::{InternalMessage, MAX_INTERNAL_LINE_BYTES, msg_types};
 use rg_protocol::{
     PROTOCOL_VERSION, PolicyContext, TemplatePropose, TemplateVerdict, VerdictReason,
 };
@@ -205,6 +207,46 @@ pub(crate) async fn run_tcp_server(
     }
 }
 
+/// Result of one bounded NDJSON line read (PB-18b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedLine {
+    /// A complete line: newline-terminated within the budget, or a
+    /// final unterminated line at EOF that stayed under the budget.
+    Line,
+    /// Clean EOF with no pending bytes.
+    Eof,
+    /// The peer sent `max_bytes` bytes without a newline. Protocol
+    /// error: the caller drops the connection immediately. Stricter
+    /// than the gateway's read side (which skips oversized lines and
+    /// disconnects after three) because a bounded reader cannot
+    /// resync to the next newline; both sides share the same 1 MiB
+    /// budget.
+    OverLimit,
+}
+
+/// Read one newline-terminated line into `buf`, enforcing `max_bytes`
+/// per line via `AsyncReadExt::take` so an endless newline-free
+/// stream can never grow the line buffer without bound (PB-18b). The
+/// `take` adaptor is re-created per call, so the budget resets for
+/// every line.
+async fn read_bounded_line<R>(
+    reader: &mut R,
+    buf: &mut String,
+    max_bytes: u64,
+) -> std::io::Result<BoundedLine>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let n = (&mut *reader).take(max_bytes).read_line(buf).await?;
+    if n == 0 {
+        return Ok(BoundedLine::Eof);
+    }
+    if u64::try_from(n).unwrap_or(u64::MAX) >= max_bytes && !buf.ends_with('\n') {
+        return Ok(BoundedLine::OverLimit);
+    }
+    Ok(BoundedLine::Line)
+}
+
 /// Handles a single TCP connection (plaintext or TLS) by reading NDJSON lines
 /// and dispatching template proposals.
 #[allow(clippy::too_many_lines)]
@@ -235,16 +277,28 @@ pub(crate) async fn handle_tcp_connection<R, W>(
         // Auto-detected on the first successfully parsed line.
         let mut uses_envelope: Option<bool> = None;
 
+        // PB-18(b): per-line byte budget shared with the gateway's
+        // internal NDJSON protocol.
+        let max_line_bytes = u64::try_from(MAX_INTERNAL_LINE_BYTES).unwrap_or(u64::MAX);
+
         loop {
             line.clear();
-            let _n = match reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(n) => n,
+            match read_bounded_line(&mut reader, &mut line, max_line_bytes).await {
+                Ok(BoundedLine::Line) => {}
+                Ok(BoundedLine::Eof) => break,
+                Ok(BoundedLine::OverLimit) => {
+                    warn!(
+                        max_bytes = MAX_INTERNAL_LINE_BYTES,
+                        "ingress line exceeded MAX_INTERNAL_LINE_BYTES without a newline; \
+                         dropping connection"
+                    );
+                    break;
+                }
                 Err(e) => {
                     warn!(error = ?e, "tcp read error");
                     break;
                 }
-            };
+            }
 
             let trimmed = line.trim();
 
@@ -435,13 +489,18 @@ pub(crate) async fn handle_tcp_connection<R, W>(
 
             let now_ms = current_timestamp_ms();
             // Phase 2 path: if AppState carries a mempool view, snapshot
-            // it and evaluate with Class M wired. Phase 1 path otherwise.
-            let eval = if let Some(view) = state_clone.mempool_view.as_ref() {
-                let snap = view.snapshot().await;
+            // it once and evaluate with Class M wired; the same snapshot
+            // refreshes the view gauges below. Phase 1 path otherwise.
+            let mempool_snap = if let Some(view) = state_clone.mempool_view.as_ref() {
+                Some(view.snapshot().await)
+            } else {
+                None
+            };
+            let eval = if let Some(snap) = mempool_snap.as_ref() {
                 pool_verifier::policy::evaluate_dynamic_phase2(
                     &propose,
                     &cfg,
-                    Some(&snap),
+                    Some(snap),
                     mempool_tx_count,
                     now_ms,
                 )
@@ -455,51 +514,45 @@ pub(crate) async fn handle_tcp_connection<R, W>(
             let reason_code_str: Option<String> =
                 eval.reason.as_ref().map(|r| r.as_str().to_string());
 
-            // ── Phase 2 Class M observability (ADR-003) ──
-            // Increments verifier_phase2_checks_total{result} based on
-            // the verdict's reason code and the mempool view state. Only
-            // fires when the Phase 2 path was taken (mempool_view present
-            // in AppState). Degraded, a primed view that aged out,
-            // increments verifier_phase2_degraded_total; Unprimed, the
-            // boot window before the first poll, does not (PB-13). Mempool
-            // view gauges are refreshed on each snapshot read so
-            // dashboards see freshness without an extra polling loop.
-            if let Some(view) = state_clone.mempool_view.as_ref() {
-                let snap = view.snapshot().await;
+            // ── Phase 2 Class M observability (ADR-003, PB-18a) ──
+            // The result label for verifier_phase2_checks_total comes
+            // from eval.phase2, reported by the evaluation path itself,
+            // so ingress cannot misattribute templates where Class M
+            // never ran (no raw_block_hex, pre-shield rejection) and
+            // cannot mislabel on a view-state flip between two snapshot
+            // reads. NotRun increments nothing. Degraded, a primed view
+            // that aged out, increments verifier_phase2_degraded_total;
+            // Unprimed, the boot window before the first poll, does not
+            // (PB-13). The gauges are view state rather than
+            // per-template attribution, so the single snapshot taken
+            // for evaluation refreshes them and dashboards see
+            // freshness without an extra polling loop.
+            if let Some(snap) = mempool_snap.as_ref() {
                 metrics
                     .mempool_view_age_seconds
                     .set(i64::try_from(snap.age_secs).unwrap_or(i64::MAX));
                 metrics
                     .mempool_view_size
                     .set(i64::try_from(snap.size).unwrap_or(i64::MAX));
-                let result_label = match (eval.reason.as_ref(), snap.state) {
-                    (
-                        Some(
-                            rg_protocol::VerdictReason::V2InvariantMempoolToleranceExceeded
-                            | rg_protocol::VerdictReason::V2InvariantMempoolTxUnknown,
-                        ),
-                        _,
-                    ) => "rejected",
-                    (_, MempoolState::Degraded) => {
+                let result_label = match eval.phase2 {
+                    Phase2Attribution::NotRun => None,
+                    Phase2Attribution::Agreed => Some("agreed"),
+                    Phase2Attribution::Stale => Some("stale"),
+                    Phase2Attribution::SkippedDegraded => {
                         metrics.phase2_degraded_total.inc();
-                        "skipped"
+                        Some("skipped")
                     }
-                    // PB-13: the boot window before the first successful
-                    // poll is Unprimed, not Degraded. Class M is skipped
-                    // the same way, but it must NOT increment
-                    // phase2_degraded_total or boot-time alerts flap. Its
-                    // own result label keeps the prime window observable
-                    // via phase2_checks_total.
-                    (_, MempoolState::Unprimed) => "unprimed",
-                    (_, MempoolState::Stale) => "stale",
-                    _ => "agreed",
+                    Phase2Attribution::SkippedUnprimed => Some("unprimed"),
+                    Phase2Attribution::Rejected => Some("rejected"),
                 };
-                metrics
-                    .phase2_checks_total
-                    .get_or_create(&crate::metrics::Phase2CheckLabels {
-                        result: result_label.to_string(),
-                    })
-                    .inc();
+                if let Some(result_label) = result_label {
+                    metrics
+                        .phase2_checks_total
+                        .get_or_create(&crate::metrics::Phase2CheckLabels {
+                            result: result_label.to_string(),
+                        })
+                        .inc();
+                }
             }
 
             let reason_detail_str: Option<String> = eval.detail.clone();
@@ -674,5 +727,80 @@ pub(crate) async fn api_key_middleware(
             "api_key_auth_failed"
         );
         (StatusCode::UNAUTHORIZED, "missing or invalid api key").into_response()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{BoundedLine, read_bounded_line};
+    use tokio::io::BufReader;
+
+    #[tokio::test]
+    async fn read_bounded_line_reads_normal_lines_then_eof() {
+        let data: &[u8] = b"hello world\nsecond\n";
+        let mut reader = BufReader::new(data);
+        let mut buf = String::new();
+
+        let r = read_bounded_line(&mut reader, &mut buf, 64).await.unwrap();
+        assert_eq!(r, BoundedLine::Line);
+        assert_eq!(buf, "hello world\n");
+
+        buf.clear();
+        let r = read_bounded_line(&mut reader, &mut buf, 64).await.unwrap();
+        assert_eq!(r, BoundedLine::Line);
+        assert_eq!(buf, "second\n");
+
+        buf.clear();
+        let r = read_bounded_line(&mut reader, &mut buf, 64).await.unwrap();
+        assert_eq!(r, BoundedLine::Eof);
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_over_limit_without_newline_is_protocol_error() {
+        // 64-byte budget, 200 newline-free bytes on the wire: the
+        // PB-18(b) attack shape. The buffer must never grow past the
+        // budget and the caller gets `OverLimit` to drop the
+        // connection.
+        let data = vec![b'a'; 200];
+        let mut reader = BufReader::new(data.as_slice());
+        let mut buf = String::new();
+        let r = read_bounded_line(&mut reader, &mut buf, 64).await.unwrap();
+        assert_eq!(r, BoundedLine::OverLimit);
+        assert!(
+            buf.len() <= 64,
+            "buffer must stay within budget, got {} bytes",
+            buf.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_exact_budget_line_with_newline_is_ok() {
+        // An 8-byte line whose final byte is the newline fits an
+        // 8-byte budget exactly.
+        let data: &[u8] = b"1234567\n";
+        let mut reader = BufReader::new(data);
+        let mut buf = String::new();
+        let r = read_bounded_line(&mut reader, &mut buf, 8).await.unwrap();
+        assert_eq!(r, BoundedLine::Line);
+        assert_eq!(buf, "1234567\n");
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_final_unterminated_line_at_eof_is_line() {
+        // Matches plain read_line semantics: a trailing line without
+        // a newline at EOF is still a line (the next call reports
+        // Eof), as long as it is under the budget.
+        let data: &[u8] = b"tail-no-newline";
+        let mut reader = BufReader::new(data);
+        let mut buf = String::new();
+        let r = read_bounded_line(&mut reader, &mut buf, 64).await.unwrap();
+        assert_eq!(r, BoundedLine::Line);
+        assert_eq!(buf, "tail-no-newline");
+
+        buf.clear();
+        let r = read_bounded_line(&mut reader, &mut buf, 64).await.unwrap();
+        assert_eq!(r, BoundedLine::Eof);
     }
 }

@@ -402,6 +402,57 @@ fn phase2_evaluate_dynamic_phase2_routes_per_tx_detail_flag() {
     // without crashing or short-circuiting on a different reason.
 }
 
+/// PB-18(c): per-tx detail mode must not blow the NDJSON wire
+/// budget. Above `PER_TX_DETAIL_EMIT_CAP` the bounded helper emits
+/// exactly the cap inside `sample=[…]` plus a truncation marker;
+/// below the cap it is a byte-for-byte pass-through of
+/// `format_mempool_tolerance_detail` with no marker.
+#[test]
+fn phase2_per_tx_detail_bounded_caps_and_marks_truncation() {
+    use pool_verifier::policy::{
+        PER_TX_DETAIL_EMIT_CAP, format_mempool_tolerance_detail,
+        format_mempool_tolerance_detail_bounded,
+    };
+
+    let over = PER_TX_DETAIL_EMIT_CAP + 7;
+    let txids: Vec<[u8; 32]> = (0..over)
+        .map(|i| {
+            let mut t = [0u8; 32];
+            t[..8].copy_from_slice(&u64::try_from(i).unwrap().to_le_bytes());
+            t
+        })
+        .collect();
+    let count = u32::try_from(over).unwrap();
+    let detail = format_mempool_tolerance_detail_bounded(count, count, &txids);
+
+    // The sample=[…] field carries exactly the cap.
+    let start = detail.find("sample=[").expect("sample field present") + "sample=[".len();
+    let end = detail[start..].find(']').expect("sample field closes") + start;
+    let emitted = detail[start..end].split(',').count();
+    assert_eq!(emitted, PER_TX_DETAIL_EMIT_CAP);
+
+    // Truncation marker names emitted-vs-total.
+    assert!(
+        detail.contains(&format!("(truncated {PER_TX_DETAIL_EMIT_CAP} of {over})")),
+        "missing truncation marker in: …{}",
+        &detail[detail.len().saturating_sub(80)..]
+    );
+
+    // Wire budget: the capped detail stays under the NDJSON line
+    // limit with headroom for the rest of the verdict envelope.
+    assert!(detail.len() < rg_protocol::gateway::MAX_INTERNAL_LINE_BYTES);
+
+    // Below the cap the bounded helper is a pass-through, keeping
+    // phase2_per_tx_detail_helper_keeps_full_list_uncapped semantics.
+    let small: Vec<[u8; 32]> = (1u8..=50).map(|b| [b; 32]).collect();
+    let bounded_small = format_mempool_tolerance_detail_bounded(50, 50, &small);
+    assert_eq!(
+        bounded_small,
+        format_mempool_tolerance_detail(50, 50, &small)
+    );
+    assert!(!bounded_small.contains("truncated"));
+}
+
 /// Defensive: `ShieldOutcome::Rejected` produced by the Phase 2 path
 /// always carries a non-empty `detail` so dashboards can surface the
 /// unknown ratio without separate lookups.
