@@ -54,7 +54,7 @@ services:
       # is not the load-bearing control on this node; the idle budget
       # is, because template-manager opens a fresh connection per
       # template and a stuck one would otherwise hold its slot forever.
-      VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP: "${VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP:-8}"
+      VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP: "${VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP:-20}"
       VELDRA_VERIFIER_IDLE_TIMEOUT_SECS: "${VELDRA_VERIFIER_IDLE_TIMEOUT_SECS:-60}"
     volumes:
       - ./deploy:/config:rw
