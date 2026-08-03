@@ -158,7 +158,8 @@ pub struct BootOptions {
     /// global cap binds while leaving one connection provably good.
     pub max_connections: u32,
     /// `VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP`. `None` leaves the
-    /// shipped default in place.
+    /// shipped default in place, and the spawn actively removes the
+    /// variable to guarantee it: see `boot_verifier`.
     pub max_connections_per_ip: Option<u32>,
     /// `VELDRA_VERIFIER_IDLE_TIMEOUT_SECS`. `None` leaves the shipped
     /// default in place, which is far too long for a test to wait on.
@@ -224,11 +225,29 @@ pub async fn boot_verifier(opts: BootOptions) -> Booted {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    if let Some(per_ip) = opts.max_connections_per_ip {
-        cmd.env("VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP", per_ip.to_string());
+    // `None` has to mean the shipped default, not "whatever the shell
+    // that ran cargo happened to export". `Command` inherits the parent
+    // environment, and clap reads these from the environment, so a
+    // developer with either variable set would silently move the value
+    // a `None` test is asserting against. PB-31's sizing test is a pin
+    // on the shipped per-IP ceiling and would pass without testing it
+    // at all if an ambient value were higher; `ingress_conn_cap.rs`
+    // makes the same claim for the idle budget in its header.
+    match opts.max_connections_per_ip {
+        Some(per_ip) => {
+            cmd.env("VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP", per_ip.to_string());
+        }
+        None => {
+            cmd.env_remove("VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP");
+        }
     }
-    if let Some(idle) = opts.idle_timeout_secs {
-        cmd.env("VELDRA_VERIFIER_IDLE_TIMEOUT_SECS", idle.to_string());
+    match opts.idle_timeout_secs {
+        Some(idle) => {
+            cmd.env("VELDRA_VERIFIER_IDLE_TIMEOUT_SECS", idle.to_string());
+        }
+        None => {
+            cmd.env_remove("VELDRA_VERIFIER_IDLE_TIMEOUT_SECS");
+        }
     }
     if opts.tls {
         let (cert_pem, key_pem) = self_signed_pem();
