@@ -576,6 +576,8 @@ pub enum ReasonCode {
     V2InvariantSigopsExceedMax,
     #[serde(rename = "v2_invariant_nontcb_null_prevout")]
     V2InvariantNontcbNullPrevout,
+    #[serde(rename = "v2_invariant_coinbase_prevout_not_null")]
+    V2InvariantCoinbasePrevoutNotNull,
     #[serde(rename = "v2_invariant_header_version_low")]
     V2InvariantHeaderVersionLow,
     #[serde(rename = "v2_invariant_duplicate_tx")]
@@ -717,6 +719,7 @@ impl ReasonCode {
         ReasonCode::V2InvariantWeightExceedsMax,
         ReasonCode::V2InvariantSigopsExceedMax,
         ReasonCode::V2InvariantNontcbNullPrevout,
+        ReasonCode::V2InvariantCoinbasePrevoutNotNull,
         ReasonCode::V2InvariantHeaderVersionLow,
         ReasonCode::V2InvariantDuplicateTx,
         ReasonCode::V2InvariantDecodeFailed,
@@ -829,6 +832,7 @@ impl ReasonCode {
         "v2_invariant_weight_exceeds_max",
         "v2_invariant_sigops_exceed_max",
         "v2_invariant_nontcb_null_prevout",
+        "v2_invariant_coinbase_prevout_not_null",
         "v2_invariant_header_version_low",
         "v2_invariant_duplicate_tx",
         "v2_invariant_decode_failed",
@@ -951,6 +955,9 @@ impl ReasonCode {
             ReasonCode::V2InvariantWeightExceedsMax => "v2_invariant_weight_exceeds_max",
             ReasonCode::V2InvariantSigopsExceedMax => "v2_invariant_sigops_exceed_max",
             ReasonCode::V2InvariantNontcbNullPrevout => "v2_invariant_nontcb_null_prevout",
+            ReasonCode::V2InvariantCoinbasePrevoutNotNull => {
+                "v2_invariant_coinbase_prevout_not_null"
+            }
             ReasonCode::V2InvariantHeaderVersionLow => "v2_invariant_header_version_low",
             ReasonCode::V2InvariantDuplicateTx => "v2_invariant_duplicate_tx",
             ReasonCode::V2InvariantDecodeFailed => "v2_invariant_decode_failed",
@@ -1097,6 +1104,9 @@ impl From<VerdictReason> for ReasonCode {
             VerdictReason::V2InvariantWeightExceedsMax => ReasonCode::V2InvariantWeightExceedsMax,
             VerdictReason::V2InvariantSigopsExceedMax => ReasonCode::V2InvariantSigopsExceedMax,
             VerdictReason::V2InvariantNontcbNullPrevout => ReasonCode::V2InvariantNontcbNullPrevout,
+            VerdictReason::V2InvariantCoinbasePrevoutNotNull => {
+                ReasonCode::V2InvariantCoinbasePrevoutNotNull
+            }
             VerdictReason::V2InvariantHeaderVersionLow => ReasonCode::V2InvariantHeaderVersionLow,
             VerdictReason::V2InvariantDuplicateTx => ReasonCode::V2InvariantDuplicateTx,
             VerdictReason::V2InvariantDecodeFailed => ReasonCode::V2InvariantDecodeFailed,
@@ -1291,9 +1301,11 @@ mod tests {
         // 32 verdict (excluding internal_error) + 58 gateway (excluding internal_error) + 1 shared
         // = 91 after ADR-002 Phase 1 mirrored the 18 v2_invariant_* codes from VerdictReason.
         // ADR-003 Phase 2 adds 4 v2_invariant_mempool_* codes, taking the total to 95.
+        // PB-20 adds v2_invariant_coinbase_prevout_not_null, a 19th Phase 1
+        // invariant that widens ADR-002's ratified table, taking it to 96.
         assert_eq!(
             ReasonCode::ALL.len(),
-            95,
+            96,
             "ReasonCode::ALL length mismatch: did you add a variant?"
         );
     }
