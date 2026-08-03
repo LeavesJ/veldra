@@ -146,10 +146,9 @@ pub(crate) fn generate_self_signed_cert() -> anyhow::Result<(Vec<u8>, Vec<u8>)> 
 /// by `send_and_receive` at `:1816`), so at `poll_secs = 5` it wants a
 /// free slot every few seconds and holds one for under its own 4 s
 /// verdict timeout (`template-manager/src/main.rs:1679`). A pool
-/// running a handful of each for HA sits in
-/// the single digits at any instant, so 32 is several times the real
-/// steady-state peak and still absorbs reconnect churn plus an
-/// operator's diagnostic connection.
+/// running a handful of each for HA sits in the single digits at any
+/// instant, so 32 is several times the real steady-state peak and still
+/// absorbs reconnect churn plus an operator's diagnostic connection.
 ///
 /// The per-template reconnect is why PB-27 matters as much as PB-26:
 /// squatting the cap does not merely degrade throughput, it starves
