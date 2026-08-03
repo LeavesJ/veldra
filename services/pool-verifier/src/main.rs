@@ -171,7 +171,7 @@ fn enforce_api_secret() {
 /// `aws-lc-rs`, `reqwest`'s `rustls-tls` pulls `ring`. With two
 /// candidates the choice is ambiguous, so every `ServerConfig::builder`
 /// and `ClientConfig::builder` call panics with "Could not automatically
-/// determine the process-level CryptoProvider from Rustls crate
+/// determine the process-level `CryptoProvider` from Rustls crate
 /// features".
 ///
 /// PB-28 put the install inside `ingress::build_tcp_tls_acceptor`, which

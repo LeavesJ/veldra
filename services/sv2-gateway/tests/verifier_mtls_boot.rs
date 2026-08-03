@@ -8,7 +8,7 @@
 //! enables two providers (`aws-lc-rs` via `axum-server`/`tokio-rustls`,
 //! `ring` via `reqwest`), so `ClientConfig::builder()` in
 //! `build_verifier_tls` (`main.rs:2440`) panicked with "Could not
-//! automatically determine the process-level CryptoProvider from Rustls
+//! automatically determine the process-level `CryptoProvider` from Rustls
 //! crate features" the moment `verifier.tls_ca_cert` was set. The server
 //! end was fixed while its only production client still died on the
 //! first line of the same handshake.

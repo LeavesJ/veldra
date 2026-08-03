@@ -7,8 +7,8 @@
 //! `VELDRA_VERIFIER_TLS_KEY` are unset. Unset is the shipped default, so
 //! in the default configuration the install never ran and
 //! `axum_server::tls_rustls::RustlsConfig` hit the same
-//! "Could not automatically determine the process-level CryptoProvider"
-//! panic that PB-28 was raised for.
+//! "Could not automatically determine the process-level
+//! `CryptoProvider`" panic that PB-28 was raised for.
 //!
 //! The failure mode is worse than a crash. The HTTP server runs in a
 //! spawned task (`main.rs:351`), so the panic takes the task and leaves

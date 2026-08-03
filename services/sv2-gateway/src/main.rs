@@ -154,7 +154,7 @@ async fn api_key_middleware(req: Request<Body>, next: Next) -> Response {
 /// `reqwest`'s `rustls-tls` pulls `ring`. With two candidates the choice
 /// is ambiguous, so `ClientConfig::builder()` in `build_verifier_tls`
 /// panicked with "Could not automatically determine the process-level
-/// CryptoProvider from Rustls crate features" the moment
+/// `CryptoProvider` from Rustls crate features" the moment
 /// `verifier.tls_ca_cert` was set, taking the process down during
 /// startup. PB-28 fixed the verifier end of that same channel and left
 /// this end dead, which is why the mTLS path had never once completed.
