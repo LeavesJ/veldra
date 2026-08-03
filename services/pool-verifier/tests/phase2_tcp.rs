@@ -317,7 +317,7 @@ fn regtest_segwit_template_and_display_hex() -> (TemplatePropose, Vec<String>) {
     // PB-19 producer conventions: non-coinbase weight sum, sigops as
     // the legacy x4 cost floor, non-coinbase tx_count.
     let weight = rg_consensus::non_coinbase_tx_weight(&parsed);
-    let total_sigops = u32::try_from(u64::from(rg_consensus::total_sigops(&parsed)) * 4)
+    let total_sigops = u32::try_from(u64::from(rg_consensus::non_coinbase_sigops(&parsed)) * 4)
         .expect("fixture sigop cost fits u32");
     let coinbase_sigops = u32::try_from(u64::from(rg_consensus::coinbase_sigops(&parsed)) * 4)
         .expect("fixture coinbase sigop cost fits u32");

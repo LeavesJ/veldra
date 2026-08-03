@@ -51,8 +51,9 @@ fn regtest_segwit_template() -> (TemplatePropose, Vec<[u8; 32]>) {
     // cost units (declared as the legacy x4 floor), non-coinbase
     // tx_count.
     let weight = rg_consensus::non_coinbase_tx_weight(&parsed);
-    let total_sigops_cost = u32::try_from(u64::from(rg_consensus::total_sigops(&parsed)) * 4)
-        .expect("fixture sigop cost fits u32");
+    let total_sigops_cost =
+        u32::try_from(u64::from(rg_consensus::non_coinbase_sigops(&parsed)) * 4)
+            .expect("fixture sigop cost fits u32");
     let coinbase_sigops_cost = u32::try_from(u64::from(rg_consensus::coinbase_sigops(&parsed)) * 4)
         .expect("fixture coinbase sigop cost fits u32");
     let txids = rg_consensus::template_txids(&parsed);

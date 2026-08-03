@@ -909,14 +909,22 @@ fn check_invariant_shield_inner(
 
     // ── Class D: SigopsMismatch (when declared; one-sided) ────────
     // Wire contract (PB-19): `total_sigops` arrives in BIP-141
-    // sigop-COST units (GBT convention). Exact cost cannot be
-    // re-derived without the spent prevouts, but legacy count x4 is
-    // a provable lower bound of true cost (P2SH and witness sigops
-    // only add), so `legacy x4 > declared` is a violation with zero
-    // false positives and still catches the real attack: declaring
-    // fewer sigops than the block provably carries.
+    // sigop-COST units over the NON-coinbase transactions (GBT
+    // `transactions[]` convention). Exact cost cannot be re-derived
+    // without the spent prevouts, but legacy count x4 is a provable
+    // lower bound of true cost (P2SH and witness sigops only add),
+    // so `legacy x4 > declared` is a violation with zero false
+    // positives and still catches the real attack: declaring fewer
+    // sigops than the block provably carries.
+    //
+    // The floor must be summed over the same inclusion set as the
+    // declaration. `rg_consensus::total_sigops` is the whole-block
+    // figure and belongs to the consensus ceiling check; using it
+    // here leaked the coinbase's own sigops into a non-coinbase
+    // comparison and rejected honest templates whenever the payout
+    // script carried a CHECKSIG.
     if let Some(declared) = template.total_sigops {
-        let legacy = rg_consensus::total_sigops(&parsed);
+        let legacy = rg_consensus::non_coinbase_sigops(&parsed);
         let floor = u64::from(legacy).saturating_mul(4);
         if floor > u64::from(declared) {
             return ShieldOutcome::Rejected {
@@ -1818,16 +1826,46 @@ mod tests {
 
     #[test]
     fn shield_total_sigops_mismatch_rejects() {
-        // One-sided check (PB-19): genesis carries one legacy sigop
-        // (P2PK output), so the provable cost floor is 4; declaring
-        // 0 understates it and must reject.
+        // One-sided check (PB-19). `total_sigops` is declared over the
+        // NON-coinbase transactions, so the attack to catch is
+        // under-declaring the sigops the block BODY provably carries.
+        // The body tx below pays to P2PKH: one legacy sigop, provable
+        // cost floor 4. Declaring 0 understates it and must reject.
+        //
+        // This deliberately no longer uses `genesis_template()`.
+        // Genesis is coinbase-only, so its single sigop lives in the
+        // coinbase and a non-coinbase declaration of 0 is HONEST
+        // there. Asserting a rejection on genesis asserted the
+        // coinbase leaking into a non-coinbase comparison, not the
+        // attack, which is how the leak survived review (R-183: cross
+        // the producer/verifier seam with a shape production emits).
+        let cb = production_shaped_coinbase_p2pkh();
+        let raw = rg_consensus::assemble_template_block(&rg_consensus::TemplateBlockParts {
+            version: 0x2000_0000,
+            prev_hash: [0x44; 32],
+            time: 1_700_000_000,
+            bits: 0x207f_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[p2pkh_body_tx()],
+        })
+        .expect("assembles");
         let t = TemplatePropose {
+            coinbase_value: 5_000_000_000,
+            tx_count: 1,
+            block_height: 102,
+            template_weight: None,
             total_sigops: Some(0),
-            ..genesis_template()
+            coinbase_sigops: Some(4),
+            raw_block_hex: Some(hex::encode(raw)),
+            ..base_template()
         };
         match check_invariant_shield(&t) {
-            ShieldOutcome::Rejected { reason, .. } => {
+            ShieldOutcome::Rejected { reason, detail } => {
                 assert_eq!(reason, VerdictReason::V2InvariantSigopsMismatch);
+                assert!(
+                    detail.contains("floor=4"),
+                    "floor must come from the body tx alone, not the coinbase: {detail}"
+                );
             }
             other => panic!("expected Rejected(V2InvariantSigopsMismatch) got {other:?}"),
         }
@@ -2017,8 +2055,9 @@ mod tests {
             hex::decode(REGTEST_SEGWIT_BLOCK_HEX.trim()).expect("REGTEST_SEGWIT_BLOCK_HEX decodes");
         let parsed = rg_consensus::parse_block(&bytes).expect("regtest block parses");
         let weight = rg_consensus::non_coinbase_tx_weight(&parsed);
-        let total_cost_floor = u32::try_from(u64::from(rg_consensus::total_sigops(&parsed)) * 4)
-            .expect("fixture sigop cost fits u32");
+        let total_cost_floor =
+            u32::try_from(u64::from(rg_consensus::non_coinbase_sigops(&parsed)) * 4)
+                .expect("fixture sigop cost fits u32");
         let coinbase_cost_floor =
             u32::try_from(u64::from(rg_consensus::coinbase_sigops(&parsed)) * 4)
                 .expect("fixture coinbase sigop cost fits u32");
@@ -2097,6 +2136,102 @@ mod tests {
             check_invariant_shield(&t),
             ShieldOutcome::Agreed,
             "a production-shaped propose must pass its own shield"
+        );
+    }
+
+    /// Same production shape as [`production_shaped_coinbase`] but
+    /// paying to a P2PKH `scriptPubKey` instead of `OP_TRUE`. Every
+    /// shipped config still pays to `OP_TRUE`
+    /// (`deploy/manager-setup-b.toml`, `dev/manager.toml`,
+    /// `dev/manager-shadow.toml`), which carries zero legacy sigops
+    /// and so cannot exercise the coinbase term of the sigop floor.
+    /// `dev/manager.toml` tells the operator to swap in a real payout
+    /// script at mainnet, so the sigop-bearing coinbase is the shape
+    /// that actually ships. R-183: the contract test must cross the
+    /// producer/verifier seam with the payout shape production uses.
+    fn production_shaped_coinbase_p2pkh() -> Vec<u8> {
+        let mut cb = Vec::new();
+        cb.extend_from_slice(&2u32.to_le_bytes()); // tx version
+        cb.push(0x01); // input count
+        cb.extend_from_slice(&[0u8; 32]); // null prevout hash
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // prevout index
+        cb.push(0x0a); // scriptSig len: 2 (BIP-34 push) + 8 (extranonce)
+        cb.extend_from_slice(&[0x01, 0x66]); // BIP-34 push of height 102
+        cb.extend_from_slice(&[0u8; 8]); // zero-filled extranonce
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sequence
+        cb.push(0x01); // output count
+        cb.extend_from_slice(&5_000_000_000u64.to_le_bytes()); // payout value
+        cb.push(0x19); // script len 25 (P2PKH)
+        cb.extend_from_slice(&[0x76, 0xa9, 0x14]); // OP_DUP OP_HASH160 PUSHBYTES_20
+        cb.extend_from_slice(&[0xab; 20]); // pubkey hash
+        cb.extend_from_slice(&[0x88, 0xac]); // OP_EQUALVERIFY OP_CHECKSIG
+        cb.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        cb
+    }
+
+    /// A minimal legacy body transaction paying to P2PKH: one legacy
+    /// sigop in the output, non-null prevout so the Tier 3
+    /// null-prevout check passes, empty scriptSig so the input adds
+    /// none. Used to give a test block a non-coinbase sigop the
+    /// Class D floor must actually see.
+    fn p2pkh_body_tx() -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&2u32.to_le_bytes()); // version
+        tx.push(0x01); // input count
+        tx.extend_from_slice(&[0x11; 32]); // non-null prevout hash
+        tx.extend_from_slice(&0u32.to_le_bytes()); // prevout index
+        tx.push(0x00); // empty scriptSig
+        tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sequence
+        tx.push(0x01); // output count
+        tx.extend_from_slice(&1_000u64.to_le_bytes()); // value
+        tx.push(0x19); // script len 25 (P2PKH)
+        tx.extend_from_slice(&[0x76, 0xa9, 0x14]);
+        tx.extend_from_slice(&[0xcd; 20]);
+        tx.extend_from_slice(&[0x88, 0xac]);
+        tx.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        tx
+    }
+
+    #[test]
+    fn shield_agrees_on_sigop_bearing_coinbase_payout() {
+        // The declared `total_sigops` wire contract is BIP-141 cost
+        // over the NON-coinbase transactions (rg-protocol field docs,
+        // PB-19), and the producer honours it by summing GBT
+        // `transactions[].sigops`, which excludes the coinbase. The
+        // shield's provable floor must therefore also exclude the
+        // coinbase, or a sigop-bearing payout script inflates the
+        // floor above an honest declaration and the shield rejects a
+        // template it should agree with.
+        //
+        // This template is honest in every field: no non-coinbase
+        // transactions, so declared cost is 0; the coinbase's single
+        // OP_CHECKSIG is declared at its true BIP-141 cost of 4, so
+        // the separate coinbase check is satisfied and this test
+        // isolates the total_sigops comparison.
+        let cb = production_shaped_coinbase_p2pkh();
+        let parts = rg_consensus::TemplateBlockParts {
+            version: 0x2000_0000,
+            prev_hash: [0x44; 32],
+            time: 1_700_000_000,
+            bits: 0x207f_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[],
+        };
+        let raw = rg_consensus::assemble_template_block(&parts).expect("assembles");
+        let t = TemplatePropose {
+            coinbase_value: 5_000_000_000,
+            tx_count: 0,
+            block_height: 102,
+            template_weight: Some(0),
+            total_sigops: Some(0),
+            coinbase_sigops: Some(4),
+            raw_block_hex: Some(hex::encode(raw)),
+            ..base_template()
+        };
+        assert_eq!(
+            check_invariant_shield(&t),
+            ShieldOutcome::Agreed,
+            "an honest propose with a sigop-bearing coinbase payout must pass its own shield"
         );
     }
 

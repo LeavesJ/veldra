@@ -646,12 +646,24 @@ pub fn tx_count(block: &ParsedBlock) -> u32 {
 }
 
 /// Total legacy sigops summed across every input `script_sig` and
-/// every output `script_pubkey` in the block.
+/// every output `script_pubkey` in the block, **including the
+/// coinbase**.
 ///
 /// Unit semantics match [`count_sigops`]: legacy count, not BIP-141
-/// sigop cost. Callers comparing against `TemplatePropose.total_sigops`
-/// must populate the declared field with the same legacy count to
-/// avoid false mismatches. BIP-141 cost is a Phase 1.5 concern.
+/// sigop cost.
+///
+/// Inclusion set (PB-19, pinned here because this crate exposes two
+/// sigop accessors whose only difference is the set they sum, which is
+/// exactly the difference that went unnoticed once): this is the
+/// WHOLE-block figure, which is what the consensus ceiling in
+/// [`check_sigops_max`] must measure. It is NOT
+/// the right operand for the Class D comparison against
+/// `TemplatePropose::total_sigops`, whose wire contract is BIP-141
+/// cost over the NON-coinbase transactions only (the GBT
+/// `transactions[]` convention). Use [`non_coinbase_sigops`] there;
+/// summing the coinbase into a floor compared against a non-coinbase
+/// declaration rejects honest templates whenever the payout script
+/// carries sigops.
 pub fn total_sigops(block: &ParsedBlock) -> u32 {
     let mut total: u64 = 0;
     for tx in &block.0.txdata {
@@ -679,6 +691,43 @@ pub fn non_coinbase_tx_weight(block: &ParsedBlock) -> u64 {
         .skip(1)
         .map(|t| t.weight().to_wu())
         .sum()
+}
+
+/// Legacy sigops summed across the non-coinbase transactions. Equals
+/// [`total_sigops`] minus [`coinbase_sigops`] except at the `u32`
+/// saturation boundary, where each figure clamps independently. This
+/// matches the producer-side declaration convention for
+/// `TemplatePropose::total_sigops` (the sum of GBT
+/// `transactions[].sigops`, which excludes the coinbase), so the
+/// shield's Class D sigop floor uses this accessor rather than the
+/// whole-block figure (PB-19).
+///
+/// Unit semantics match [`total_sigops`]: legacy count, not BIP-141
+/// sigop cost. The caller scales the legacy count by the BIP-141
+/// factor of 4 to reach the provable cost floor.
+///
+/// This exists because the Class D comparison and the consensus
+/// ceiling check need different inclusion sets: `check_sigops_max`
+/// measures the whole block against the consensus limit, while the
+/// Class D floor must line up with a declaration the producer built
+/// from non-coinbase transactions alone.
+///
+/// Caveat shared with [`non_coinbase_tx_weight`] and
+/// [`check_non_coinbase_null_prevout`]: `skip(1)` means "not the first
+/// transaction", not "not the coinbase". No shield check currently
+/// asserts that `txdata[0]` is a coinbase, so all three rest on that
+/// unchecked assumption.
+pub fn non_coinbase_sigops(block: &ParsedBlock) -> u32 {
+    let mut total: u64 = 0;
+    for tx in block.0.txdata.iter().skip(1) {
+        for input in &tx.input {
+            total = total.saturating_add(input.script_sig.count_sigops_legacy() as u64);
+        }
+        for output in &tx.output {
+            total = total.saturating_add(output.script_pubkey.count_sigops_legacy() as u64);
+        }
+    }
+    u32::try_from(total).unwrap_or(u32::MAX)
 }
 
 /// Legacy sigops summed across the coinbase transaction only.
@@ -1328,6 +1377,96 @@ mod tests {
         assert_eq!(
             parsed_total, raw_total,
             "ParsedBlock total_sigops must agree with count_sigops"
+        );
+    }
+
+    #[test]
+    fn non_coinbase_sigops_excludes_the_coinbase() {
+        // Genesis is coinbase-only and its payout is a bare-pubkey
+        // CHECKSIG, so the whole-block figure is non-zero while the
+        // non-coinbase figure must be zero. This is the asymmetry the
+        // Class D sigop floor depends on: a sigop-bearing payout must
+        // not raise a floor compared against a declaration the
+        // producer built from non-coinbase transactions alone.
+        let bytes = genesis_bytes();
+        let block = parse_block(&bytes).unwrap();
+        assert_eq!(
+            total_sigops(&block),
+            coinbase_sigops(&block),
+            "genesis carries only the coinbase, so whole-block == coinbase"
+        );
+        assert!(
+            coinbase_sigops(&block) > 0,
+            "genesis payout must carry sigops or this test proves nothing"
+        );
+        assert_eq!(
+            non_coinbase_sigops(&block),
+            0,
+            "non_coinbase_sigops must exclude the coinbase"
+        );
+    }
+
+    #[test]
+    fn non_coinbase_sigops_is_total_minus_coinbase_on_a_multi_tx_block() {
+        // The invariant that keeps the two accessors honest against
+        // each other on a block that actually has a body. Both the
+        // coinbase and the single body transaction pay to P2PKH, so
+        // each contributes exactly one legacy sigop and a split that
+        // silently included or dropped the coinbase would be visible.
+        let p2pkh = |v: &mut Vec<u8>| {
+            v.push(0x19);
+            v.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            v.extend_from_slice(&[0xcd; 20]);
+            v.extend_from_slice(&[0x88, 0xac]);
+        };
+
+        let mut cb = Vec::new();
+        cb.extend_from_slice(&2u32.to_le_bytes());
+        cb.push(0x01);
+        cb.extend_from_slice(&[0u8; 32]);
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        cb.push(0x02);
+        cb.extend_from_slice(&[0x01, 0x66]); // BIP-34 push of height 102
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        cb.push(0x01);
+        cb.extend_from_slice(&5_000_000_000u64.to_le_bytes());
+        p2pkh(&mut cb);
+        cb.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&2u32.to_le_bytes());
+        tx.push(0x01);
+        tx.extend_from_slice(&[0x11; 32]); // non-null prevout
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(0x00); // empty scriptSig
+        tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        tx.push(0x01);
+        tx.extend_from_slice(&1_000u64.to_le_bytes());
+        p2pkh(&mut tx);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+
+        let raw = assemble_template_block(&TemplateBlockParts {
+            version: 0x2000_0000,
+            prev_hash: [0x44; 32],
+            time: 1_700_000_000,
+            bits: 0x207f_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[tx],
+        })
+        .expect("assembles");
+        let block = parse_block(&raw).expect("parses");
+
+        assert_eq!(
+            coinbase_sigops(&block),
+            1,
+            "P2PKH coinbase payout is 1 sigop"
+        );
+        assert_eq!(non_coinbase_sigops(&block), 1, "the body tx is 1 sigop");
+        assert_eq!(total_sigops(&block), 2, "whole block is both");
+        assert_eq!(
+            u64::from(non_coinbase_sigops(&block)) + u64::from(coinbase_sigops(&block)),
+            u64::from(total_sigops(&block)),
+            "non_coinbase + coinbase must reconstruct the whole-block figure"
         );
     }
 
