@@ -253,6 +253,62 @@ fn log_sample(line: &str) -> std::borrow::Cow<'_, str> {
     ))
 }
 
+/// Render `value` into at most `LOG_SAMPLE_BYTES`, marking any truncation
+/// and keeping the true length, so the output has the same shape
+/// `log_sample` gives a borrowed line.
+///
+/// This exists because capping the `line` field alone left the same
+/// amplification open through the sibling field on the same `warn!`.
+/// `serde_json::Error`'s `Display` embeds the offending input verbatim:
+/// a type mismatch against `InternalMessage::version` on a hostile line
+/// renders as `invalid type: string "AAA...", expected u16` carrying the
+/// whole value. Measured, a 1,000,042 byte line yields a 1,000,062 byte
+/// error message, so the error tracks the line rather than bounding it.
+///
+/// The value is streamed through a capping sink instead of being
+/// rendered with `to_string()` and then cut, so a hostile line never
+/// gets a second full-size copy. serde has already paid for the first
+/// one inside `from_str`, and that allocation is not ours to avoid.
+fn log_display(value: impl std::fmt::Display) -> String {
+    use std::fmt::Write as _;
+
+    /// Keeps at most `LOG_SAMPLE_BYTES`, cut on a char boundary, while
+    /// counting every byte offered so the true length survives.
+    struct Capped {
+        kept: String,
+        offered: usize,
+    }
+
+    impl std::fmt::Write for Capped {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.offered += s.len();
+            let mut room = LOG_SAMPLE_BYTES
+                .saturating_sub(self.kept.len())
+                .min(s.len());
+            // Same char-boundary walk as `log_sample`, and load bearing
+            // for the same reason: the cut point is attacker-chosen.
+            while room > 0 && !s.is_char_boundary(room) {
+                room -= 1;
+            }
+            self.kept.push_str(&s[..room]);
+            Ok(())
+        }
+    }
+
+    let mut sink = Capped {
+        kept: String::new(),
+        offered: 0,
+    };
+    // Writing to a String sink cannot fail; a Display impl that returns
+    // Err would simply yield the prefix it managed to write.
+    let _ = write!(sink, "{value}");
+    let Capped { mut kept, offered } = sink;
+    if offered > kept.len() {
+        let _ = write!(kept, " (truncated, {offered} bytes total)");
+    }
+    kept
+}
+
 /// Read one newline-terminated line into `buf`, enforcing `max_bytes`
 /// per line via `AsyncReadExt::take` so a verifier that never sends a
 /// newline can never grow the gateway's line buffer without bound
@@ -346,7 +402,7 @@ where
                             }
                             Err(e) => {
                                 warn!(
-                                    error = %e,
+                                    error = %log_display(&e),
                                     line = %log_sample(line_buf.trim()),
                                     "malformed verifier message"
                                 );
@@ -439,7 +495,13 @@ fn dispatch_inbound(
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "failed to parse template_verdict payload");
+                    // Reached with an envelope that parsed: `payload` is a
+                    // `Value`, so it accepts anything and the typing failure
+                    // lands here carrying the payload in the message. Unlike
+                    // the malformed-line path above there is no strike
+                    // counter on this one, so a peer can repeat it for the
+                    // life of the connection.
+                    warn!(error = %log_display(&e), "failed to parse template_verdict payload");
                 }
             }
         }
@@ -453,7 +515,9 @@ fn dispatch_inbound(
             }
         }
         other => {
-            debug!(msg_type = other, "unknown verifier message type; ignoring");
+            // `msg_type` is a peer-supplied `String` bounded only by the
+            // line budget, and this arm has no strike counter either.
+            debug!(msg_type = %log_sample(other), "unknown verifier message type; ignoring");
         }
     }
 }
@@ -537,6 +601,132 @@ mod tests {
         assert!(
             log_sample(&over).contains("truncated"),
             "one over, truncate"
+        );
+    }
+
+    /// A line that is valid JSON but fails `InternalMessage` typing, with
+    /// `body` landing in the `version` field. `version` is a `u16`, so
+    /// serde renders `invalid type: string "<body>", expected u16` and
+    /// carries the whole body into the error message.
+    fn hostile_typed_line(body: &str) -> String {
+        format!(r#"{{"msg_type":"x","version":"{body}","payload":{{}}}}"#)
+    }
+
+    #[test]
+    fn log_display_passes_short_errors_through_untouched() {
+        let e = serde_json::from_str::<InternalMessage>("{").unwrap_err();
+        assert_eq!(log_display(&e), e.to_string());
+    }
+
+    #[test]
+    fn log_display_caps_a_hostile_serde_error() {
+        let line = hostile_typed_line(&"A".repeat(1_000_000));
+        let e = serde_json::from_str::<InternalMessage>(&line).unwrap_err();
+
+        // The premise: serde does not truncate, so the error tracks the
+        // line rather than bounding it. Capping `line` alone left this
+        // open through the sibling field on the same `warn!`.
+        let uncapped = e.to_string().len();
+        assert!(
+            uncapped > 1_000_000,
+            "expected the error to carry the line, got {uncapped} bytes"
+        );
+
+        let out = log_display(&e);
+        assert!(
+            out.len() < LOG_SAMPLE_BYTES + 64,
+            "error field reached the log as {} bytes",
+            out.len()
+        );
+        assert!(out.contains("truncated"), "truncation must be visible");
+        assert!(
+            out.contains(&uncapped.to_string()),
+            "the real length must survive into the log"
+        );
+    }
+
+    #[test]
+    fn log_display_truncates_on_a_char_boundary() {
+        // 3-byte chars, so the 512 cap never lands on a boundary. A naive
+        // slice here panics, remotely triggerable on attacker-chosen input.
+        let line = hostile_typed_line(&"\u{4e16}".repeat(400_000));
+        let e = serde_json::from_str::<InternalMessage>(&line).unwrap_err();
+        let out = log_display(&e);
+        assert!(out.contains("truncated"));
+        assert!(out.len() < LOG_SAMPLE_BYTES + 64);
+    }
+
+    /// Sink that collects everything a `tracing` subscriber writes, so a
+    /// test can assert on the bytes that actually reach a log rather than
+    /// on the capping helpers called in isolation.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_inbound_lines_emit_bounded_log_records() {
+        // The claim PB-23's log half actually needs to make, asserted on
+        // the emitted records and through the real `run_io_loop`: a
+        // hostile line must not buy log write amplification through ANY
+        // field of the record it triggers, on ANY inbound path. Testing
+        // `log_sample` alone covered one field of one of these three.
+        let big = "A".repeat(1_000_000);
+
+        // 1. Fails `InternalMessage` typing. Three-strike counter applies,
+        //    and the whole line reaches `error` as well as `line`.
+        let malformed = hostile_typed_line(&big);
+        // 2. Envelope parses, `TemplateVerdict` typing fails on the
+        //    payload. No strike counter on this path.
+        let bad_payload =
+            format!(r#"{{"msg_type":"template_verdict","version":1,"payload":{{"id":"{big}"}}}}"#);
+        // 3. Envelope parses, `msg_type` itself is the hostile string.
+        //    No strike counter on this path either.
+        let unknown_type = format!(r#"{{"msg_type":"{big}","version":1,"payload":{{}}}}"#);
+
+        let stream = format!("{malformed}\n{bad_payload}\n{unknown_type}\n");
+        let sent = stream.len();
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            // The unknown-type arm logs at DEBUG, so the default INFO
+            // filter would hide it and the assertion would pass vacuously.
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let (outcome, received) = drive_io_loop(stream.as_bytes()).await;
+            // One malformed line is under the three-strike threshold and
+            // the other two parse as envelopes, so the loop reads on and
+            // leaves through EOF. The strike policy is unchanged here.
+            assert!(matches!(outcome, IoLoopOutcome::Disconnected));
+            assert!(received.is_empty(), "nothing should have been dispatched");
+        }
+
+        let emitted = captured.0.lock().unwrap().len();
+        assert!(
+            emitted < 8192,
+            "{sent} bytes of hostile input produced {emitted} bytes of \
+             log; every peer-controlled field must be capped at \
+             {LOG_SAMPLE_BYTES}"
         );
     }
 
