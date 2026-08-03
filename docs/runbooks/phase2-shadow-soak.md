@@ -22,6 +22,22 @@ If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak be
 
 ## Prerequisites
 
+- **The template sender must ship `raw_block_hex` on every `TemplatePropose`.**
+  Class M lives inside the Invariant Shield, which is skipped entirely when
+  the field is absent (`verifier_shield_skipped_total` counts the skips). A
+  soak whose senders omit the field validates the mempool view
+  infrastructure but never runs a single tolerance comparison, making the
+  false-positive criterion vacuous. Verify at T+0:
+  `verifier_shield_skipped_total` must stay at zero while verdicts climb.
+  (Template-manager ships the field from Phase 1b; note that mainnet raw
+  blocks at 1.5 to 8 MB of hex also require the internal line budget,
+  `MAX_INTERNAL_LINE_BYTES`, to be raised protocol-wide first.)
+- **Metric semantics from the PB-18 build onward:** `phase2_checks_total`
+  counts only templates whose evaluation actually reached Class M; templates
+  that skip the shield increment nothing (older builds mislabeled them
+  `agreed`). `phase2_degraded_total` likewise increments only when a
+  template reaches Class M against a Degraded view. Do not mix baselines
+  taken on a pre-PB-18 binary with deltas from a PB-18 binary.
 - A pool-verifier instance running in `VELDRA_MODE=shadow`. Shadow mode reports verdicts but does not enforce; rejections are observable signal without operational risk.
 - An operator-controlled bitcoind reachable from the verifier over JSON-RPC. Mainnet, not regtest.
 - `[policy.mempool] enforce = true` plus `tolerance_pct = 4.0` plus `poll_interval_secs = 10` plus `max_stale_secs = 60` in the verifier's `policy.toml`.

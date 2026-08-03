@@ -54,6 +54,12 @@ pub struct EvalResult {
     /// visibility explicit. `false` for rejected-before-shield and for
     /// shield-ran paths (agreed or rejected).
     pub shield_skipped: bool,
+    /// PB-18(a): what the Class M (Phase 2 mempool ground truth)
+    /// check actually did during this evaluation. Reported by the
+    /// evaluation path itself so the ingress metrics block labels
+    /// `verifier_phase2_checks_total` from ground truth instead of
+    /// re-deriving it from `reason` plus a second snapshot read.
+    pub phase2: Phase2Attribution,
 }
 
 fn default_max_weight_ratio() -> f64 {
@@ -174,9 +180,14 @@ pub struct PolicyMempool {
     #[serde(default = "default_mempool_poll_interval_secs")]
     pub poll_interval_secs: u64,
 
-    /// Fail-stale window. Last known view served up to this many
-    /// seconds after the most recent successful refresh. ADR-003 D3
-    /// default 60.
+    /// Fail-stale window (ADR-003 D3, default 60). The mempool view
+    /// state machine keys off this value twice: a view refreshed
+    /// within `max_stale_secs` is `Fresh`; between `max_stale_secs`
+    /// and `2 * max_stale_secs` it is `Stale` — still served and
+    /// still enforcing (a tolerance-exceeded template hard-rejects;
+    /// the stale age is advisory only for templates that agree);
+    /// past `2 * max_stale_secs` it is `Degraded` and the Class M
+    /// check is skipped entirely.
     #[serde(default = "default_mempool_max_stale_secs")]
     pub max_stale_secs: u64,
 
@@ -285,6 +296,7 @@ fn check_basic_validity(
             min_avg_fee_used,
             warnings: vec![],
             shield_skipped: false,
+            phase2: Phase2Attribution::NotRun,
         });
     }
 
@@ -300,6 +312,7 @@ fn check_basic_validity(
             min_avg_fee_used,
             warnings: vec![],
             shield_skipped: false,
+            phase2: Phase2Attribution::NotRun,
         });
     }
 
@@ -311,6 +324,7 @@ fn check_basic_validity(
             min_avg_fee_used,
             warnings: vec![],
             shield_skipped: false,
+            phase2: Phase2Attribution::NotRun,
         });
     }
 
@@ -332,6 +346,7 @@ fn check_template_constraints(
             min_avg_fee_used,
             warnings: vec![],
             shield_skipped: false,
+            phase2: Phase2Attribution::NotRun,
         });
     }
 
@@ -343,6 +358,7 @@ fn check_template_constraints(
             min_avg_fee_used,
             warnings: vec![],
             shield_skipped: false,
+            phase2: Phase2Attribution::NotRun,
         });
     }
 
@@ -357,6 +373,7 @@ fn check_template_constraints(
             min_avg_fee_used,
             warnings: vec![],
             shield_skipped: false,
+            phase2: Phase2Attribution::NotRun,
         });
     }
 
@@ -371,6 +388,7 @@ fn check_template_constraints(
             min_avg_fee_used,
             warnings: vec![],
             shield_skipped: false,
+            phase2: Phase2Attribution::NotRun,
         });
     }
 
@@ -395,6 +413,7 @@ fn check_template_constraints(
                 min_avg_fee_used,
                 warnings: vec![],
                 shield_skipped: false,
+                phase2: Phase2Attribution::NotRun,
             });
         }
     }
@@ -429,6 +448,7 @@ fn check_safety_constraints(
                     min_avg_fee_used,
                     warnings: warnings.clone(),
                     shield_skipped: false,
+                    phase2: Phase2Attribution::NotRun,
                 });
             }
             warnings.push(SafetyWarning {
@@ -453,6 +473,7 @@ fn check_safety_constraints(
                     min_avg_fee_used,
                     warnings: warnings.clone(),
                     shield_skipped: false,
+                    phase2: Phase2Attribution::NotRun,
                 });
             }
             warnings.push(SafetyWarning {
@@ -633,6 +654,27 @@ pub enum ShieldOutcome {
     },
 }
 
+/// PB-18(a): what the Class M (Phase 2 mempool ground truth) check
+/// actually did during this evaluation, reported by the evaluation
+/// path itself so the ingress metrics cannot misattribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase2Attribution {
+    /// Class M never executed: no mempool snapshot supplied, no
+    /// `raw_block_hex`, or an earlier check rejected the template
+    /// before the shield ran.
+    NotRun,
+    /// Ran against a fresh view and the template agreed.
+    Agreed,
+    /// Ran against a stale-but-served view (advisory) and agreed.
+    Stale,
+    /// Skipped because the view was Degraded (primed then aged out).
+    SkippedDegraded,
+    /// Skipped because the view was Unprimed (boot window, PB-13).
+    SkippedUnprimed,
+    /// Rejected with a Class M reason code.
+    Rejected,
+}
+
 /// Map a `ConsensusViolation` returned by the rg-consensus facade to
 /// the canonical `VerdictReason` variant that mirrors the same
 /// `snake_case` reason code string. The mapping is exhaustive by
@@ -739,7 +781,7 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
 // reads better. Phase 2 adds a Class M (mempool ground truth) section
 // at the tail; same rationale.
 pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
-    check_invariant_shield_inner(template, None)
+    check_invariant_shield_inner(template, None).0
 }
 
 /// Format the canonical `V2InvariantMempoolToleranceExceeded`
@@ -774,6 +816,46 @@ pub fn format_mempool_tolerance_detail(
     detail
 }
 
+/// PB-18(c): wire budget for per-tx detail mode. Caps the number of
+/// txids emitted into the `sample=[…]` field of the
+/// `v2_invariant_mempool_tolerance_exceeded` rejection detail so the
+/// final verdict NDJSON line stays safely under
+/// `rg_protocol::gateway::MAX_INTERNAL_LINE_BYTES` (1 MiB).
+/// Arithmetic: each txid emits as 64 hex chars plus a 1-byte comma
+/// separator, so 10,000 txids occupy at most 10,000 * 65 = 650,000
+/// bytes (~650 KB) in the `sample=` field, leaving over 350 KB of
+/// headroom for the rest of the verdict JSON envelope. Deliberately
+/// far above `SAMPLE_UNKNOWN_CAP` (10) so aggregate mode is never
+/// affected and small per-tx lists pass through uncapped.
+pub const PER_TX_DETAIL_EMIT_CAP: usize = 10_000;
+
+/// Bounded wrapper around [`format_mempool_tolerance_detail`]:
+/// truncates `txids_to_emit` to [`PER_TX_DETAIL_EMIT_CAP`] entries
+/// and appends a ` (truncated N of M)` marker when the cap was hit,
+/// so per-tx detail mode can never push the verdict NDJSON line over
+/// the wire budget. At or below the cap it delegates unchanged.
+pub fn format_mempool_tolerance_detail_bounded(
+    unknown_count: u32,
+    total: u32,
+    txids_to_emit: &[[u8; 32]],
+) -> String {
+    use std::fmt::Write as _;
+    if txids_to_emit.len() <= PER_TX_DETAIL_EMIT_CAP {
+        return format_mempool_tolerance_detail(unknown_count, total, txids_to_emit);
+    }
+    let mut detail = format_mempool_tolerance_detail(
+        unknown_count,
+        total,
+        &txids_to_emit[..PER_TX_DETAIL_EMIT_CAP],
+    );
+    let _ = write!(
+        detail,
+        " (truncated {PER_TX_DETAIL_EMIT_CAP} of {})",
+        txids_to_emit.len()
+    );
+    detail
+}
+
 /// Phase 2 entry point. Runs the full Phase 1 + Class M shield
 /// against a mempool snapshot. `tolerance_pct` is the operator-tuned
 /// threshold from `policy.toml` `[policy.mempool] tolerance_pct`
@@ -791,29 +873,36 @@ pub fn check_invariant_shield_with_mempool(
     tolerance_pct: f64,
     per_tx_detail: bool,
 ) -> ShieldOutcome {
-    check_invariant_shield_inner(template, Some((mempool, tolerance_pct, per_tx_detail)))
+    check_invariant_shield_inner(template, Some((mempool, tolerance_pct, per_tx_detail))).0
 }
 
 /// Signature shared by every Tier 3 standalone check in the
 /// rg-consensus facade.
 type Tier3Check = fn(&rg_consensus::ParsedBlock) -> Result<(), ConsensusViolation>;
 
+/// Internal shield pass. Returns the outcome together with the
+/// PB-18(a) [`Phase2Attribution`]: every return site that fires
+/// before the Class M section reports `NotRun` because the mempool
+/// check never executed for that template.
 #[allow(clippy::too_many_lines)]
 fn check_invariant_shield_inner(
     template: &TemplatePropose,
     mempool: Option<(&crate::mempool_view::MempoolSnapshot, f64, bool)>,
-) -> ShieldOutcome {
+) -> (ShieldOutcome, Phase2Attribution) {
     let Some(hex_str) = template.raw_block_hex.as_deref() else {
-        return ShieldOutcome::Skipped;
+        return (ShieldOutcome::Skipped, Phase2Attribution::NotRun);
     };
 
     let raw_block = match hex::decode(hex_str) {
         Ok(b) => b,
         Err(e) => {
-            return ShieldOutcome::Rejected {
-                reason: VerdictReason::V2InvariantDecodeFailed,
-                detail: format!("raw_block_hex decode failed: {e}"),
-            };
+            return (
+                ShieldOutcome::Rejected {
+                    reason: VerdictReason::V2InvariantDecodeFailed,
+                    detail: format!("raw_block_hex decode failed: {e}"),
+                },
+                Phase2Attribution::NotRun,
+            );
         }
     };
 
@@ -822,10 +911,13 @@ fn check_invariant_shield_inner(
     let parsed = match rg_consensus::parse_block(&raw_block) {
         Ok(p) => p,
         Err(v) => {
-            return ShieldOutcome::Rejected {
-                reason: consensus_violation_to_verdict_reason(&v),
-                detail: v.to_string(),
-            };
+            return (
+                ShieldOutcome::Rejected {
+                    reason: consensus_violation_to_verdict_reason(&v),
+                    detail: v.to_string(),
+                },
+                Phase2Attribution::NotRun,
+            );
         }
     };
 
@@ -833,20 +925,26 @@ fn check_invariant_shield_inner(
     match rg_consensus::re_derive_coinbase_value(&raw_block) {
         Ok(re_derived) => {
             if re_derived != template.coinbase_value {
-                return ShieldOutcome::Rejected {
-                    reason: VerdictReason::V2InvariantCoinbaseValueMismatch,
-                    detail: format!(
-                        "coinbase_value declared={} re_derived={}",
-                        template.coinbase_value, re_derived
-                    ),
-                };
+                return (
+                    ShieldOutcome::Rejected {
+                        reason: VerdictReason::V2InvariantCoinbaseValueMismatch,
+                        detail: format!(
+                            "coinbase_value declared={} re_derived={}",
+                            template.coinbase_value, re_derived
+                        ),
+                    },
+                    Phase2Attribution::NotRun,
+                );
             }
         }
         Err(v) => {
-            return ShieldOutcome::Rejected {
-                reason: consensus_violation_to_verdict_reason(&v),
-                detail: v.to_string(),
-            };
+            return (
+                ShieldOutcome::Rejected {
+                    reason: consensus_violation_to_verdict_reason(&v),
+                    detail: v.to_string(),
+                },
+                Phase2Attribution::NotRun,
+            );
         }
     }
 
@@ -858,35 +956,47 @@ fn check_invariant_shield_inner(
     if let Some(declared) = template.template_weight {
         let re_derived = rg_consensus::non_coinbase_tx_weight(&parsed);
         if re_derived != declared {
-            return ShieldOutcome::Rejected {
-                reason: VerdictReason::V2InvariantTemplateWeightMismatch,
-                detail: format!("template_weight declared={declared} re_derived={re_derived}"),
-            };
+            return (
+                ShieldOutcome::Rejected {
+                    reason: VerdictReason::V2InvariantTemplateWeightMismatch,
+                    detail: format!("template_weight declared={declared} re_derived={re_derived}"),
+                },
+                Phase2Attribution::NotRun,
+            );
         }
     }
 
     // ── Class S: MerkleRootMismatch ───────────────────────────────
     if let Err(v) = rg_consensus::check_merkle_root_internal(&parsed) {
-        return ShieldOutcome::Rejected {
-            reason: consensus_violation_to_verdict_reason(&v),
-            detail: v.to_string(),
-        };
+        return (
+            ShieldOutcome::Rejected {
+                reason: consensus_violation_to_verdict_reason(&v),
+                detail: v.to_string(),
+            },
+            Phase2Attribution::NotRun,
+        );
     }
 
     // ── Class S: WitnessCommitment{Missing,Mismatch} ──────────────
     if let Err(v) = rg_consensus::check_witness_commitment_internal(&parsed) {
-        return ShieldOutcome::Rejected {
-            reason: consensus_violation_to_verdict_reason(&v),
-            detail: v.to_string(),
-        };
+        return (
+            ShieldOutcome::Rejected {
+                reason: consensus_violation_to_verdict_reason(&v),
+                detail: v.to_string(),
+            },
+            Phase2Attribution::NotRun,
+        );
     }
 
     // ── Class S: CoinbaseBip34Missing ─────────────────────────────
     if let Err(v) = rg_consensus::check_coinbase_bip34_present(&parsed) {
-        return ShieldOutcome::Rejected {
-            reason: consensus_violation_to_verdict_reason(&v),
-            detail: v.to_string(),
-        };
+        return (
+            ShieldOutcome::Rejected {
+                reason: consensus_violation_to_verdict_reason(&v),
+                detail: v.to_string(),
+            },
+            Phase2Attribution::NotRun,
+        );
     }
 
     // ── Class D: TxCountMismatch (always comparable) ──────────────
@@ -897,13 +1007,16 @@ fn check_invariant_shield_inner(
     {
         let re_derived = rg_consensus::tx_count(&parsed).saturating_sub(1);
         if re_derived != template.tx_count {
-            return ShieldOutcome::Rejected {
-                reason: VerdictReason::V2InvariantTxCountMismatch,
-                detail: format!(
-                    "tx_count declared={} re_derived={}",
-                    template.tx_count, re_derived
-                ),
-            };
+            return (
+                ShieldOutcome::Rejected {
+                    reason: VerdictReason::V2InvariantTxCountMismatch,
+                    detail: format!(
+                        "tx_count declared={} re_derived={}",
+                        template.tx_count, re_derived
+                    ),
+                },
+                Phase2Attribution::NotRun,
+            );
         }
     }
 
@@ -927,13 +1040,16 @@ fn check_invariant_shield_inner(
         let legacy = rg_consensus::non_coinbase_sigops(&parsed);
         let floor = u64::from(legacy).saturating_mul(4);
         if floor > u64::from(declared) {
-            return ShieldOutcome::Rejected {
-                reason: VerdictReason::V2InvariantSigopsMismatch,
-                detail: format!(
-                    "total_sigops declared_cost={declared} below provable floor={floor} \
-                     (legacy count {legacy} x4)"
-                ),
-            };
+            return (
+                ShieldOutcome::Rejected {
+                    reason: VerdictReason::V2InvariantSigopsMismatch,
+                    detail: format!(
+                        "total_sigops declared_cost={declared} below provable floor={floor} \
+                         (legacy count {legacy} x4)"
+                    ),
+                },
+                Phase2Attribution::NotRun,
+            );
         }
     }
 
@@ -946,13 +1062,16 @@ fn check_invariant_shield_inner(
         let legacy = rg_consensus::coinbase_sigops(&parsed);
         let floor = u64::from(legacy).saturating_mul(4);
         if floor > u64::from(declared) {
-            return ShieldOutcome::Rejected {
-                reason: VerdictReason::V2InvariantCoinbaseSigopsMismatch,
-                detail: format!(
-                    "coinbase_sigops declared_cost={declared} below provable floor={floor} \
-                     (legacy count {legacy} x4)"
-                ),
-            };
+            return (
+                ShieldOutcome::Rejected {
+                    reason: VerdictReason::V2InvariantCoinbaseSigopsMismatch,
+                    detail: format!(
+                        "coinbase_sigops declared_cost={declared} below provable floor={floor} \
+                         (legacy count {legacy} x4)"
+                    ),
+                },
+                Phase2Attribution::NotRun,
+            );
         }
     }
 
@@ -960,20 +1079,26 @@ fn check_invariant_shield_inner(
     match rg_consensus::bip34_height(&parsed) {
         Ok(re_derived) => {
             if re_derived != template.block_height {
-                return ShieldOutcome::Rejected {
-                    reason: VerdictReason::V2InvariantCoinbaseHeightMismatch,
-                    detail: format!(
-                        "block_height declared={} re_derived={}",
-                        template.block_height, re_derived
-                    ),
-                };
+                return (
+                    ShieldOutcome::Rejected {
+                        reason: VerdictReason::V2InvariantCoinbaseHeightMismatch,
+                        detail: format!(
+                            "block_height declared={} re_derived={}",
+                            template.block_height, re_derived
+                        ),
+                    },
+                    Phase2Attribution::NotRun,
+                );
             }
         }
         Err(v) => {
-            return ShieldOutcome::Rejected {
-                reason: consensus_violation_to_verdict_reason(&v),
-                detail: v.to_string(),
-            };
+            return (
+                ShieldOutcome::Rejected {
+                    reason: consensus_violation_to_verdict_reason(&v),
+                    detail: v.to_string(),
+                },
+                Phase2Attribution::NotRun,
+            );
         }
     }
 
@@ -993,10 +1118,13 @@ fn check_invariant_shield_inner(
     ];
     for check in tier3_checks {
         if let Err(v) = check(&parsed) {
-            return ShieldOutcome::Rejected {
-                reason: consensus_violation_to_verdict_reason(&v),
-                detail: v.to_string(),
-            };
+            return (
+                ShieldOutcome::Rejected {
+                    reason: consensus_violation_to_verdict_reason(&v),
+                    detail: v.to_string(),
+                },
+                Phase2Attribution::NotRun,
+            );
         }
     }
 
@@ -1007,16 +1135,29 @@ fn check_invariant_shield_inner(
     // mempool snapshot leaves the verdict at Agreed, an
     // Agreed/Stale mempool snapshot leaves the verdict at Agreed,
     // and only ToleranceExceeded converts to Rejected.
+    let mut phase2 = Phase2Attribution::NotRun;
     if let Some((snapshot, tolerance_pct, per_tx_detail)) = mempool {
         let txids = rg_consensus::template_txids(&parsed);
         match crate::mempool_view::evaluate(snapshot, &txids, tolerance_pct) {
-            crate::mempool_view::MempoolCheckOutcome::Agreed { .. }
-            | crate::mempool_view::MempoolCheckOutcome::Stale { .. }
-            | crate::mempool_view::MempoolCheckOutcome::Skipped => {
+            crate::mempool_view::MempoolCheckOutcome::Agreed { .. } => {
+                phase2 = Phase2Attribution::Agreed;
+            }
+            crate::mempool_view::MempoolCheckOutcome::Stale { .. } => {
                 // Stale produces an advisory at the metric layer
-                // but does not reject. Skipped means the view is
-                // Degraded and the caller increments
+                // but does not reject.
+                phase2 = Phase2Attribution::Stale;
+            }
+            crate::mempool_view::MempoolCheckOutcome::Skipped => {
+                // `evaluate` skips only for `Degraded` and `Unprimed`
+                // views; the snapshot state disambiguates which, so
+                // PB-13 keeps the boot window out of
                 // `verifier_phase2_degraded_total`.
+                phase2 = match snapshot.state {
+                    crate::mempool_view::MempoolState::Degraded => {
+                        Phase2Attribution::SkippedDegraded
+                    }
+                    _ => Phase2Attribution::SkippedUnprimed,
+                };
             }
             crate::mempool_view::MempoolCheckOutcome::ToleranceExceeded {
                 unknown_count,
@@ -1037,16 +1178,20 @@ fn check_invariant_shield_inner(
                 } else {
                     sample_unknown
                 };
-                let detail = format_mempool_tolerance_detail(unknown_count, total, &txids_to_emit);
-                return ShieldOutcome::Rejected {
-                    reason: VerdictReason::V2InvariantMempoolToleranceExceeded,
-                    detail,
-                };
+                let detail =
+                    format_mempool_tolerance_detail_bounded(unknown_count, total, &txids_to_emit);
+                return (
+                    ShieldOutcome::Rejected {
+                        reason: VerdictReason::V2InvariantMempoolToleranceExceeded,
+                        detail,
+                    },
+                    Phase2Attribution::Rejected,
+                );
             }
         }
     }
 
-    ShieldOutcome::Agreed
+    (ShieldOutcome::Agreed, phase2)
 }
 
 /// Convenience wrapper: evaluate with no mempool context.
@@ -1132,15 +1277,10 @@ fn evaluate_dynamic_inner(
     // Phase 1 + Phase 2 chain. When None, only Phase 1 runs (legacy
     // behavior, used by tests and any caller that has not wired the
     // Phase 2 mempool view).
-    let shield_outcome = match mempool_snapshot {
-        Some(snap) => check_invariant_shield_with_mempool(
-            template,
-            snap,
-            cfg.mempool.tolerance_pct,
-            cfg.mempool.per_tx_detail,
-        ),
-        None => check_invariant_shield(template),
-    };
+    let (shield_outcome, phase2) = check_invariant_shield_inner(
+        template,
+        mempool_snapshot.map(|snap| (snap, cfg.mempool.tolerance_pct, cfg.mempool.per_tx_detail)),
+    );
     let shield_skipped = match shield_outcome {
         ShieldOutcome::Skipped => true,
         ShieldOutcome::Agreed => false,
@@ -1152,6 +1292,7 @@ fn evaluate_dynamic_inner(
                 min_avg_fee_used,
                 warnings,
                 shield_skipped: false,
+                phase2,
             };
         }
     };
@@ -1163,6 +1304,7 @@ fn evaluate_dynamic_inner(
         min_avg_fee_used,
         warnings,
         shield_skipped,
+        phase2,
     }
 }
 
@@ -2380,5 +2522,149 @@ mod tests {
             }
             other => panic!("expected Rejected(V2InvariantCoinbaseBip34Missing) got {other:?}"),
         }
+    }
+
+    // ── PB-18(a): Phase 2 Class M attribution ─────────────────────
+    //
+    // `EvalResult.phase2` must report what the Class M check actually
+    // did during the evaluation, so the ingress metrics block cannot
+    // misattribute templates where Class M never ran and cannot
+    // mislabel on a view-state flip between two snapshot reads.
+
+    fn attribution_snapshot(
+        state: crate::mempool_view::MempoolState,
+        txids: Vec<[u8; 32]>,
+    ) -> crate::mempool_view::MempoolSnapshot {
+        crate::mempool_view::MempoolSnapshot {
+            state,
+            txids: std::sync::Arc::new(txids.into_iter().collect()),
+            age_secs: 0,
+            size: 0,
+        }
+    }
+
+    /// Non-coinbase txids of the regtest segwit fixture, in internal
+    /// byte order, derived through the facade like production does.
+    fn regtest_segwit_txids() -> Vec<[u8; 32]> {
+        let bytes =
+            hex::decode(REGTEST_SEGWIT_BLOCK_HEX.trim()).expect("REGTEST_SEGWIT_BLOCK_HEX decodes");
+        let parsed = rg_consensus::parse_block(&bytes).expect("regtest block parses");
+        rg_consensus::template_txids(&parsed)
+    }
+
+    #[test]
+    fn phase2_attribution_not_run_without_raw_block_hex() {
+        // Class M cannot run when the template omits raw_block_hex,
+        // even though a fresh snapshot was supplied.
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let snap = attribution_snapshot(crate::mempool_view::MempoolState::Fresh, vec![]);
+        let result = evaluate_dynamic_phase2(&base_template(), &cfg, Some(&snap), Some(100), 0);
+        assert!(result.reason.is_none(), "got {:?}", result.reason);
+        assert_eq!(result.phase2, Phase2Attribution::NotRun);
+    }
+
+    #[test]
+    fn phase2_attribution_not_run_without_snapshot() {
+        // Shield runs Phase 1 only when no snapshot is supplied;
+        // Class M never executed.
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let result = evaluate_dynamic_phase2(&regtest_segwit_template(), &cfg, None, Some(100), 0);
+        assert!(result.reason.is_none(), "got {:?}", result.reason);
+        assert_eq!(result.phase2, Phase2Attribution::NotRun);
+    }
+
+    #[test]
+    fn phase2_attribution_not_run_on_pre_shield_rejection() {
+        // A pre-shield rejection (protocol version mismatch) means
+        // Class M never ran, regardless of the supplied snapshot.
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let snap = attribution_snapshot(
+            crate::mempool_view::MempoolState::Fresh,
+            regtest_segwit_txids(),
+        );
+        let t = TemplatePropose {
+            version: 99,
+            ..regtest_segwit_template()
+        };
+        let result = evaluate_dynamic_phase2(&t, &cfg, Some(&snap), Some(100), 0);
+        assert_eq!(result.reason, Some(VerdictReason::ProtocolVersionMismatch));
+        assert_eq!(result.phase2, Phase2Attribution::NotRun);
+    }
+
+    #[test]
+    fn phase2_attribution_agreed_on_fresh_full_overlap() {
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let snap = attribution_snapshot(
+            crate::mempool_view::MempoolState::Fresh,
+            regtest_segwit_txids(),
+        );
+        let result =
+            evaluate_dynamic_phase2(&regtest_segwit_template(), &cfg, Some(&snap), Some(100), 0);
+        assert!(result.reason.is_none(), "got {:?}", result.reason);
+        assert_eq!(result.phase2, Phase2Attribution::Agreed);
+    }
+
+    #[test]
+    fn phase2_attribution_rejected_on_tolerance_exceeded() {
+        // Empty fresh view, 1/1 template txs unknown, above 4%.
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let snap = attribution_snapshot(crate::mempool_view::MempoolState::Fresh, vec![]);
+        let result =
+            evaluate_dynamic_phase2(&regtest_segwit_template(), &cfg, Some(&snap), Some(100), 0);
+        assert_eq!(
+            result.reason,
+            Some(VerdictReason::V2InvariantMempoolToleranceExceeded)
+        );
+        assert_eq!(result.phase2, Phase2Attribution::Rejected);
+    }
+
+    #[test]
+    fn phase2_attribution_skipped_degraded() {
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let snap = attribution_snapshot(crate::mempool_view::MempoolState::Degraded, vec![]);
+        let result =
+            evaluate_dynamic_phase2(&regtest_segwit_template(), &cfg, Some(&snap), Some(100), 0);
+        assert!(result.reason.is_none(), "got {:?}", result.reason);
+        assert_eq!(result.phase2, Phase2Attribution::SkippedDegraded);
+    }
+
+    #[test]
+    fn phase2_attribution_skipped_unprimed() {
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let snap = attribution_snapshot(crate::mempool_view::MempoolState::Unprimed, vec![]);
+        let result =
+            evaluate_dynamic_phase2(&regtest_segwit_template(), &cfg, Some(&snap), Some(100), 0);
+        assert!(result.reason.is_none(), "got {:?}", result.reason);
+        assert_eq!(result.phase2, Phase2Attribution::SkippedUnprimed);
+    }
+
+    #[test]
+    fn phase2_attribution_stale_on_stale_view_agreement() {
+        // Stale-but-served view with full overlap: advisory Stale.
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let snap = attribution_snapshot(
+            crate::mempool_view::MempoolState::Stale,
+            regtest_segwit_txids(),
+        );
+        let result =
+            evaluate_dynamic_phase2(&regtest_segwit_template(), &cfg, Some(&snap), Some(100), 0);
+        assert!(result.reason.is_none(), "got {:?}", result.reason);
+        assert_eq!(result.phase2, Phase2Attribution::Stale);
+    }
+
+    #[test]
+    fn phase2_attribution_rejected_on_stale_view_tolerance_exceeded() {
+        // A Stale view still hard-rejects above tolerance
+        // (stale_state_still_rejects_above_threshold); attribution
+        // must follow the rejection, not the view state.
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let snap = attribution_snapshot(crate::mempool_view::MempoolState::Stale, vec![]);
+        let result =
+            evaluate_dynamic_phase2(&regtest_segwit_template(), &cfg, Some(&snap), Some(100), 0);
+        assert_eq!(
+            result.reason,
+            Some(VerdictReason::V2InvariantMempoolToleranceExceeded)
+        );
+        assert_eq!(result.phase2, Phase2Attribution::Rejected);
     }
 }

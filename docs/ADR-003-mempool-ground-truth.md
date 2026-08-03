@@ -337,7 +337,7 @@ the Tier 1 #3 / R-167 pattern.
 verifier_phase2_degraded_total       counter      bitcoind unavailable beyond fail-stale
 verifier_mempool_view_age_seconds    gauge        seconds since last successful refresh
 verifier_mempool_view_size           gauge        current HashSet<Txid> count
-verifier_phase2_checks_total{result} counter vec  result in {agreed, rejected, degraded}
+verifier_phase2_checks_total{result} counter vec  result in {agreed, rejected, skipped, stale, unprimed}
 ```
 
 Four new metrics. Dashboards consume `verifier_mempool_view_age_seconds`
