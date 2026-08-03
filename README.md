@@ -1,4 +1,4 @@
-## ReserveGrid OS
+# ReserveGrid OS
 
 A [Veldra, Inc.](https://veldra.org) product.
 

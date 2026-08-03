@@ -169,8 +169,13 @@ or unparseable bytes, and the `Skipped` path noted above.
 **Tier 3 (belt-and-suspenders, standalone consensus ceilings; wired
 in Phase 1.5)**
 
-These run after the Tier 1+2 checks, in ADR-002 table order, and need
-no declared field: each one reads only the parsed block.
+These run after the Tier 1+2 checks and need no declared field: each
+one reads only the parsed block. The array order is close to ADR-002's
+table order but is no longer identical to it: PB-21 grouped
+`coinbase_value_exceeds_max` with the other ceiling checks rather than
+at its table position. Order is behaviourally significant, because the
+first violation wins, so the array is the source of truth here and the
+table is not.
 
 ```
 v2_invariant_coinbase_script_length     coinbase scriptSig 2..=100 bytes (bad-cb-length)
