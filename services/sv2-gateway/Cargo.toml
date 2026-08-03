@@ -74,3 +74,8 @@ uuid = { version = "1", features = ["v7"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
+# PB-30. `tests/verifier_mtls_boot.rs` boots the real gateway binary
+# against a listener holding the verifier's mTLS role, so it has to mint
+# a CA and two leaf identities. Not a new crate in the build: the same
+# rcgen 0.13 already builds for `pool-verifier`.
+rcgen = "0.13"

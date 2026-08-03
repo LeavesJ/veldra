@@ -8,9 +8,9 @@
 //! maps in `rg-feed-server` and `rg-demo-feed`), and a fourth copy was
 //! not worth the name recognition.
 //!
-//! Of the three, this is the only shape whose map is bounded and whose
-//! decrement is an RAII `Drop` rather than a manual `fetch_sub` at the
-//! end of a connection task, which is why it is the one that moved.
+//! Of the three, this is the only shape whose decrement is an RAII
+//! `Drop` rather than a manual `fetch_sub` at the end of a connection
+//! task, which is why it is the one that moved.
 //! `rg-feed-server` and `rg-demo-feed` keep their inline copies: both
 //! use a `tokio::sync::Mutex` inside an already-async accept loop, and
 //! converting them is unrelated churn on services this change does not
@@ -20,16 +20,34 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Tracks active connection counts per IP address.
 ///
 /// When `max_per_ip` is nonzero, `try_accept` rejects IPs that already
-/// hold that many active connections. The map is bounded to
-/// `max_tracked_ips` entries with LRU eviction of IPs that have zero
-/// active connections. If the map is full and no zero-count entry
-/// exists, the request is allowed through (fail open for map capacity,
-/// fail closed for per-IP enforcement).
+/// hold that many active connections.
+///
+/// An entry exists only while its address holds at least one live
+/// connection: `PerIpPermit::drop` removes it at zero. The map is
+/// therefore bounded by the caller's own concurrent-connection ceiling,
+/// which is `VELDRA_VERIFIER_MAX_CONNECTIONS` for the verifier ingress
+/// (`pool-verifier/src/ingress.rs`) and `gateway.max_connections` for
+/// the miner listener (`sv2-gateway/src/main.rs`). Nothing this type
+/// owns bounds it, and both callers must keep enforcing a global cap
+/// ahead of `try_accept` for that bound to mean anything.
+///
+/// PB-30. This used to claim a `max_tracked_ips` ceiling with LRU
+/// eviction of zero-count entries. The claim was false and the eviction
+/// branch was unreachable: a zero-count entry cannot exist, because
+/// `Drop` removes the entry rather than leaving it at zero. Measured
+/// before the removal, 64 live entries under a `max_tracked_ips` of 4,
+/// and the test that covered eviction passed without ever entering the
+/// branch. The doc now states the bound that does hold. Reintroducing an
+/// internal cap means deciding what happens to a live connection whose
+/// entry is evicted: its `Drop` would decrement an entry that no longer
+/// exists, and the per-IP ceiling would stop binding for that address
+/// until it went quiet, which is the opposite of what the ceiling is
+/// for.
 ///
 /// Uses `std::sync::Mutex` rather than `tokio::sync::Mutex` because the
 /// critical section is a single integer increment or decrement, and the
@@ -37,7 +55,6 @@ use tracing::{debug, warn};
 #[derive(Clone)]
 pub struct PerIpConnectionTracker {
     max_per_ip: u32,
-    max_tracked_ips: usize,
     counts: Arc<std::sync::Mutex<HashMap<IpAddr, u32>>>,
 }
 
@@ -49,9 +66,10 @@ pub struct PerIpPermit {
 
 impl Drop for PerIpPermit {
     fn drop(&mut self) {
-        // Best effort decrement. If the lock is poisoned, we leak a count
-        // entry, which is acceptable: the map has bounded capacity and the
-        // entry will be evicted by LRU when the slot is needed.
+        // Best effort decrement. A poisoned lock leaks this entry, but
+        // it leaks nothing further: `try_accept` fails closed on the
+        // same poison, so the tracker admits nothing after that point
+        // and the map cannot grow.
         let Ok(mut map) = self.counts.lock() else {
             warn!("per-IP tracker mutex poisoned, failing open on drop");
             return;
@@ -65,20 +83,11 @@ impl Drop for PerIpPermit {
     }
 }
 
-/// Default maximum tracked IPs. Sized for a large mining pool gateway.
-const DEFAULT_MAX_TRACKED_IPS: usize = 50_000;
-
 impl PerIpConnectionTracker {
     /// Create a new tracker. `max_per_ip = 0` disables per-IP enforcement.
     pub fn new(max_per_ip: u32) -> Self {
-        Self::with_capacity(max_per_ip, DEFAULT_MAX_TRACKED_IPS)
-    }
-
-    /// Create with explicit map capacity for testing.
-    pub fn with_capacity(max_per_ip: u32, max_tracked_ips: usize) -> Self {
         Self {
             max_per_ip,
-            max_tracked_ips,
             counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -111,23 +120,6 @@ impl PerIpConnectionTracker {
 
         if current >= self.max_per_ip {
             return None;
-        }
-
-        // Evict a zero-count entry if at capacity and the IP is new.
-        if map.len() >= self.max_tracked_ips && !map.contains_key(&ip) {
-            let evict_ip = map
-                .iter()
-                .filter(|(_, count)| **count == 0)
-                .map(|(ip, _)| *ip)
-                .next();
-            if let Some(dead_ip) = evict_ip {
-                debug!(evicted_ip = %dead_ip, map_size = map.len(), "per-IP tracker LRU eviction");
-                map.remove(&dead_ip);
-            }
-            // If no zero-count entry exists and the map is full, allow the
-            // connection anyway. The global connection cap still bounds
-            // total concurrency. This avoids denying legitimate new IPs
-            // when the map is saturated with active connections.
         }
 
         *map.entry(ip).or_insert(0) += 1;
@@ -203,14 +195,46 @@ mod tests {
         assert_eq!(tracker.count_for(ip(3)), 1);
     }
 
+    /// The map's real bound (PB-30): one entry per address that holds a
+    /// live connection, and nothing else.
+    ///
+    /// This replaces `per_ip_map_evicts_zero_count_at_capacity`, which
+    /// asserted only `count_for(ip(3)) == 1` and passed whether or not
+    /// the eviction branch it was named for ran. It could not have run:
+    /// dropping a permit removes the entry, so the zero-count entry the
+    /// branch looked for never existed.
     #[test]
-    fn per_ip_map_evicts_zero_count_at_capacity() {
-        let tracker = PerIpConnectionTracker::with_capacity(3, 2);
-        let _p1 = tracker.try_accept(ip(1)).unwrap();
-        let p2 = tracker.try_accept(ip(2)).unwrap();
-        drop(p2);
-        let _p3 = tracker.try_accept(ip(3)).unwrap();
-        assert_eq!(tracker.count_for(ip(3)), 1);
+    fn per_ip_map_holds_an_entry_only_while_a_connection_is_live() {
+        let tracker = PerIpConnectionTracker::new(2);
+        let permits: Vec<_> = (1..=4)
+            .map(|i| tracker.try_accept(ip(i)).unwrap())
+            .collect();
+        assert_eq!(tracked_ips(&tracker), 4, "one entry per live source");
+
+        // A second connection from an already-tracked address shares
+        // the entry rather than adding one.
+        let second_from_first = tracker.try_accept(ip(1)).unwrap();
+        assert_eq!(tracked_ips(&tracker), 4);
+        drop(second_from_first);
+        assert_eq!(
+            tracked_ips(&tracker),
+            4,
+            "ip(1) still holds one connection, so its entry must stay"
+        );
+
+        drop(permits);
+        assert_eq!(
+            tracked_ips(&tracker),
+            0,
+            "an address with no live connection must not keep an entry"
+        );
+    }
+
+    /// Map size, which is the quantity the type's doc makes a claim
+    /// about. Not exposed outside the module: the callers have no use
+    /// for it, and `count_for` is the diagnostic they do use.
+    fn tracked_ips(tracker: &PerIpConnectionTracker) -> usize {
+        tracker.counts.lock().unwrap().len()
     }
 
     /// IPv4-mapped IPv6 and plain IPv4 are distinct `IpAddr` values, so a

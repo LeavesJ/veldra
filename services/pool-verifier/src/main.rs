@@ -163,6 +163,51 @@ fn enforce_api_secret() {
     }
 }
 
+/// Install the process-level rustls `CryptoProvider` before any TLS
+/// consumer in this process can reach a builder (PB-28, PB-30).
+///
+/// `rustls` 0.23 picks a provider from its enabled crate features, and
+/// this binary enables two: `axum-server`'s `tls-rustls` pulls
+/// `aws-lc-rs`, `reqwest`'s `rustls-tls` pulls `ring`. With two
+/// candidates the choice is ambiguous, so every `ServerConfig::builder`
+/// and `ClientConfig::builder` call panics with "Could not automatically
+/// determine the process-level CryptoProvider from Rustls crate
+/// features".
+///
+/// PB-28 put the install inside `ingress::build_tcp_tls_acceptor`, which
+/// returns early when `VELDRA_VERIFIER_TLS_CERT` and `_KEY` are unset.
+/// Unset is the shipped default, so in the default configuration the
+/// install never ran and `axum-server` hit the identical panic on the
+/// HTTPS path (`http.rs:113` and `:122`). That one lands inside the
+/// spawned HTTP task, so the process stays up with the ingress still
+/// answering templates and no `/health`, no `/metrics` and no dashboard:
+/// blindness rather than a crash. It belongs here, once, ahead of both.
+///
+/// `aws_lc_rs` is rustls' own default and the provider `axum-server`
+/// builds against, and `sv2-gateway` installs the same one, so a
+/// verdict channel never has one provider on each end.
+///
+/// `install_default` returns `Err` only when a provider is already
+/// installed, which is the state this wants, so that arm proceeds. The
+/// post-condition is checked rather than assumed: no provider at this
+/// point is a startup failure, not a panic deferred to the first
+/// handshake.
+fn install_crypto_provider() -> anyhow::Result<()> {
+    use tokio_rustls::rustls::crypto::{CryptoProvider, aws_lc_rs};
+
+    if CryptoProvider::get_default().is_none()
+        && aws_lc_rs::default_provider().install_default().is_err()
+    {
+        info!("rustls CryptoProvider was installed concurrently; using the installed one");
+    }
+    if CryptoProvider::get_default().is_none() {
+        anyhow::bail!(
+            "no rustls CryptoProvider is installed after install_default; TLS cannot start"
+        );
+    }
+    Ok(())
+}
+
 fn init_metrics() -> (
     reservegrid_common::metrics::SharedRegistry,
     Arc<metrics::VerifierMetrics>,
@@ -245,6 +290,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     enforce_api_secret();
+
+    // Ahead of the ingress acceptor and the HTTPS server both, because
+    // either one can be the first rustls consumer depending on which
+    // env vars an operator set. See `install_crypto_provider`.
+    install_crypto_provider()?;
 
     let tcp_addr = cli.tcp_addr;
     let http_addr = cli.http_addr;
