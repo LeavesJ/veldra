@@ -4235,6 +4235,7 @@ version = "2.0.0-rc1"
 dependencies = [
  "prometheus-client",
  "rg-protocol",
+ "rustls",
  "serde",
  "serde_json",
  "subtle",
@@ -4367,6 +4368,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http",
+ "reservegrid-common",
  "serde",
  "serde_json",
  "tokio",

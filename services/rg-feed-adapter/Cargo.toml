@@ -21,6 +21,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 http = "1"
+# PB-32. Only for `crypto_provider::install_default`, which the `wss://`
+# feed URL in both shipped configs needs before `connect_async` builds a
+# rustls `ClientConfig`.
+reservegrid-common = { path = "../reservegrid-common", features = [
+  "rustls-provider",
+] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# PB-32. `tests/feed_tls_handshake.rs` boots the real adapter binary and
+# holds the `wss://` endpoint it dials. Integration tests are separate
+# crates and cannot reach the package's regular `[dependencies]`, so the
+# same tokio has to be re-listed here for the test binary.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }

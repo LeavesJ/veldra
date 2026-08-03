@@ -22,7 +22,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 rg-protocol = { path = "../rg-protocol" }
-reservegrid-common = { path = "../reservegrid-common" }
+reservegrid-common = { path = "../reservegrid-common", features = [
+  "rustls-provider",
+] }
 rg-consensus = { path = "../rg-consensus" }
 prometheus-client = { workspace = true }
 subtle = "2"
