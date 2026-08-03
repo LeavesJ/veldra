@@ -41,6 +41,14 @@ warn_coinbase_sigops_max = 400
 # mainnet bitcoind (not regtest) and set credentials. rpc_pass is read
 # from VELDRA_BITCOIND_RPC_PASS when set, falling back to the value
 # here, so keep the secret in the environment and leave it empty here.
+#
+# The TODO_SET_* values below are load-bearing, not decoration: with
+# enforce = true the verifier REFUSES TO START until rpc_url and
+# rpc_user are real and a password is available. That is deliberate.
+# A placeholder is a non-empty string, so it used to pass validation
+# and leave a verifier that answered /health and ran no Class M check
+# at all. If you want Phase 1 only, say so with enforce = false rather
+# than by leaving these unfilled.
 [policy.mempool]
 enforce = true
 tolerance_pct = 4.0

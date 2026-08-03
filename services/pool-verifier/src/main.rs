@@ -221,35 +221,40 @@ fn init_metrics() -> (
 // ── Phase 2 mempool view bootstrap (ADR-003) ──────────────────
 
 /// Construct the Phase 2 [`MempoolView`] and spawn the polling task
-/// when policy enables Class M and the bitcoind RPC creds are
-/// populated. Returns `None` to leave the shield in Phase 1 mode.
+/// when policy enables Class M. Returns `Ok(None)` only when the
+/// operator has explicitly left `[policy.mempool] enforce = false`,
+/// which is the shipped default and means Phase 1 mode on purpose.
 ///
 /// `[policy.mempool] rpc_pass` is preferred from the
 /// `VELDRA_BITCOIND_RPC_PASS` env var when set, falling back to the
 /// TOML-stored value. Operators should keep secrets out of
 /// `policy.toml` on disk.
+///
+/// With `enforce = true` and unusable credentials this returns `Err`
+/// and startup fails. It used to warn and return `None`, which is the
+/// same shape of defect the placeholder itself is: `deploy/policy-prod.toml`
+/// ships `enforce = true` beside `rpc_url = "TODO_SET_..."`, a non-empty
+/// string that passed the old emptiness check, so the verifier came up
+/// answering `/health`, climbing `verdicts_total`, and running no Class
+/// M check at all. Invariant 4: a default that validates but cannot
+/// work is worse than a missing key, because a missing key fails
+/// loudly at boot. An operator who wants Phase 1 says so with
+/// `enforce = false`.
 fn build_phase2_mempool_view(
     cfg: &pool_verifier::policy::PolicyConfig,
-) -> Option<Arc<pool_verifier::mempool_view::MempoolView>> {
+) -> anyhow::Result<Option<Arc<pool_verifier::mempool_view::MempoolView>>> {
     let mp = &cfg.mempool;
     if !mp.enforce {
-        return None;
-    }
-    if mp.rpc_url.is_empty() || mp.rpc_user.is_empty() {
-        tracing::warn!(
-            "policy.mempool.enforce=true but rpc_url or rpc_user is empty; \
-             Phase 2 Class M check disabled (shield runs Phase 1 only)"
-        );
-        return None;
+        return Ok(None);
     }
     let pass = env::var("VELDRA_BITCOIND_RPC_PASS").unwrap_or_else(|_| mp.rpc_pass.clone());
-    if pass.is_empty() {
-        tracing::warn!(
-            "policy.mempool.enforce=true but no rpc_pass available \
-             (neither VELDRA_BITCOIND_RPC_PASS env nor [policy.mempool] rpc_pass); \
-             Phase 2 Class M check disabled (shield runs Phase 1 only)"
+    if let Err(why) = mp.require_usable_credentials(&pass) {
+        anyhow::bail!(
+            "[policy.mempool] enforce = true but {why}. Refusing to start: the Class M \
+             mempool ground-truth check would be silently disabled while the verifier \
+             reported healthy. Point rpc_url at a real bitcoind JSON-RPC endpoint and set \
+             the credentials, or set enforce = false to run Phase 1 only on purpose."
         );
-        return None;
     }
 
     let client = pool_verifier::bitcoind_rpc::BitcoindClient::new(
@@ -275,7 +280,7 @@ fn build_phase2_mempool_view(
         per_tx_detail = mp.per_tx_detail,
         "Phase 2 Class M check enabled; mempool view polling task spawned"
     );
-    Some(view)
+    Ok(Some(view))
 }
 
 // ── Main ─────────────────────────────────────────────────────
@@ -342,7 +347,9 @@ async fn main() -> anyhow::Result<()> {
     // `[policy.mempool] enforce = true` and the bitcoind RPC creds
     // are populated. Defaults shipped with `enforce = false`, so
     // existing deployments run Phase 1 only without operator action.
-    let mempool_view = build_phase2_mempool_view(&policy_holder.config);
+    // With `enforce = true` and unusable credentials this is fatal:
+    // startup fails rather than serving a verifier that checks nothing.
+    let mempool_view = build_phase2_mempool_view(&policy_holder.config)?;
 
     let app_state = AppState {
         policy: Arc::new(RwLock::new(policy_holder)),

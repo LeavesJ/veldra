@@ -43,7 +43,11 @@ services:
       VELDRA_POLICY_FILE: /config/policy-prod.toml
       VELDRA_VERIFIER_CONFIG: /devconfig/verifier.toml
       VELDRA_MODE: "${VELDRA_MODE:-observe}"
-      VELDRA_BITCOIND_RPC_PASS: "${VELDRA_BITCOIND_RPC_PASS}"
+      # Required, not optional: policy-prod.toml sets
+      # [policy.mempool] enforce = true, and the verifier now refuses
+      # to start without a usable RPC password. Failing here at
+      # `compose up` beats failing in a restart loop on the node.
+      VELDRA_BITCOIND_RPC_PASS: "${VELDRA_BITCOIND_RPC_PASS:?Set VELDRA_BITCOIND_RPC_PASS in .env.setup-b}"
       # PB-26 ingress connection cap, pinned at the shipped default.
       # This is the Class M soak node: the ingress binds 127.0.0.1 only
       # (network_mode: host), and the legitimate population is one

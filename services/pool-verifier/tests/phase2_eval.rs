@@ -485,3 +485,85 @@ fn phase2_rejected_detail_format_under_per_tx_uses_same_sample_field() {
         }
     }
 }
+
+// ── Class M soak hazard: an empty successful poll is not ground truth ──
+
+/// A successful `getrawmempool` that returns an empty set must never
+/// install as a `Fresh` view.
+///
+/// This is the boot case: the very first poll after startup answers
+/// `200 OK` with `[]` because bitcoind is still loading `mempool.dat`,
+/// is on the wrong chain, or was just restarted. Installing that as
+/// `Fresh` scores 100% of every non-empty template's transactions as
+/// unknown, which drives Class M straight to `ToleranceExceeded` on
+/// every template. In the launch-gate soak evidence that is
+/// indistinguishable from a real detection: a false-positive storm
+/// that looks like the product working.
+#[tokio::test]
+async fn phase2_empty_first_poll_does_not_prime_a_fresh_view() {
+    let view = MempoolView::new(60);
+    assert_eq!(view.snapshot().await.state, MempoolState::Unprimed);
+
+    view.install(HashSet::new()).await;
+
+    let snap = view.snapshot().await;
+    assert_ne!(
+        snap.state,
+        MempoolState::Fresh,
+        "an empty successful poll must not mark the view Fresh"
+    );
+    assert_eq!(
+        snap.state,
+        MempoolState::Unprimed,
+        "an empty successful poll must leave the view unprimed"
+    );
+    assert_eq!(
+        view.empty_responses(),
+        1,
+        "the refusal must be countable; it exports as verifier_mempool_empty_responses"
+    );
+
+    // The check must skip, not score the template 100% unknown.
+    let (template, _txids) = regtest_segwit_template();
+    let cfg = permissive_policy();
+    let result = evaluate_dynamic_phase2(&template, &cfg, Some(&snap), Some(100), 0);
+    assert!(
+        result.reason.is_none(),
+        "an empty view must skip Class M, not reject; got reason={:?} detail={:?}",
+        result.reason,
+        result.detail
+    );
+}
+
+/// The steady-state half: a view that was primed with a real mempool
+/// and then receives an empty successful poll must keep the prior set
+/// and keep its age advancing, so the existing fail-stale ladder
+/// (Fresh -> Stale -> Degraded, the last of which already increments
+/// `verifier_phase2_degraded_total`) carries the outage. Resetting the
+/// refresh clock on an empty response would pin the view at `Fresh`
+/// forever while it scored every template 100% unknown.
+#[tokio::test]
+async fn phase2_empty_poll_does_not_refresh_a_primed_view() {
+    let view = MempoolView::new(60);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .expect("clock available");
+
+    // Primed 90s ago: between max_stale_secs and 2 * max_stale_secs.
+    view.install_at(HashSet::from([[1u8; 32]]), now_ms.saturating_sub(90_000))
+        .await;
+    assert_eq!(view.snapshot().await.state, MempoolState::Stale);
+
+    // An empty success must not reset the clock back to Fresh.
+    view.install_at(HashSet::new(), now_ms).await;
+
+    let snap = view.snapshot().await;
+    assert_eq!(
+        snap.state,
+        MempoolState::Stale,
+        "an empty poll must not refresh a primed view back to Fresh"
+    );
+    assert_eq!(snap.size, 1, "the prior non-empty view must be retained");
+    assert_eq!(view.empty_responses(), 1);
+}

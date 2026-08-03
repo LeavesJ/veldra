@@ -145,7 +145,7 @@ Re-run periodically. The node is synced when `verificationprogress` is at or abo
 
 The launch-gate pipeline is bitcoind to template-manager to pool-verifier. template-manager's bitcoind backend polls `getblocktemplate` from the real node directly, and the verifier polls `getrawmempool` directly, so both views come from one node. The synthetic feed chain (rg-demo-feed, rg-feed-adapter) and the licensed feed product (rg-feed-server, rg-auth) are not part of this pipeline. `docker-compose.setup-b.yml` codifies it: host networking so the containers can reach the loopback-only bitcoind, every service bound to 127.0.0.1, and credentials supplied through the environment.
 
-1. **Verifier mempool source.** In `deploy/policy-prod.toml [policy.mempool]`, fill the placeholders added in this repo:
+1. **Verifier mempool source.** In `deploy/policy-prod.toml [policy.mempool]`, fill the placeholders added in this repo. This is mandatory, not advisory: with `enforce = true` the verifier refuses to start on a placeholder, an empty value, a non-`http(s)` `rpc_url`, or an empty resolved password, and prints the offending key. A verifier that starts is a verifier whose Class M check is actually wired.
    ```toml
    rpc_url  = "http://<NODE_HOST>:8332"
    rpc_user = "veldra"
@@ -167,7 +167,8 @@ The launch-gate pipeline is bitcoind to template-manager to pool-verifier. templ
    - the log line `Phase 2 mempool view polling task started`,
    - `verifier_phase2_degraded_total` settles at `0` after the first successful poll,
    - `verifier_mempool_view_size` tracks `getmempoolinfo .size`,
-   - `verifier_phase2_checks_total{result="agreed"}` climbs as templates flow.
+   - `verifier_phase2_checks_total{result="agreed"}` climbs as templates flow,
+   - `verifier_mempool_empty_responses` holds at `0`. Anything above zero means `getrawmempool` succeeded and came back empty, so the view was refused rather than served: the node is on the wrong chain or has not finished loading `mempool.dat`. Left unfixed the view never primes, `verifier_phase2_checks_total{result="unprimed"}` climbs instead of `agreed`, and the soak measures nothing.
 2. Promote the verifier to `VELDRA_MODE=shadow`.
 3. Run the one-week soak in `docs/runbooks/phase2-shadow-soak.md` from its Pre-Soak Setup step. The acceptance bar is `FP_total == 0` at `tolerance_pct = 4.0`.
 
