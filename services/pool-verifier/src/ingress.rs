@@ -223,6 +223,90 @@ enum BoundedLine {
     OverLimit,
 }
 
+/// Longest rendering of a rejected line that reaches the log.
+///
+/// Mirrors the gateway's `verifier_stream::LOG_SAMPLE_BYTES`, deliberately
+/// duplicated rather than shared for the same reason `read_bounded_line`
+/// is: each side owns its own ingress and neither should have to import
+/// the other's I/O internals to bound a log field.
+const LOG_SAMPLE_BYTES: usize = 512;
+
+/// Bound a borrowed string before it reaches a log field, on a char
+/// boundary so the output stays valid UTF-8, marking any truncation.
+///
+/// Used for the peer-supplied `msg_type`, which is a `String` bounded
+/// only by `MAX_INTERNAL_LINE_BYTES` and reaches an unknown-type warning
+/// that has no strike counter, so a peer can repeat it for the life of
+/// the connection.
+///
+/// Mirrors the gateway's `verifier_stream::log_sample`.
+fn log_sample(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.len() <= LOG_SAMPLE_BYTES {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut end = LOG_SAMPLE_BYTES;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{} (truncated, {} bytes total)",
+        &line[..end],
+        line.len()
+    ))
+}
+
+/// Render `value` into at most `LOG_SAMPLE_BYTES`, marking any truncation
+/// and keeping the true length.
+///
+/// This ingress never logged the offending line itself, so it did not
+/// carry the gateway's original defect. It carried the other half of it:
+/// `serde_json::Error`'s `Display` embeds the offending input verbatim,
+/// so `error = %e` on a parse failure hands back whatever the peer sent.
+/// A line is bounded only by `MAX_INTERNAL_LINE_BYTES` (20 MiB), and a
+/// malformed line here is skipped rather than fatal, so a peer can spend
+/// them one after another on a single connection. Measured against the
+/// gateway's envelope type, a 1,000,042 byte line yields a 1,000,062 byte
+/// error message.
+///
+/// Mirrors the gateway's `verifier_stream::log_display`.
+fn log_display(value: impl std::fmt::Display) -> String {
+    use std::fmt::Write as _;
+
+    /// Keeps at most `LOG_SAMPLE_BYTES`, cut on a char boundary, while
+    /// counting every byte offered so the true length survives.
+    struct Capped {
+        kept: String,
+        offered: usize,
+    }
+
+    impl std::fmt::Write for Capped {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.offered += s.len();
+            let mut room = LOG_SAMPLE_BYTES
+                .saturating_sub(self.kept.len())
+                .min(s.len());
+            // The cut point is attacker-chosen, so a naive slice at the
+            // cap panics whenever it lands mid-codepoint.
+            while room > 0 && !s.is_char_boundary(room) {
+                room -= 1;
+            }
+            self.kept.push_str(&s[..room]);
+            Ok(())
+        }
+    }
+
+    let mut sink = Capped {
+        kept: String::new(),
+        offered: 0,
+    };
+    let _ = write!(sink, "{value}");
+    let Capped { mut kept, offered } = sink;
+    if offered > kept.len() {
+        let _ = write!(kept, " (truncated, {offered} bytes total)");
+    }
+    kept
+}
+
 /// Read one newline-terminated line into `buf`, enforcing `max_bytes`
 /// per line via `AsyncReadExt::take` so an endless newline-free
 /// stream can never grow the line buffer without bound (PB-18b). The
@@ -312,7 +396,10 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                             match serde_json::from_value::<TemplatePropose>(env.payload) {
                                 Ok(p) => p,
                                 Err(e) => {
-                                    warn!(error = ?e, "template_propose payload parse error");
+                                    warn!(
+                                        error = %log_display(&e),
+                                        "template_propose payload parse error"
+                                    );
                                     continue;
                                 }
                             }
@@ -341,7 +428,10 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                             continue;
                         }
                         other => {
-                            warn!(msg_type = other, "unknown internal message type; ignoring");
+                            warn!(
+                                msg_type = %log_sample(other),
+                                "unknown internal message type; ignoring"
+                            );
                             continue;
                         }
                     }
@@ -355,7 +445,7 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                             p
                         }
                         Err(e) => {
-                            warn!(error = ?e, "template JSON parse error");
+                            warn!(error = %log_display(&e), "template JSON parse error");
                             continue;
                         }
                     }
@@ -732,8 +822,190 @@ pub(crate) async fn api_key_middleware(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{BoundedLine, read_bounded_line};
+    use super::{BoundedLine, LOG_SAMPLE_BYTES, log_display, log_sample, read_bounded_line};
+    use rg_protocol::TemplatePropose;
+    use rg_protocol::gateway::MAX_INTERNAL_LINE_BYTES;
     use tokio::io::BufReader;
+
+    // ── PB-23 parity: log write amplification through the error field ──
+    //
+    // This ingress never logged the offending line, so it did not carry
+    // the gateway's original defect. It carried the other half: both
+    // parse-failure sites render a `serde_json::Error`, whose Display
+    // embeds the offending input verbatim. `TemplatePropose::id` is a
+    // `u64`, so a giant string there is valid JSON that fails typing.
+
+    fn hostile_propose_line(body: &str) -> String {
+        format!(r#"{{"version":1,"id":"{body}"}}"#)
+    }
+
+    #[test]
+    fn log_display_caps_the_raw_template_parse_error() {
+        // The fallback site: `serde_json::from_str::<TemplatePropose>`.
+        let line = hostile_propose_line(&"A".repeat(1_000_000));
+        let e = serde_json::from_str::<TemplatePropose>(&line).unwrap_err();
+
+        let uncapped = e.to_string().len();
+        assert!(
+            uncapped > 1_000_000,
+            "expected the error to carry the line, got {uncapped} bytes"
+        );
+
+        let out = log_display(&e);
+        assert!(
+            out.len() < LOG_SAMPLE_BYTES + 64,
+            "error field reached the log as {} bytes",
+            out.len()
+        );
+        assert!(out.contains("truncated"), "truncation must be visible");
+        assert!(
+            out.contains(&uncapped.to_string()),
+            "the real length must survive into the log"
+        );
+    }
+
+    #[test]
+    fn log_display_caps_the_envelope_payload_parse_error() {
+        // The envelope site: `serde_json::from_value::<TemplatePropose>`
+        // on `InternalMessage::payload`.
+        let payload = serde_json::json!({ "version": 1, "id": "A".repeat(1_000_000) });
+        let e = serde_json::from_value::<TemplatePropose>(payload).unwrap_err();
+
+        assert!(e.to_string().len() > 1_000_000);
+        let out = log_display(&e);
+        assert!(out.len() < LOG_SAMPLE_BYTES + 64);
+        assert!(out.contains("truncated"));
+    }
+
+    #[test]
+    fn log_display_passes_short_errors_through_untouched() {
+        let e = serde_json::from_str::<TemplatePropose>("{").unwrap_err();
+        assert_eq!(log_display(&e), e.to_string());
+    }
+
+    #[test]
+    fn log_sample_caps_a_hostile_msg_type() {
+        // `InternalMessage::msg_type` is a peer-supplied String bounded
+        // only by MAX_INTERNAL_LINE_BYTES, and the unknown-type warning
+        // that logs it has no strike counter, so it repeats for the life
+        // of the connection.
+        let msg_type = "A".repeat(MAX_INTERNAL_LINE_BYTES);
+        let out = log_sample(&msg_type);
+        assert!(
+            out.len() < LOG_SAMPLE_BYTES + 64,
+            "msg_type reached the log as {} bytes",
+            out.len()
+        );
+        assert!(out.contains("truncated"));
+        assert!(out.contains(&MAX_INTERNAL_LINE_BYTES.to_string()));
+
+        // Short types pass through borrowed, so the common path allocates
+        // nothing.
+        assert!(matches!(
+            log_sample("template_verdict"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// Sink that collects everything a `tracing` subscriber writes, so a
+    /// test can assert on the bytes that actually reach a log rather than
+    /// on the capping helpers called in isolation.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_inbound_lines_emit_bounded_log_records() {
+        use crate::state::{AppState, PolicyHolder};
+        use pool_verifier::policy::PolicyConfig;
+        use rg_protocol::PROTOCOL_VERSION;
+
+        // Asserted on the emitted records and through the real
+        // `handle_tcp_connection`, so a future edit that drops a capping
+        // call at a call site fails here rather than passing because the
+        // helper is still correct in isolation.
+        let big = "A".repeat(1_000_000);
+
+        // 1. Envelope parses, `msg_type` itself is the hostile string.
+        let unknown_type = format!(r#"{{"msg_type":"{big}","version":1,"payload":{{}}}}"#);
+        // 2. Envelope parses, `TemplatePropose` typing fails on the payload.
+        let bad_payload =
+            format!(r#"{{"msg_type":"template_propose","version":1,"payload":{{"id":"{big}"}}}}"#);
+        // 3. Not an envelope, so the raw `TemplatePropose` fallback runs
+        //    and fails typing there.
+        let bad_raw = format!(r#"{{"version":1,"id":"{big}"}}"#);
+
+        let stream = format!("{unknown_type}\n{bad_payload}\n{bad_raw}\n");
+        let sent = stream.len();
+
+        let app_state = AppState {
+            policy: std::sync::Arc::new(std::sync::RwLock::new(PolicyHolder {
+                config: PolicyConfig::default_with_protocol(PROTOCOL_VERSION),
+                toml_text: String::new(),
+            })),
+            mempool_view: None,
+        };
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = std::sync::Arc::new(crate::metrics::VerifierMetrics::new_registered(
+            &mut registry,
+        ));
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            super::handle_tcp_connection(
+                stream.as_bytes(),
+                tokio::io::sink(),
+                app_state,
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                metrics,
+            )
+            .await;
+        }
+
+        let emitted = captured.0.lock().unwrap().len();
+        assert!(
+            emitted < 8192,
+            "{sent} bytes of hostile input produced {emitted} bytes of \
+             log; every peer-controlled field must be capped at \
+             {LOG_SAMPLE_BYTES}"
+        );
+    }
+
+    #[test]
+    fn log_display_truncates_on_a_char_boundary() {
+        // 3-byte chars, so the 512 cap never lands on a boundary. A naive
+        // slice here panics on input the peer chooses.
+        let line = hostile_propose_line(&"\u{4e16}".repeat(400_000));
+        let e = serde_json::from_str::<TemplatePropose>(&line).unwrap_err();
+        let out = log_display(&e);
+        assert!(out.contains("truncated"));
+        assert!(out.len() < LOG_SAMPLE_BYTES + 64);
+    }
 
     #[tokio::test]
     async fn read_bounded_line_reads_normal_lines_then_eof() {
