@@ -185,9 +185,11 @@ pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
 /// holding 5.10 s and a 15 s budget holding 15.05 s. A gateway
 /// reconnects in 2 to 3 s, so for the ~58 s in between one egress
 /// address carries two slots per gateway. TCP keepalive cannot shorten
-/// that window: the ladder set below is 30 s idle plus eight 10 s
-/// probes, which fires at 110 s on macOS and 120 s on Linux, both past
-/// the budget, so it can never be what reclaims the slot first.
+/// that window. The ladder set below is 30 s idle and 10 s between
+/// probes, and it leaves the probe count at the OS default, which is 8
+/// on macOS and 9 on Linux, so the kill lands at 110 s and 120 s
+/// respectively. Both are past the budget, so keepalive can never be
+/// what reclaims the slot first at shipped defaults.
 ///
 /// `M` is 1. A concurrent template-manager costs exactly one slot even
 /// though it opens a fresh connection per template: measured peak
