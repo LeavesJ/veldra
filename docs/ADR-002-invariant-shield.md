@@ -3,11 +3,77 @@
 **Status:** Accepted, implemented (Phase 1 shipped 2026-04-21 through
 2026-04-29; Phase 1.5 Tier 3 completion shipped 2026-07-22 — all 18
 checks wired). **Amended 2026-08-02 by PB-20: the ratified table of 18
-is widened to 19.** See "Amendment 1" below; the 18-count statements in
+is widened to 19. Amended again 2026-08-03 by PB-21: widened to 20.**
+See "Amendment 1" and "Amendment 2" below; the 18-count statements in
 the sections underneath record what was originally ratified and are
 left as written.
 **Date:** 2026-04-21
 **Deciders:** Jarron (Veldra, Inc.)
+
+## Amendment 2 (2026-08-03, PB-21): a 20th invariant
+
+No bound on coinbase value existed anywhere in the workspace. The
+ratified table has a Class D check that the declared `coinbase_value`
+equals the value re-derived from `raw_block_hex`, and Tier 3 ceilings
+for weight and sigops, but nothing that asked whether the value itself
+is a number Bitcoin can represent. `raw_block_hex` is fully attacker
+controlled, so the coinbase output values are attacker chosen `u64`s,
+and `re_derive_coinbase_value` added them with an unchecked `sum()`.
+
+Added: `v2_invariant_coinbase_value_exceeds_max`, a Tier 3 ceiling
+check asserting every coinbase output value and their total sit inside
+Bitcoin `MoneyRange` of 0 through `MAX_MONEY` (2,100,000,000,000,000
+sats). It is the third member of the ceiling family, beside
+`check_weight_max` and `check_sigops_max`, and runs directly after
+them. Core applies `MoneyRange` per output and again on the total, and
+both halves are needed: one output above `MAX_MONEY` overflows nothing,
+and a total above `MAX_MONEY` can be built from individually legal
+outputs. This **widens** v2.0 rather than completing it.
+
+**Severity, as executed.** Two distinct failures, both reproduced
+before the fix on a template whose coinbase carries two outputs of
+`0xC000_0000_0000_0000`.
+
+Under the debug and CI profiles, where overflow checks are on, the
+unchecked `sum()` panicked at `core/src/iter/traits/accum.rs:204` with
+"attempt to add with overflow", inside `check_invariant_shield`. That
+is a remote denial of service: a peer stops the verifier on demand
+with one template.
+
+Under release, where the same addition wraps, `re_derive_coinbase_value`
+returned `Ok(9223372036854775808)`, exactly 2^63. An attacker who
+declares that number matches the Class D re-derivation, and
+`check_invariant_shield` returned `Agreed` on a block paying about
+1.8e19 sats. The same `Agreed` was returned, in both profiles, for the
+two non-overflowing shapes: a single output of `MAX_MONEY + 1`, and two
+in-range outputs totalling above `MAX_MONEY`. Agreeing to a block that
+causes consensus rejection is the harm class the Tier 1 table in
+`docs/three-mode-architecture.md` labels CRITICAL.
+
+What was NOT demonstrated, and is not claimed here: any path to stolen
+funds. Real-world exposure stays bounded by Core rejecting such a block
+outright, since `CheckTransaction` enforces the same `MoneyRange` this
+check ports. That is a bound on blast radius, not a reason to grade the
+defect low, and it does not bound the panic at all: the denial of
+service lands on the verifier before any node sees the block.
+
+**Where the arithmetic lives.** `re_derive_coinbase_value` now folds
+with `checked_add` and reports a total that does not fit `u64` as this
+same violation, since such a total is by construction far above
+`MAX_MONEY`. It deliberately does not apply the `MoneyRange` ceiling
+itself: that belongs to the Tier 3 check, which keeps the ceiling
+reachable through the shield rather than shadowed by an earlier
+rejection. Saturating instead of failing was considered and rejected,
+because `u64::MAX` is a number the attacker can also declare, so the
+Class D comparison would agree again. Reusing
+`v2_invariant_decode_failed` was also rejected: the bytes decode fine,
+and labelling a value overflow a decode failure lies to every dashboard
+that keys off `reason_code`.
+
+Count impact, superseding both the Phase 1 figures below and Amendment
+1: `VerdictReason::ALL` 38 to 39, `ReasonCode::ALL` 96 to 97,
+`ConsensusViolation::ALL_CODES` 23 to 24, `ConsensusViolation::ALL` 24
+to 25, Tier 3 array 8 to 9, invariants wired 19 of 19 to 20 of 20.
 
 ## Amendment 1 (2026-08-02, PB-20): a 19th invariant
 
@@ -372,6 +438,7 @@ Proposed canonical strings (snake_case, `v2_invariant_` prefix):
 | Block sigops exceed consensus maximum | `v2_invariant_sigops_exceed_max` |
 | Non coinbase transaction carries null prevout | `v2_invariant_nontcb_null_prevout` |
 | `txdata[0]` is not a coinbase (Amendment 1, PB-20) | `v2_invariant_coinbase_prevout_not_null` |
+| Coinbase output value or total outside MoneyRange (Amendment 2, PB-21) | `v2_invariant_coinbase_value_exceeds_max` |
 | Block header version below active soft fork floor | `v2_invariant_header_version_low` |
 | Duplicate transaction in block body | `v2_invariant_duplicate_tx` |
 | Raw block bytes fail to deserialize | `v2_invariant_decode_failed` |

@@ -574,6 +574,8 @@ pub enum ReasonCode {
     V2InvariantWeightExceedsMax,
     #[serde(rename = "v2_invariant_sigops_exceed_max")]
     V2InvariantSigopsExceedMax,
+    #[serde(rename = "v2_invariant_coinbase_value_exceeds_max")]
+    V2InvariantCoinbaseValueExceedsMax,
     #[serde(rename = "v2_invariant_nontcb_null_prevout")]
     V2InvariantNontcbNullPrevout,
     #[serde(rename = "v2_invariant_coinbase_prevout_not_null")]
@@ -718,6 +720,7 @@ impl ReasonCode {
         ReasonCode::V2InvariantCoinbaseHeightMismatch,
         ReasonCode::V2InvariantWeightExceedsMax,
         ReasonCode::V2InvariantSigopsExceedMax,
+        ReasonCode::V2InvariantCoinbaseValueExceedsMax,
         ReasonCode::V2InvariantNontcbNullPrevout,
         ReasonCode::V2InvariantCoinbasePrevoutNotNull,
         ReasonCode::V2InvariantHeaderVersionLow,
@@ -831,6 +834,7 @@ impl ReasonCode {
         "v2_invariant_coinbase_height_mismatch",
         "v2_invariant_weight_exceeds_max",
         "v2_invariant_sigops_exceed_max",
+        "v2_invariant_coinbase_value_exceeds_max",
         "v2_invariant_nontcb_null_prevout",
         "v2_invariant_coinbase_prevout_not_null",
         "v2_invariant_header_version_low",
@@ -954,6 +958,9 @@ impl ReasonCode {
             }
             ReasonCode::V2InvariantWeightExceedsMax => "v2_invariant_weight_exceeds_max",
             ReasonCode::V2InvariantSigopsExceedMax => "v2_invariant_sigops_exceed_max",
+            ReasonCode::V2InvariantCoinbaseValueExceedsMax => {
+                "v2_invariant_coinbase_value_exceeds_max"
+            }
             ReasonCode::V2InvariantNontcbNullPrevout => "v2_invariant_nontcb_null_prevout",
             ReasonCode::V2InvariantCoinbasePrevoutNotNull => {
                 "v2_invariant_coinbase_prevout_not_null"
@@ -1103,6 +1110,9 @@ impl From<VerdictReason> for ReasonCode {
             }
             VerdictReason::V2InvariantWeightExceedsMax => ReasonCode::V2InvariantWeightExceedsMax,
             VerdictReason::V2InvariantSigopsExceedMax => ReasonCode::V2InvariantSigopsExceedMax,
+            VerdictReason::V2InvariantCoinbaseValueExceedsMax => {
+                ReasonCode::V2InvariantCoinbaseValueExceedsMax
+            }
             VerdictReason::V2InvariantNontcbNullPrevout => ReasonCode::V2InvariantNontcbNullPrevout,
             VerdictReason::V2InvariantCoinbasePrevoutNotNull => {
                 ReasonCode::V2InvariantCoinbasePrevoutNotNull
@@ -1303,9 +1313,11 @@ mod tests {
         // ADR-003 Phase 2 adds 4 v2_invariant_mempool_* codes, taking the total to 95.
         // PB-20 adds v2_invariant_coinbase_prevout_not_null, a 19th Phase 1
         // invariant that widens ADR-002's ratified table, taking it to 96.
+        // PB-21 adds v2_invariant_coinbase_value_exceeds_max, a 20th, taking
+        // it to 97.
         assert_eq!(
             ReasonCode::ALL.len(),
-            96,
+            97,
             "ReasonCode::ALL length mismatch: did you add a variant?"
         );
     }
