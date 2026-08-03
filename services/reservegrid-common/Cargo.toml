@@ -17,6 +17,25 @@ subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v7"] }
 prometheus-client = { workspace = true }
+# PB-32. Only `crypto_provider` uses this, and only under the
+# `rustls-provider` feature. `default-features = false` is deliberate:
+# rustls' defaults add `logging` and `prefer-post-quantum`, neither of
+# which any consumer resolves today, and `prefer-post-quantum` reorders
+# the offered key exchange groups. This asks for the provider and
+# nothing else. Not a new crate in the build: the same rustls 0.23
+# already resolves for all three callers.
+rustls = { version = "0.23", default-features = false, features = [
+  "aws_lc_rs",
+  "std",
+], optional = true }
+
+[features]
+# This exists because pool-verifier, sv2-gateway and rg-feed-adapter all
+# need `crypto_provider::install_default`, and because rg-auth,
+# template-manager and reservegrid-gateway link this crate and must not
+# get a rustls provider edge they did not ask for. See the module doc
+# comment in src/crypto_provider.rs for why that second half matters.
+rustls-provider = ["dep:rustls"]
 
 [lints]
 workspace = true

@@ -6,9 +6,13 @@
 //! - Configuration schema and validation
 //! - Redacted wrapper for secret-bearing values
 //! - Shared error response types
+//! - Process-level rustls `CryptoProvider` installation, behind the
+//!   opt-in `rustls-provider` feature (`crypto_provider`)
 
 pub mod config;
 pub mod config_io;
+#[cfg(feature = "rustls-provider")]
+pub mod crypto_provider;
 pub mod error;
 pub mod metrics;
 pub mod mode;

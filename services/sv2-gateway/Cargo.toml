@@ -11,7 +11,9 @@ workspace = true
 [dependencies]
 # Internal crates
 rg-protocol = { path = "../rg-protocol" }
-reservegrid-common = { path = "../reservegrid-common" }
+reservegrid-common = { path = "../reservegrid-common", features = [
+  "rustls-provider",
+] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

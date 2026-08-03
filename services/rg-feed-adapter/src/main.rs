@@ -107,6 +107,33 @@ async fn main() {
         subscriber.init();
     }
 
+    // Ahead of the feed reader task, because `connect_async` builds a
+    // rustls `ClientConfig` the moment the feed URL is `wss://`, which
+    // both shipped configs are (PB-32). `tokio-tungstenite`'s
+    // `rustls-tls-webpki-roots` resolved rustls with no provider feature
+    // at all, so that builder panicked and took the feed task with it.
+    //
+    // What repaired that is the `reservegrid-common/rustls-provider`
+    // edge in Cargo.toml: with `aws-lc-rs` resolving and `ring` not,
+    // rustls' own lazy auto-selection would now find exactly one
+    // candidate. Removing this call alone leaves the test in
+    // `tests/feed_tls_handshake.rs` green, and that was measured, not
+    // assumed. The call stays because "exactly one provider feature
+    // resolves transitively" is the assumption that broke three times
+    // (PB-28, PB-30, PB-32): one `reqwest` anywhere in this crate's
+    // graph adds `ring` and the count goes to two. Pinning the choice
+    // here makes that a no-op instead of a fresh panic, and makes a
+    // provider that cannot install a startup error rather than a panic
+    // in a spawned task that leaves the process up serving `/health`
+    // with `feed_connected: false` and never retrying.
+    //
+    // Shared with `pool-verifier` and `sv2-gateway`; see
+    // `reservegrid_common::crypto_provider`.
+    if let Err(e) = reservegrid_common::crypto_provider::install_default() {
+        error!(error = %e, "failed to install the rustls CryptoProvider");
+        std::process::exit(1);
+    }
+
     let cli = Cli::parse();
     let cfg = match AdapterConfig::load(&cli.config) {
         Ok(c) => c,
