@@ -224,6 +224,35 @@ enum BoundedLine {
     OverLimit,
 }
 
+/// Longest prefix of a rejected line that reaches the log.
+///
+/// A malformed line is bounded by `MAX_INTERNAL_LINE_BYTES` but that
+/// bound is 20 MiB, and the three-strike counter lets a peer spend
+/// three of them before the connection drops. Logging the line whole
+/// would hand a hostile verifier 60 MiB of log write amplification per
+/// connection off 60 MiB of send, which is the same asymmetry PB-23
+/// closed on the read side. PB-19 widened this 20x when it raised the
+/// line budget from 1 MiB for `raw_block_hex`.
+const LOG_SAMPLE_BYTES: usize = 512;
+
+/// Bound a line before it reaches a log field, on a char boundary so
+/// the output stays valid UTF-8, marking any truncation so a reader
+/// never mistakes a sample for the whole message.
+fn log_sample(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.len() <= LOG_SAMPLE_BYTES {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut end = LOG_SAMPLE_BYTES;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{} (truncated, {} bytes total)",
+        &line[..end],
+        line.len()
+    ))
+}
+
 /// Read one newline-terminated line into `buf`, enforcing `max_bytes`
 /// per line via `AsyncReadExt::take` so a verifier that never sends a
 /// newline can never grow the gateway's line buffer without bound
@@ -316,7 +345,11 @@ where
                                 dispatch_inbound(&msg, verdict_tx, readiness);
                             }
                             Err(e) => {
-                                warn!(error = %e, line = %line_buf.trim(), "malformed verifier message");
+                                warn!(
+                                    error = %e,
+                                    line = %log_sample(line_buf.trim()),
+                                    "malformed verifier message"
+                                );
                                 malformed_count += 1;
                                 if malformed_count >= 3 {
                                     error!("3 malformed lines; disconnecting");
@@ -456,6 +489,56 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, ReadBuf};
+
+    // ── PB-23: log write amplification ──
+
+    #[test]
+    fn log_sample_passes_short_lines_through_untouched() {
+        let line = r#"{"kind":"verdict","id":7}"#;
+        assert_eq!(log_sample(line), line);
+        // Borrowed, so the common path allocates nothing.
+        assert!(matches!(log_sample(line), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn log_sample_caps_a_hostile_line_and_marks_it() {
+        // A malformed line may be up to MAX_INTERNAL_LINE_BYTES, and
+        // three of them land before the connection drops.
+        let line = "x".repeat(MAX_INTERNAL_LINE_BYTES);
+        let out = log_sample(&line);
+        assert!(
+            out.len() < LOG_SAMPLE_BYTES + 64,
+            "20 MiB line reached the log as {} bytes",
+            out.len()
+        );
+        assert!(out.contains("truncated"), "truncation must be visible");
+        assert!(
+            out.contains(&MAX_INTERNAL_LINE_BYTES.to_string()),
+            "the real length must survive into the log"
+        );
+    }
+
+    #[test]
+    fn log_sample_truncates_on_a_char_boundary() {
+        // A naive `&line[..LOG_SAMPLE_BYTES]` panics when the cap
+        // lands mid-codepoint, which an attacker picks deliberately.
+        // 3-byte chars mean 512 is never a boundary.
+        let line = "\u{4e16}".repeat(MAX_INTERNAL_LINE_BYTES / 3);
+        let out = log_sample(&line);
+        assert!(out.contains("truncated"));
+        assert!(out.len() < LOG_SAMPLE_BYTES + 64);
+    }
+
+    #[test]
+    fn log_sample_boundary_is_exact() {
+        let exact = "y".repeat(LOG_SAMPLE_BYTES);
+        assert_eq!(log_sample(&exact), exact, "at the cap, pass through");
+        let over = "y".repeat(LOG_SAMPLE_BYTES + 1);
+        assert!(
+            log_sample(&over).contains("truncated"),
+            "one over, truncate"
+        );
+    }
 
     // ── PB-23 harness ──
 
