@@ -399,10 +399,16 @@ gate "deep: fly.toml keeps a machine warm (warn)" \
 # ── D12. Canonical counts: reason-code stability (R-13/R-155) ───
 gate "deep: reason-code count assertions present" \
   bash -c '
-    grep -q "37" services/rg-protocol/src/lib.rs || { echo "ERROR: VerdictReason count assertion missing"; exit 1; }
-    grep -qE "59|95" services/reservegrid-common/src/reason.rs || { echo "ERROR: reason count assertions missing"; exit 1; }
+    # Anchored on the line that follows the assert_eq! operand, so a bare
+    # "38" anywhere else in the file cannot satisfy the gate (PB-20).
+    grep -A1 "VerdictReason::ALL.len()," services/rg-protocol/src/lib.rs | grep -qE "^ *38, *$" \
+      || { echo "ERROR: VerdictReason::ALL count assertion is not 38"; exit 1; }
+    grep -A1 "GatewayReason::ALL.len()," services/reservegrid-common/src/reason.rs | grep -qE "^ *59, *$" \
+      || { echo "ERROR: GatewayReason::ALL count assertion is not 59"; exit 1; }
+    grep -A1 "ReasonCode::ALL.len()," services/reservegrid-common/src/reason.rs | grep -qE "^ *96, *$" \
+      || { echo "ERROR: ReasonCode::ALL count assertion is not 96"; exit 1; }
     C=$(grep -rhoE "v2_invariant_[a-z0-9_]+" services/rg-protocol/src | sort -u | wc -l | tr -d " ")
-    [ "$C" = "22" ] || { echo "ERROR: rg-protocol v2_invariant_* count drifted: $C (expect 22)"; exit 1; }
+    [ "$C" = "23" ] || { echo "ERROR: rg-protocol v2_invariant_* count drifted: $C (expect 23)"; exit 1; }
   '
 
 # ── D13. Observability: metric names single-suffix (R-177) ──────
