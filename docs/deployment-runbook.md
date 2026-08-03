@@ -217,8 +217,8 @@ Fill in the TODO fields:
 | `vardiff_min_difficulty` | `1` | Floor for retargeting. Prevents vardiff from collapsing into single-share-per-block territory on small miners. |
 | `vardiff_max_difficulty` | `u64::MAX` | Ceiling for retargeting. Only set if the pool imposes a policy limit. |
 | `vardiff_max_adjustment_factor` | `4.0` | Maximum single-step multiplier up or down per retarget. Dampens oscillation under bursty share rates. |
-| `auto_degrade` | `true` | When the verifier heartbeat is lost for longer than `auto_degrade_after_ms`, the gateway flips readiness to degraded and keeps distributing jobs without enforcement. See "Degradation Behavior" further down. |
-| `auto_degrade_after_ms` | `10000` | Heartbeat-loss threshold for degraded mode. Must be at least `verifier.heartbeat_interval_ms` or the gateway will refuse to start. |
+| `auto_degrade` | `true` | When the verifier stops serving verdicts, either by heartbeat loss or by verdict starvation while proposals are outstanding, for longer than `auto_degrade_after_ms`, the gateway flips readiness to degraded and keeps distributing jobs without enforcement. See "Degradation Behavior" further down. |
+| `auto_degrade_after_ms` | `10000` | Threshold for both degrade signals (heartbeat loss and verdict starvation). Must be at least `verifier.heartbeat_interval_ms` or the gateway will refuse to start. |
 
 These keys are TOML-only at v1.1.0. There are no `VELDRA_` env overrides yet. If you need per-instance overrides, use separate TOML files per instance, as shown in the multi-gateway section of this runbook.
 
@@ -1037,8 +1037,12 @@ intervals.
 ### Degradation Behavior in Multi-Gateway
 
 When `auto_degrade = true`, each gateway independently monitors its verifier
-connection and enters degraded mode if the heartbeat is lost for longer than
-`auto_degrade_after_ms`. A degraded gateway still returns 200 from `/readyz`
+and enters degraded mode when either signal crosses `auto_degrade_after_ms`:
+heartbeat loss (dead link), or verdict starvation while proposals are
+outstanding (live link whose verdict service went mute; PB-15/PB-17).
+Heartbeat-loss degrades recover on the next heartbeat ack; starvation
+degrades recover only when a verdict arrives, so a heartbeating-but-mute
+verifier cannot flap the mode. A degraded gateway still returns 200 from `/readyz`
 (with `"status": "degraded"` and `"degraded": true` in the JSON body) because
 miners should stay connected.
 
