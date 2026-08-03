@@ -827,10 +827,10 @@ pub fn format_mempool_tolerance_detail(
 /// txids emitted into the `sample=[…]` field of the
 /// `v2_invariant_mempool_tolerance_exceeded` rejection detail so the
 /// final verdict NDJSON line stays safely under
-/// `rg_protocol::gateway::MAX_INTERNAL_LINE_BYTES` (1 MiB).
+/// `rg_protocol::gateway::MAX_INTERNAL_LINE_BYTES` (20 MiB).
 /// Arithmetic: each txid emits as 64 hex chars plus a 1-byte comma
 /// separator, so 10,000 txids occupy at most 10,000 * 65 = 650,000
-/// bytes (~650 KB) in the `sample=` field, leaving over 350 KB of
+/// bytes (~650 KB) in the `sample=` field, leaving over 19 MiB of
 /// headroom for the rest of the verdict JSON envelope. Deliberately
 /// far above `SAMPLE_UNKNOWN_CAP` (10) so aggregate mode is never
 /// affected and small per-tx lists pass through uncapped.

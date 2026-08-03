@@ -29,9 +29,11 @@ If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak be
   infrastructure but never runs a single tolerance comparison, making the
   false-positive criterion vacuous. Verify at T+0:
   `verifier_shield_skipped_total` must stay at zero while verdicts climb.
-  (Template-manager ships the field from Phase 1b; note that mainnet raw
-  blocks at 1.5 to 8 MB of hex also require the internal line budget,
-  `MAX_INTERNAL_LINE_BYTES`, to be raised protocol-wide first.)
+  (Template-manager ships the field from Phase 1b. Mainnet raw blocks run
+  1.5 to 8 MB of hex; the internal line budget `MAX_INTERNAL_LINE_BYTES` was
+  already raised protocol-wide to 20 MiB in PB-19, so no operator action is
+  needed. Both the verifier ingress and the gateway read side enforce that
+  budget before buffering and drop a peer that exceeds it.)
 - **Metric semantics from the PB-18 build onward:** `phase2_checks_total`
   counts only templates whose evaluation actually reached Class M; templates
   that skip the shield increment nothing (older builds mislabeled them

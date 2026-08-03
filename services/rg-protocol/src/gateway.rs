@@ -114,10 +114,15 @@ pub const DIFF1_TARGET_BE: [u8; 32] = [
 /// `internal_line_too_large`.
 // PB-19 / Phase 1b: sized for `raw_block_hex`. A mainnet block caps at
 // 4,000,000 WU, so at most 4 MB serialized, 8 MB hex-encoded, plus the
-// JSON envelope; 20 MiB leaves better than 2x headroom. The gateway
-// `verifier_stream` read side enforces this constant per line; the
-// verifier ingress enforces it once PB-18's bounded reads merge (until
-// then its read loop is unbounded, which tolerates any size).
+// JSON envelope; 20 MiB leaves better than 2x headroom.
+//
+// Both sides now enforce this constant *before* buffering, with a
+// `take()` that resets per line: the verifier ingress since PB-18(b),
+// the gateway `verifier_stream` read side since PB-23 (before PB-23 it
+// compared the byte count only after `read_line` had already buffered
+// the whole line, so the bound did not bind). Both sides drop the
+// connection when a peer spends the budget without sending a newline,
+// because a bounded reader cannot resync to the next newline.
 pub const MAX_INTERNAL_LINE_BYTES: usize = 20 * 1024 * 1024; // 20 MiB
 
 /// NDJSON envelope for messages on the gateway-to-verifier TCP stream.
