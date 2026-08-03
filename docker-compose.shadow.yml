@@ -85,8 +85,11 @@ services:
       # cap alone let one address hold every slot; through a published
       # port an external peer arrives as the docker bridge address, so
       # this bounds what any one outside source can take. Container
-      # peers each have their own address and are unaffected.
-      VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP: "${VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP:-8}"
+      # peers each have their own address and are unaffected. PB-31
+      # raised the default from 8 to 20 so a NATed deployment at the
+      # documented single-digit stream ceiling is not refused while a
+      # silently dead socket still holds its slot.
+      VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP: "${VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP:-20}"
       # PB-27 no-progress budget, pinned at the shipped default. A peer
       # that connects and never speaks now loses its slot after this
       # many seconds instead of holding it for the process lifetime.

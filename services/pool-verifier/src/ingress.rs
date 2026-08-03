@@ -170,15 +170,48 @@ pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
 ///
 /// The PB-26 cap is global, so one address could take every slot: the
 /// reported probe locked out a legitimate peer with eight sockets from
-/// one source. A quarter of the shipped global cap forces an attacker
-/// onto at least four distinct addresses to saturate the ingress,
-/// while staying well clear of any legitimate single-host population.
-/// The largest realistic one is a NAT or L4 proxy fronting an HA pair:
-/// two persistent gateway streams plus two in-flight template-manager
-/// connections is four, and 8 is double that. Compose stacks put every
-/// service on its own container address, so in-cluster peers are one
-/// per IP and only host-published traffic collapses onto the bridge
-/// address, which is the attacker's path and the one this bounds.
+/// one source. This bounds that. The size comes from the largest
+/// legitimate single-address population, which is a NAT or L4 proxy
+/// collapsing a deployment's whole egress onto one address:
+///
+/// ```text
+/// per_ip >= 2G + M + 1
+/// ```
+///
+/// `G` is gateway streams, and each costs two slots rather than one for
+/// as long as a death takes to clear. A silently dead socket holds its
+/// slot for the full idle budget: measured at 60.08 s against the 60 s
+/// default below, and confirmed parametrically, with a 5 s budget
+/// holding 5.10 s and a 15 s budget holding 15.05 s. A gateway
+/// reconnects in 2 to 3 s, so for the ~58 s in between one egress
+/// address carries two slots per gateway. TCP keepalive cannot shorten
+/// that window: the ladder set below is 30 s idle plus eight 10 s
+/// probes, which fires at 110 s on macOS and 120 s on Linux, both past
+/// the budget, so it can never be what reclaims the slot first.
+///
+/// `M` is 1. A concurrent template-manager costs exactly one slot even
+/// though it opens a fresh connection per template: measured peak
+/// `verifier_connections_active` of 1 across twenty back-to-back
+/// cycles. The trailing `+ 1` is an operator's diagnostic connection.
+///
+/// `G` is 8, the top of the single-digit gateway and template-manager
+/// population `docker-compose.yml` documents as supported. That gives
+/// 18, rounded to 20. PB-31 raised it from 8, which had been derived
+/// from an HA pair at `G = 2` and so contradicted that documented
+/// ceiling: at `G = 2` the number was right, but the supported topology
+/// is single digits, and 8 broke at 7 gateways on one silent death, 6
+/// with concurrent manager traffic, and 4 if they died together.
+/// Refusing a real gateway is not a safe failure. It drives the
+/// gateway's `auto_degrade` (default true), which suspends enforcement.
+///
+/// The cost of the raise is that 20 out of the 32-slot global cap lets
+/// two addresses saturate the ingress where 8 needed four. That is
+/// accepted because the per-IP ceiling was never what stops a squatter:
+/// an attacker never needed a dead socket, only a quiet one, and the
+/// idle budget below is what bounds those. Compose stacks also put
+/// every service on its own container address, so in-cluster peers stay
+/// one per IP and only host-published traffic collapses onto the bridge
+/// address.
 ///
 /// `0` stays supported, matching `sv2-gateway`, `rg-feed-server` and
 /// `rg-demo-feed`, because a deployment whose every legitimate peer
@@ -187,7 +220,7 @@ pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
 /// switch. `docker-compose.yml` raises it to 256 instead, because
 /// `scripts/benchmark-release.sh` scenario 6 opens 100 connections
 /// from one host.
-pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS_PER_IP: u32 = 8;
+pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS_PER_IP: u32 = 20;
 
 /// Default no-progress budget for one ingress connection (PB-27), used
 /// when `VELDRA_VERIFIER_IDLE_TIMEOUT_SECS` is unset.
