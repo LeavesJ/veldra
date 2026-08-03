@@ -400,15 +400,16 @@ gate "deep: fly.toml keeps a machine warm (warn)" \
 gate "deep: reason-code count assertions present" \
   bash -c '
     # Anchored on the line that follows the assert_eq! operand, so a bare
-    # "38" anywhere else in the file cannot satisfy the gate (PB-20).
-    grep -A1 "VerdictReason::ALL.len()," services/rg-protocol/src/lib.rs | grep -qE "^ *38, *$" \
-      || { echo "ERROR: VerdictReason::ALL count assertion is not 38"; exit 1; }
+    # "39" anywhere else in the file cannot satisfy the gate (PB-20).
+    # Counts last moved with PB-21, v2_invariant_coinbase_value_exceeds_max.
+    grep -A1 "VerdictReason::ALL.len()," services/rg-protocol/src/lib.rs | grep -qE "^ *39, *$" \
+      || { echo "ERROR: VerdictReason::ALL count assertion is not 39"; exit 1; }
     grep -A1 "GatewayReason::ALL.len()," services/reservegrid-common/src/reason.rs | grep -qE "^ *59, *$" \
       || { echo "ERROR: GatewayReason::ALL count assertion is not 59"; exit 1; }
-    grep -A1 "ReasonCode::ALL.len()," services/reservegrid-common/src/reason.rs | grep -qE "^ *96, *$" \
-      || { echo "ERROR: ReasonCode::ALL count assertion is not 96"; exit 1; }
+    grep -A1 "ReasonCode::ALL.len()," services/reservegrid-common/src/reason.rs | grep -qE "^ *97, *$" \
+      || { echo "ERROR: ReasonCode::ALL count assertion is not 97"; exit 1; }
     C=$(grep -rhoE "v2_invariant_[a-z0-9_]+" services/rg-protocol/src | sort -u | wc -l | tr -d " ")
-    [ "$C" = "23" ] || { echo "ERROR: rg-protocol v2_invariant_* count drifted: $C (expect 23)"; exit 1; }
+    [ "$C" = "24" ] || { echo "ERROR: rg-protocol v2_invariant_* count drifted: $C (expect 24)"; exit 1; }
   '
 
 # ── D13. Observability: metric names single-suffix (R-177) ──────

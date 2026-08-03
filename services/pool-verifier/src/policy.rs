@@ -717,6 +717,9 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
         }
         ConsensusViolation::WeightExceedsMax => VerdictReason::V2InvariantWeightExceedsMax,
         ConsensusViolation::SigopsExceedMax => VerdictReason::V2InvariantSigopsExceedMax,
+        ConsensusViolation::CoinbaseValueExceedsMax => {
+            VerdictReason::V2InvariantCoinbaseValueExceedsMax
+        }
         ConsensusViolation::NonCoinbaseNullPrevout => VerdictReason::V2InvariantNontcbNullPrevout,
         ConsensusViolation::CoinbasePrevoutNotNull => {
             VerdictReason::V2InvariantCoinbasePrevoutNotNull
@@ -767,6 +770,7 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
 ///   - `CoinbaseOutputCount`        coinbase must pay at least one output
 ///   - `WeightExceedsMax`           4,000,000 WU ceiling (BIP-141)
 ///   - `SigopsExceedMax`            80,000 sigop-cost ceiling (BIP-141)
+///   - `CoinbaseValueExceedsMax`    `MAX_MONEY` ceiling on coinbase value (PB-21)
 ///   - `NonCoinbaseNullPrevout`     null prevout outside the coinbase
 ///   - `CoinbasePrevoutNotNull`     `txdata[0]` IS a coinbase (PB-20)
 ///   - `HeaderVersionLow`           header version below the BIP-65 floor
@@ -1114,11 +1118,12 @@ fn check_invariant_shield_inner(
     // table order. No declared field needed; each check reads only
     // the parsed block. First violation wins, matching the Class S
     // and Class D short-circuit discipline above.
-    let tier3_checks: [Tier3Check; 8] = [
+    let tier3_checks: [Tier3Check; 9] = [
         rg_consensus::check_coinbase_script_length,
         rg_consensus::check_coinbase_output_count,
         rg_consensus::check_weight_max,
         rg_consensus::check_sigops_max,
+        rg_consensus::check_coinbase_value_max,
         rg_consensus::check_non_coinbase_null_prevout,
         rg_consensus::check_coinbase_null_prevout,
         rg_consensus::check_header_version,
@@ -2710,6 +2715,159 @@ mod tests {
                 ShieldOutcome::Agreed
             ),
             "PB-20 check must not reject the honest regtest fixture"
+        );
+    }
+
+    // ── PB-21: coinbase value must stay inside MoneyRange ─────────
+    //
+    // The Class D coinbase-value comparison re-derives the total from
+    // `raw_block_hex`, which is attacker controlled, and nothing in
+    // the workspace bounded either an individual output or the sum.
+    // An attacker who declares the same out-of-range number the
+    // outputs add up to matched the re-derivation and reached
+    // `Agreed`.
+
+    /// Same production shape as [`production_shaped_coinbase`] but
+    /// with caller-chosen output values, so a test can put an
+    /// out-of-range or overflowing payout in the coinbase. Every
+    /// other byte is the shipped shape, which keeps the output value
+    /// the only variable. Assembling from parts computes the merkle
+    /// root over the body it builds, so Class S has nothing to catch
+    /// and the template reaches the coinbase-value checks.
+    fn coinbase_with_output_values(values: &[u64]) -> Vec<u8> {
+        assert!(
+            !values.is_empty() && values.len() < 0xFD,
+            "helper emits a single-byte output count varint"
+        );
+        let mut cb = Vec::new();
+        cb.extend_from_slice(&2u32.to_le_bytes()); // tx version
+        cb.push(0x01); // input count
+        cb.extend_from_slice(&[0u8; 32]); // null prevout hash
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // prevout index
+        cb.push(0x0a); // scriptSig len: 2 (BIP-34 push) + 8 (extranonce)
+        cb.extend_from_slice(&[0x01, 0x66]); // BIP-34 push of height 102
+        cb.extend_from_slice(&[0u8; 8]); // zero-filled extranonce
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sequence
+        cb.push(u8::try_from(values.len()).expect("output count fits a byte"));
+        for v in values {
+            cb.extend_from_slice(&v.to_le_bytes()); // payout value
+            cb.push(0x01); // script len
+            cb.push(0x51); // OP_TRUE
+        }
+        cb.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        cb
+    }
+
+    /// An otherwise honest propose carrying a coinbase that pays
+    /// `values`, declaring `declared` as its coinbase value. Passing
+    /// the true sum as `declared` is what makes the Class D
+    /// comparison agree and pushes the question onto the ceiling.
+    fn template_with_coinbase_values(values: &[u64], declared: u64) -> TemplatePropose {
+        let cb = coinbase_with_output_values(values);
+        let parts = rg_consensus::TemplateBlockParts {
+            version: 0x2000_0000,
+            prev_hash: [0x44; 32],
+            time: 1_700_000_000,
+            bits: 0x207f_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[],
+        };
+        let raw = rg_consensus::assemble_template_block(&parts).expect("assembles");
+        TemplatePropose {
+            coinbase_value: declared,
+            // Producer semantics throughout: non-coinbase counts.
+            tx_count: 0,
+            block_height: 102,
+            template_weight: Some(0),
+            total_sigops: Some(0),
+            coinbase_sigops: Some(0),
+            raw_block_hex: Some(hex::encode(raw)),
+            ..base_template()
+        }
+    }
+
+    #[test]
+    fn shield_rejects_pb21_two_output_overflow() {
+        // The PB-21 repro. Two outputs of 0xC000_0000_0000_0000 sum
+        // to 2^64, which the unchecked `.sum()` inside
+        // `re_derive_coinbase_value` could not represent: the
+        // debug/CI profile panicked outright, so a remote peer could
+        // stop the verifier on demand, and the release profile
+        // wrapped to 2^63, which the attacker declares here so the
+        // Class D comparison matches and the shield agrees to a
+        // block paying about 1.8e19 sats.
+        let t = template_with_coinbase_values(
+            &[0xC000_0000_0000_0000, 0xC000_0000_0000_0000],
+            9_223_372_036_854_775_808,
+        );
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbaseValueExceedsMax);
+            }
+            other => panic!(
+                "expected Rejected(V2InvariantCoinbaseValueExceedsMax) on the overflow shape, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn shield_rejects_pb21_single_output_above_max_money() {
+        // No overflow at all: one output of MAX_MONEY + 1, declared
+        // honestly, so Class D re-derives exactly what was declared
+        // and waves it through. Only a MoneyRange ceiling catches it.
+        let t = template_with_coinbase_values(&[2_100_000_000_000_001], 2_100_000_000_000_001);
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbaseValueExceedsMax);
+            }
+            other => panic!(
+                "expected Rejected(V2InvariantCoinbaseValueExceedsMax) on a single out-of-range output, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn shield_rejects_pb21_sum_above_max_money() {
+        // Both outputs are individually inside MoneyRange, so a
+        // per-output check alone would wave this through. Only the
+        // total is out of range.
+        let t = template_with_coinbase_values(
+            &[2_000_000_000_000_000, 200_000_000_000_000],
+            2_200_000_000_000_000,
+        );
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbaseValueExceedsMax);
+            }
+            other => panic!(
+                "expected Rejected(V2InvariantCoinbaseValueExceedsMax) on an out-of-range total, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn shield_still_agrees_on_honest_coinbase_values() {
+        // The honest side. Without this the three tests above would
+        // also pass if the new ceiling rejected everything: a normal
+        // subsidy plus fees, and exactly MAX_MONEY, which Core's
+        // inclusive `MoneyRange` accepts.
+        let subsidy_plus_fees = template_with_coinbase_values(&[3_125_000_000, 141], 3_125_000_141);
+        assert_eq!(
+            check_invariant_shield(&subsidy_plus_fees),
+            ShieldOutcome::Agreed,
+            "a normal subsidy plus fees coinbase must still pass"
+        );
+        let exactly_max_money =
+            template_with_coinbase_values(&[2_100_000_000_000_000], 2_100_000_000_000_000);
+        assert_eq!(
+            check_invariant_shield(&exactly_max_money),
+            ShieldOutcome::Agreed,
+            "MoneyRange is inclusive: exactly MAX_MONEY must still pass"
+        );
+        assert_eq!(
+            check_invariant_shield(&regtest_segwit_template()),
+            ShieldOutcome::Agreed,
+            "PB-21 ceiling must not reject the honest regtest fixture"
         );
     }
 

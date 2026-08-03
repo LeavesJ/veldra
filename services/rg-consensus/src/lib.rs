@@ -101,6 +101,11 @@ pub enum ConsensusViolation {
     /// Block sigops exceed consensus maximum.
     SigopsExceedMax,
 
+    /// A coinbase output value, or the total of them, falls outside
+    /// Bitcoin's `MoneyRange` of 0 through 21,000,000 BTC, or the
+    /// true total does not fit `u64` at all.
+    CoinbaseValueExceedsMax,
+
     /// Non coinbase transaction carries a null prevout.
     NonCoinbaseNullPrevout,
 
@@ -218,6 +223,7 @@ impl ConsensusViolation {
         },
         ConsensusViolation::WeightExceedsMax,
         ConsensusViolation::SigopsExceedMax,
+        ConsensusViolation::CoinbaseValueExceedsMax,
         ConsensusViolation::NonCoinbaseNullPrevout,
         ConsensusViolation::CoinbasePrevoutNotNull,
         ConsensusViolation::HeaderVersionLow,
@@ -232,8 +238,8 @@ impl ConsensusViolation {
         ConsensusViolation::NotImplemented,
     ];
 
-    /// All canonical reason code strings carried by the 23 shield
-    /// violation variants (19 Phase 1 + 4 Phase 2 Class M).
+    /// All canonical reason code strings carried by the 24 shield
+    /// violation variants (20 Phase 1 + 4 Phase 2 Class M).
     /// `NotImplemented` intentionally routes to a separate degraded
     /// sentinel and is not in this list.
     ///
@@ -255,6 +261,7 @@ impl ConsensusViolation {
         "v2_invariant_coinbase_height_mismatch",
         "v2_invariant_weight_exceeds_max",
         "v2_invariant_sigops_exceed_max",
+        "v2_invariant_coinbase_value_exceeds_max",
         "v2_invariant_nontcb_null_prevout",
         "v2_invariant_coinbase_prevout_not_null",
         "v2_invariant_header_version_low",
@@ -306,6 +313,9 @@ impl ConsensusViolation {
             }
             ConsensusViolation::WeightExceedsMax => "v2_invariant_weight_exceeds_max",
             ConsensusViolation::SigopsExceedMax => "v2_invariant_sigops_exceed_max",
+            ConsensusViolation::CoinbaseValueExceedsMax => {
+                "v2_invariant_coinbase_value_exceeds_max"
+            }
             ConsensusViolation::NonCoinbaseNullPrevout => "v2_invariant_nontcb_null_prevout",
             ConsensusViolation::CoinbasePrevoutNotNull => "v2_invariant_coinbase_prevout_not_null",
             ConsensusViolation::HeaderVersionLow => "v2_invariant_header_version_low",
@@ -341,10 +351,26 @@ impl std::error::Error for ConsensusViolation {}
 /// bytes. Callers compare against the declared coinbase value and
 /// emit `v2_invariant_coinbase_value_mismatch` on disagreement.
 ///
+/// The output values are attacker chosen `u64`s off `raw_block_hex`,
+/// so the total is summed with `checked_add` rather than `sum()`
+/// (PB-21). An unchecked `sum()` panicked under the debug and CI
+/// overflow checks, which let a remote peer stop the verifier on
+/// demand, and wrapped under release, which handed the attacker a
+/// small number to declare against a coinbase paying an enormous one.
+///
+/// A total that does not fit `u64` is reported as
+/// [`ConsensusViolation::CoinbaseValueExceedsMax`] rather than as a
+/// decode failure: the bytes decoded fine, and a sum too large for
+/// `u64` is by construction far above `MAX_MONEY`. The `MoneyRange`
+/// ceiling itself belongs to Tier 3 [`check_coinbase_value_max`], so
+/// this function still returns the true total for any block whose
+/// outputs are merely large, and the ceiling decides its fate.
+///
 /// # Errors
 ///
 /// Returns [`ConsensusViolation::DecodeFailed`] if the bytes cannot
-/// be parsed.
+/// be parsed, or [`ConsensusViolation::CoinbaseValueExceedsMax`] if
+/// the coinbase output total does not fit `u64`.
 pub fn re_derive_coinbase_value(raw_block: &[u8]) -> Result<u64, ConsensusViolation> {
     let block: Block = deserialize(raw_block).map_err(|_| ConsensusViolation::DecodeFailed {
         detail: "block_deserialize",
@@ -355,7 +381,11 @@ pub fn re_derive_coinbase_value(raw_block: &[u8]) -> Result<u64, ConsensusViolat
         .ok_or(ConsensusViolation::DecodeFailed {
             detail: "block_has_no_coinbase",
         })?;
-    Ok(coinbase.output.iter().map(|o| o.value.to_sat()).sum())
+    coinbase
+        .output
+        .iter()
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value.to_sat()))
+        .ok_or(ConsensusViolation::CoinbaseValueExceedsMax)
 }
 
 /// Re-derive block weight from the raw block bytes per BIP-141
@@ -806,6 +836,12 @@ const MAX_BLOCK_WEIGHT_WU: u64 = 4_000_000;
 /// Consensus maximum block sigop cost (BIP-141).
 const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
 
+/// Total satoshis that will ever exist: 21,000,000 BTC at 100,000,000
+/// sats each. Bitcoin Core's `MoneyRange(nValue)` is
+/// `0 <= nValue <= MAX_MONEY`, applied per output and again on a
+/// transaction's output total, and this constant is that ceiling.
+const MAX_MONEY_SATS: u64 = 21_000_000 * 100_000_000;
+
 /// BIP-141 scale factor mapping legacy sigops to sigop cost.
 const WITNESS_SCALE_FACTOR: u64 = 4;
 
@@ -911,6 +947,63 @@ pub fn check_sigops_max(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
     let scaled = u64::from(total_sigops(block)).saturating_mul(WITNESS_SCALE_FACTOR);
     if scaled > MAX_BLOCK_SIGOPS_COST {
         return Err(ConsensusViolation::SigopsExceedMax);
+    }
+    Ok(())
+}
+
+/// Verify every coinbase output value, and their total, sit inside
+/// Bitcoin's `MoneyRange` of 0 through `MAX_MONEY` sats (PB-21).
+///
+/// The third member of the Tier 3 ceiling family, beside
+/// [`check_weight_max`] and [`check_sigops_max`], and the one the
+/// ratified table was missing: no bound on coinbase value existed
+/// anywhere in the workspace. `raw_block_hex` is attacker controlled,
+/// so the values are attacker chosen `u64`s, and the Class D
+/// coinbase-value comparison only asks whether the declaration
+/// matches the block. An attacker who declares the same out-of-range
+/// number his outputs add up to satisfies that comparison exactly.
+///
+/// Both halves of Core's `MoneyRange` discipline are enforced,
+/// because they catch different shapes. A single output above
+/// `MAX_MONEY` needs the per-output test, since one output alone
+/// overflows nothing. A total above `MAX_MONEY` needs the sum test,
+/// since each output can be individually legal.
+///
+/// The running total uses `checked_add` and treats overflow as the
+/// same violation rather than saturating. Given the per-output bound
+/// checked first, reaching that branch would take more than 2^12
+/// outputs of `MAX_MONEY` and no block can hold them, but a
+/// saturating fallback here would be a silent wrong answer, and this
+/// is exactly the arithmetic PB-21 was.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::CoinbaseValueExceedsMax`] when any
+/// coinbase output exceeds `MAX_MONEY`, when their total does, or
+/// when that total does not fit `u64`. A block with no coinbase
+/// yields [`ConsensusViolation::DecodeFailed`], matching its Tier 3
+/// siblings [`check_coinbase_script_length`] and
+/// [`check_coinbase_output_count`].
+pub fn check_coinbase_value_max(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    let coinbase = block
+        .0
+        .txdata
+        .first()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "block_has_no_coinbase",
+        })?;
+    let mut total: u64 = 0;
+    for output in &coinbase.output {
+        let value = output.value.to_sat();
+        if value > MAX_MONEY_SATS {
+            return Err(ConsensusViolation::CoinbaseValueExceedsMax);
+        }
+        total = total
+            .checked_add(value)
+            .ok_or(ConsensusViolation::CoinbaseValueExceedsMax)?;
+    }
+    if total > MAX_MONEY_SATS {
+        return Err(ConsensusViolation::CoinbaseValueExceedsMax);
     }
     Ok(())
 }
@@ -1226,28 +1319,29 @@ fn decode_bip34_height(script: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// The 23 shield variants (19 Phase 1 plus 4 Phase 2 Class M)
+    /// The 24 shield variants (20 Phase 1 plus 4 Phase 2 Class M)
     /// must each map to a distinct canonical code listed in
-    /// `ALL_CODES`, and `ALL_CODES` must have length 23.
+    /// `ALL_CODES`, and `ALL_CODES` must have length 24.
     ///
     /// Phase 1 went from 18 to 19 with PB-20's
-    /// `v2_invariant_coinbase_prevout_not_null`, which widens ADR-002's
-    /// ratified table rather than completing it.
+    /// `v2_invariant_coinbase_prevout_not_null`, and from 19 to 20
+    /// with PB-21's `v2_invariant_coinbase_value_exceeds_max`. Both
+    /// widen ADR-002's ratified table rather than completing it.
     #[test]
-    fn all_codes_has_twenty_three_invariant_entries() {
+    fn all_codes_has_twenty_four_invariant_entries() {
         assert_eq!(
             ConsensusViolation::ALL_CODES.len(),
-            23,
+            24,
             "ALL_CODES length must match ADR-002 Phase 1 + ADR-003 Phase 2 check set"
         );
     }
 
     #[test]
-    fn all_has_twenty_four_entries_scaffold_plus_shield() {
-        // 23 shield variants plus NotImplemented sentinel.
+    fn all_has_twenty_five_entries_scaffold_plus_shield() {
+        // 24 shield variants plus NotImplemented sentinel.
         assert_eq!(
             ConsensusViolation::ALL.len(),
-            24,
+            25,
             "ALL length drift: did you add a variant?"
         );
     }
@@ -2263,6 +2357,113 @@ mod tests {
             vout: 0xFFFF_FFFE,
         };
         assert!(!wrong_index.is_null());
+    }
+
+    // ── PB-21: coinbase value must stay inside MoneyRange ─────────
+    // `raw_block_hex` is attacker controlled, so the coinbase output
+    // values are attacker chosen u64s. Nothing bounded them and
+    // nothing bounded their sum.
+
+    /// Helper: serialize a block whose coinbase pays exactly the
+    /// given output values to `OP_TRUE`. Genesis supplies every other
+    /// byte, so the output values are the only thing under test.
+    fn block_with_coinbase_output_values(values: &[u64]) -> Vec<u8> {
+        use bitcoin::consensus::serialize;
+        let mut b = genesis_block_mut();
+        b.txdata[0].output = values
+            .iter()
+            .map(|v| bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(*v),
+                script_pubkey: bitcoin::ScriptBuf::from(vec![0x51u8]),
+            })
+            .collect();
+        serialize(&b)
+    }
+
+    #[test]
+    fn re_derive_coinbase_value_rejects_pb21_two_output_overflow() {
+        // The PB-21 repro. Two outputs of 0xC000_0000_0000_0000 sum
+        // to 2^63 + 2^63, which does not fit u64. The unchecked
+        // `.sum()` this replaced panicked under the debug/CI overflow
+        // checks and wrapped to 2^63 under release, and a wrapped
+        // value an attacker can also declare re-derives as a match.
+        let raw =
+            block_with_coinbase_output_values(&[0xC000_0000_0000_0000, 0xC000_0000_0000_0000]);
+        assert_eq!(
+            re_derive_coinbase_value(&raw),
+            Err(ConsensusViolation::CoinbaseValueExceedsMax),
+            "a coinbase whose output sum does not fit u64 must not re-derive to a value"
+        );
+    }
+
+    #[test]
+    fn re_derive_coinbase_value_rejects_u64_max_pair() {
+        // Wrapping is not the only bad shape: u64::MAX plus 1 also
+        // overflows, and saturating instead of failing would hand the
+        // attacker u64::MAX to declare.
+        let raw = block_with_coinbase_output_values(&[u64::MAX, 1]);
+        assert_eq!(
+            re_derive_coinbase_value(&raw),
+            Err(ConsensusViolation::CoinbaseValueExceedsMax),
+            "u64::MAX + 1 sats must not re-derive to a value"
+        );
+    }
+
+    #[test]
+    fn genesis_and_subsidy_shapes_still_re_derive() {
+        // The honest side. If the guard above rejected everything,
+        // the two tests before it would pass for the wrong reason.
+        assert_eq!(
+            re_derive_coinbase_value(&genesis_bytes()).expect("genesis re-derives"),
+            50 * 100_000_000
+        );
+        let subsidy_plus_fees = block_with_coinbase_output_values(&[3_125_000_000, 141]);
+        assert_eq!(
+            re_derive_coinbase_value(&subsidy_plus_fees).expect("subsidy + fees re-derives"),
+            3_125_000_141
+        );
+    }
+
+    #[test]
+    fn coinbase_value_max_rejects_single_output_above_max_money() {
+        // MoneyRange is per output as well as on the sum: one output
+        // of MAX_MONEY + 1 is out of range without the sum
+        // overflowing anything.
+        let raw = block_with_coinbase_output_values(&[2_100_000_000_000_001]);
+        let block = parse_block(&raw).expect("block parses");
+        assert_eq!(
+            check_coinbase_value_max(&block),
+            Err(ConsensusViolation::CoinbaseValueExceedsMax),
+            "a single coinbase output above MAX_MONEY must be a violation"
+        );
+    }
+
+    #[test]
+    fn coinbase_value_max_rejects_sum_above_max_money() {
+        // Both outputs are individually inside MoneyRange. Only the
+        // total is out of range, which is the case a per-output check
+        // alone would wave through.
+        let raw = block_with_coinbase_output_values(&[2_000_000_000_000_000, 200_000_000_000_000]);
+        let block = parse_block(&raw).expect("block parses");
+        assert_eq!(
+            check_coinbase_value_max(&block),
+            Err(ConsensusViolation::CoinbaseValueExceedsMax),
+            "a coinbase whose outputs total above MAX_MONEY must be a violation"
+        );
+    }
+
+    #[test]
+    fn coinbase_value_max_accepts_honest_shapes() {
+        // Genesis, a post-halving subsidy plus fees, and exactly
+        // MAX_MONEY (Core's MoneyRange is inclusive) must all pass.
+        for raw in [
+            genesis_bytes(),
+            block_with_coinbase_output_values(&[3_125_000_000, 141]),
+            block_with_coinbase_output_values(&[2_100_000_000_000_000]),
+        ] {
+            let block = parse_block(&raw).expect("block parses");
+            check_coinbase_value_max(&block).expect("honest coinbase value is inside MoneyRange");
+        }
     }
 
     #[test]

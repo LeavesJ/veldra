@@ -142,7 +142,7 @@ pub enum VerdictReason {
     /// `coinbase_sigops` outside expected range (observe only in 0.2.2)
     CoinbaseSigopsAbnormal,
 
-    // ── v2.0 Invariant Shield (ADR-002 Phase 1, 19 codes) ──
+    // ── v2.0 Invariant Shield (ADR-002 Phase 1, 20 codes) ──
     //
     // Each variant below mirrors a `ConsensusViolation` variant in the
     // `rg-consensus` facade crate. Canonical `snake_case` strings are
@@ -209,6 +209,12 @@ pub enum VerdictReason {
     V2InvariantSigopsExceedMax,
 
     /// Non coinbase transaction carries a null prevout.
+    /// A coinbase output value, or their total, falls outside
+    /// Bitcoin's `MoneyRange`, or the total does not fit `u64`
+    /// (PB-21).
+    #[serde(rename = "v2_invariant_coinbase_value_exceeds_max")]
+    V2InvariantCoinbaseValueExceedsMax,
+
     #[serde(rename = "v2_invariant_nontcb_null_prevout")]
     V2InvariantNontcbNullPrevout,
 
@@ -287,6 +293,7 @@ impl VerdictReason {
         VerdictReason::V2InvariantCoinbaseHeightMismatch,
         VerdictReason::V2InvariantWeightExceedsMax,
         VerdictReason::V2InvariantSigopsExceedMax,
+        VerdictReason::V2InvariantCoinbaseValueExceedsMax,
         VerdictReason::V2InvariantNontcbNullPrevout,
         VerdictReason::V2InvariantCoinbasePrevoutNotNull,
         VerdictReason::V2InvariantHeaderVersionLow,
@@ -332,6 +339,7 @@ impl VerdictReason {
         "v2_invariant_coinbase_height_mismatch",
         "v2_invariant_weight_exceeds_max",
         "v2_invariant_sigops_exceed_max",
+        "v2_invariant_coinbase_value_exceeds_max",
         "v2_invariant_nontcb_null_prevout",
         "v2_invariant_coinbase_prevout_not_null",
         "v2_invariant_header_version_low",
@@ -398,6 +406,9 @@ impl VerdictReason {
             }
             VerdictReason::V2InvariantWeightExceedsMax => "v2_invariant_weight_exceeds_max",
             VerdictReason::V2InvariantSigopsExceedMax => "v2_invariant_sigops_exceed_max",
+            VerdictReason::V2InvariantCoinbaseValueExceedsMax => {
+                "v2_invariant_coinbase_value_exceeds_max"
+            }
             VerdictReason::V2InvariantNontcbNullPrevout => "v2_invariant_nontcb_null_prevout",
             VerdictReason::V2InvariantCoinbasePrevoutNotNull => {
                 "v2_invariant_coinbase_prevout_not_null"
@@ -467,12 +478,13 @@ mod tests {
     fn all_constant_covers_every_variant() {
         // If a variant is added to the enum but not to ALL, this count will
         // mismatch and the serde round-trip test below will not cover it.
-        // 15 original (v1.x) + 19 v2.0 Invariant Shield (ADR-002,
-        // 18 ratified plus PB-20's coinbase_prevout_not_null)
-        // + 4 mempool ground truth (ADR-003 Phase 2) = 38.
+        // 15 original (v1.x) + 20 v2.0 Invariant Shield (ADR-002,
+        // 18 ratified plus PB-20's coinbase_prevout_not_null and
+        // PB-21's coinbase_value_exceeds_max)
+        // + 4 mempool ground truth (ADR-003 Phase 2) = 39.
         assert_eq!(
             VerdictReason::ALL.len(),
-            38,
+            39,
             "VerdictReason::ALL length mismatch — did you add a variant?"
         );
     }
