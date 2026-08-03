@@ -56,6 +56,22 @@ struct Cli {
         default_value = "config/verifier.toml"
     )]
     config_file: String,
+
+    /// Maximum concurrent NDJSON ingress connections (PB-26). Raise it
+    /// when a deployment genuinely runs more gateway and
+    /// template-manager streams than the default allows; each admitted
+    /// connection can hold a line buffer up to
+    /// `MAX_INTERNAL_LINE_BYTES` (20 MiB), so this is the ingress
+    /// memory bound as much as a connection count. Zero is rejected:
+    /// a cap of zero would refuse every gateway and hand the pool
+    /// straight to `auto_degrade`.
+    #[arg(
+        long,
+        env = "VELDRA_VERIFIER_MAX_CONNECTIONS",
+        default_value_t = ingress::DEFAULT_MAX_INGRESS_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    max_connections: u32,
 }
 
 // ── Tracing ─────────────────────────────────────────────────
@@ -196,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
     let tcp_addr = cli.tcp_addr;
     let http_addr = cli.http_addr;
     let policy_path = cli.policy_file;
+    let max_connections = cli.max_connections;
 
     // Prefer VELDRA_MODE; fall back to deprecated VELDRA_DASH_MODE for backward
     // compat with existing docker-compose files. Emit a warning so operators
@@ -282,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
             tcp_log_counter,
             tcp_tls_acceptor,
             tcp_metrics,
+            max_connections,
         )
         .await
         {

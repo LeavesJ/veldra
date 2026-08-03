@@ -44,6 +44,11 @@ services:
       VELDRA_VERIFIER_CONFIG: /devconfig/verifier.toml
       VELDRA_MODE: "${VELDRA_MODE:-observe}"
       VELDRA_BITCOIND_RPC_PASS: "${VELDRA_BITCOIND_RPC_PASS}"
+      # PB-26 ingress connection cap, pinned at the shipped default.
+      # This is the Class M soak node: the ingress binds 127.0.0.1 only
+      # (network_mode: host), and the legitimate population is one
+      # template-manager plus one sv2-gateway stream.
+      VELDRA_VERIFIER_MAX_CONNECTIONS: "${VELDRA_VERIFIER_MAX_CONNECTIONS:-32}"
     volumes:
       - ./deploy:/config:rw
       - ./config:/devconfig:ro

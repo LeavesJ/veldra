@@ -74,6 +74,13 @@ services:
       VELDRA_POLICY_FILE: /config/policy.toml
       VELDRA_VERIFIER_CONFIG: /config/verifier.toml
       VELDRA_MODE: shadow
+      # PB-26 ingress connection cap, pinned at the shipped default.
+      # This stack publishes 9090 on the host (see ports below) and the
+      # ingress takes unauthenticated peers, so the cap is the bound on
+      # how much line buffer a reachable peer can make the verifier
+      # hold. Only two legitimate streams connect here: template-manager
+      # and sv2-gateway.
+      VELDRA_VERIFIER_MAX_CONNECTIONS: "${VELDRA_VERIFIER_MAX_CONNECTIONS:-32}"
     volumes:
       - ./config:/config:rw
       # Verdict log lives at /data/verdicts.log inside the container

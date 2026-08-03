@@ -42,8 +42,9 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 # Phase 2 #3 integration tests (`tests/phase2_eval.rs`,
-# `tests/phase2_tcp.rs`). Integration tests are separate crates and
-# cannot reach the package's regular `[dependencies]` directly, so
+# `tests/phase2_tcp.rs`) and the PB-26 ingress cap regression
+# (`tests/ingress_conn_cap.rs`). Integration tests are separate crates
+# and cannot reach the package's regular `[dependencies]` directly, so
 # the same crates need to be re-listed here for the test binaries.
 rg-protocol = { path = "../rg-protocol" }
 rg-consensus = { path = "../rg-consensus" }
@@ -52,6 +53,10 @@ axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+# Not a new workspace dependency: the same reqwest already builds for
+# this crate above. `ingress_conn_cap.rs` scrapes the public /metrics
+# endpoint to assert the PB-26 refusal is observable.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [lints]
 workspace = true

@@ -89,6 +89,13 @@ services:
       VELDRA_API_SECRET_OPTIONAL: "${VELDRA_API_SECRET_OPTIONAL:-1}"
       VELDRA_POLICY_FILE: /config/policy.toml
       VELDRA_VERIFIER_CONFIG: /config/verifier.toml
+      # PB-26 ingress connection cap. Raised well above the shipped
+      # default of 32 because this is the stack scripts/benchmark-release.sh
+      # drives, and its scenario 6 opens 100 concurrent rg-load-test
+      # connections. A production pool runs single-digit gateway and
+      # template-manager streams and must NOT copy this value: each
+      # admitted connection can hold a 20 MiB line buffer.
+      VELDRA_VERIFIER_MAX_CONNECTIONS: "${VELDRA_VERIFIER_MAX_CONNECTIONS:-256}"
     volumes:
       - ./config:/config:rw
     ports:

@@ -67,6 +67,16 @@ pub(crate) struct VerifierMetrics {
     /// view. Healthy mainnet typically sits in the 30k-80k range;
     /// regtest and shadow-mode synthetic feeds report near zero.
     pub(crate) mempool_view_size: Gauge<i64, AtomicI64>,
+
+    /// PB-26. Inbound NDJSON ingress connections refused because the
+    /// concurrent connection cap (`VELDRA_VERIFIER_MAX_CONNECTIONS`)
+    /// was already saturated. A healthy pool never ticks this: the
+    /// legitimate population is one persistent stream per gateway and
+    /// per template-manager. A nonzero rate means either the cap is
+    /// set below the deployment's real service count, or an
+    /// unauthenticated peer is holding slots, and both need an
+    /// operator.
+    pub(crate) connections_refused_total: Counter,
 }
 
 impl VerifierMetrics {
@@ -80,6 +90,7 @@ impl VerifierMetrics {
             phase2_checks_total: Family::default(),
             mempool_view_age_seconds: Gauge::default(),
             mempool_view_size: Gauge::default(),
+            connections_refused_total: Counter::default(),
         };
         registry.register(
             "verifier_verdicts",
@@ -126,6 +137,12 @@ impl VerifierMetrics {
             "Number of distinct txids in the verifier's mempool view",
             m.mempool_view_size.clone(),
         );
+        registry.register(
+            "verifier_connections_refused",
+            "NDJSON ingress connections refused because the concurrent connection cap \
+             (VELDRA_VERIFIER_MAX_CONNECTIONS) was saturated",
+            m.connections_refused_total.clone(),
+        );
         m
     }
 }
@@ -163,6 +180,7 @@ mod tests {
         m.templates_evaluated_total.inc();
         m.shield_skipped_total.inc();
         m.phase2_degraded_total.inc();
+        m.connections_refused_total.inc();
         m.verdicts_total
             .get_or_create(&VerdictLabels {
                 accepted: "true".to_string(),
@@ -190,6 +208,7 @@ mod tests {
             "verifier_shield_skipped_total",
             "verifier_phase2_degraded_total",
             "verifier_phase2_checks_total",
+            "verifier_connections_refused_total",
         ] {
             assert!(body.contains(name), "missing exported counter `{name}`");
             let doubled = format!("{name}_total");
