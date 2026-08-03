@@ -5,9 +5,13 @@
 //! resulting `HashSet<Txid>` to the shield. Implements the D3
 //! fail-stale state machine: serves the last known view up to
 //! `max_stale_secs` after a refresh failure, then degrades.
+//!
+//! A successful RPC that returns an empty set is treated as a refresh
+//! failure, not as ground truth: see [`MIN_INSTALLABLE_MEMPOOL_SIZE`].
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
@@ -39,8 +43,31 @@ pub enum MempoolState {
     /// degradation, so it does NOT increment
     /// `verifier_phase2_degraded_total`. Keeping the two distinct
     /// stops boot-time alerts from flapping (PB-13, R-173).
+    ///
+    /// It is still per-template observable: ingress increments
+    /// `verifier_phase2_checks_total{result="unprimed"}` for it
+    /// (`ingress.rs:997`), so a view that never primes is alertable
+    /// without folding the boot window into the degradation counter.
     Unprimed,
 }
+
+/// Minimum size a successful `getrawmempool` response must have before
+/// it is allowed to become the served view.
+///
+/// The floor is one, not a plausibility estimate of mainnet depth. A
+/// positive floor would be a guess about which chain the operator
+/// pointed the verifier at: 30k is right for mainnet and wrong for
+/// signet, regtest, and a node three seconds after a block. Zero is the
+/// only threshold that is objectively wrong on every network for a node
+/// that has finished loading `mempool.dat`, so it is the only one that
+/// can be a shipped default under Invariant 4.
+///
+/// The hazard it closes: an empty-but-successful response installing as
+/// [`MempoolState::Fresh`] makes the Class M check score 100% of a
+/// non-empty template's transactions as unknown, driving every template
+/// to `ToleranceExceeded`. In a launch-gate soak that false-positive
+/// storm is indistinguishable from a real detection.
+pub const MIN_INSTALLABLE_MEMPOOL_SIZE: usize = 1;
 
 /// Snapshot of the verifier's mempool view at a point in time.
 ///
@@ -58,6 +85,18 @@ pub struct MempoolSnapshot {
 /// Owns the polling task and the latest view.
 pub struct MempoolView {
     inner: Arc<RwLock<MempoolViewInner>>,
+    /// Successful `getrawmempool` responses refused because they were
+    /// below [`MIN_INSTALLABLE_MEMPOOL_SIZE`], counted since process
+    /// start. Exported as the `verifier_mempool_empty_responses` gauge
+    /// so an operator can alert on the cause rather than only on the
+    /// downstream `Unprimed` / `Degraded` symptom.
+    ///
+    /// A plain atomic rather than a `prometheus_client::Counter`
+    /// because `VerifierMetrics` is private to the binary crate while
+    /// the polling task lives here in the library. Ingress already
+    /// mirrors this view's `age_secs` and `size` into gauges from a
+    /// single call site (`ingress.rs:946`); this rides the same one.
+    empty_responses: AtomicU64,
 }
 
 struct MempoolViewInner {
@@ -80,7 +119,15 @@ impl MempoolView {
                 max_stale_secs,
                 primed: false,
             })),
+            empty_responses: AtomicU64::new(0),
         }
+    }
+
+    /// Successful `getrawmempool` responses refused for being below
+    /// [`MIN_INSTALLABLE_MEMPOOL_SIZE`], since process start.
+    /// Monotonic; ingress exports it as a gauge.
+    pub fn empty_responses(&self) -> u64 {
+        self.empty_responses.load(Ordering::Relaxed)
     }
 
     /// Read the current view as a snapshot. The returned
@@ -113,9 +160,10 @@ impl MempoolView {
     }
 
     /// Replace the view with a new txid set. Updates the refresh
-    /// timestamp and marks the view as primed.
-    pub async fn install(&self, txids: HashSet<[u8; 32]>) {
-        self.install_at(txids, unix_ms_now()).await;
+    /// timestamp and marks the view as primed. Returns `false` when the
+    /// set was refused; see [`MempoolView::install_at`].
+    pub async fn install(&self, txids: HashSet<[u8; 32]>) -> bool {
+        self.install_at(txids, unix_ms_now()).await
     }
 
     /// Replace the view with a new txid set, attributing the refresh
@@ -125,11 +173,42 @@ impl MempoolView {
     /// to drive the fail-stale state machine deterministically without
     /// waiting on wall-clock time. R-160 friendly: takes a timestamp
     /// rather than a Duration so the test owns the clock model.
-    pub async fn install_at(&self, txids: HashSet<[u8; 32]>, last_refresh_unix_ms: u64) {
+    ///
+    /// A set below [`MIN_INSTALLABLE_MEMPOOL_SIZE`] is **refused**:
+    /// the prior view stays served, its age keeps advancing toward
+    /// `Stale` and then `Degraded`, an unprimed view stays `Unprimed`,
+    /// and `empty_responses` increments. Returns `true` when the set
+    /// was installed and `false` when it was refused, so the polling
+    /// task can log the two apart instead of reporting a refresh that
+    /// did not happen.
+    ///
+    /// This deliberately does not special-case a genuinely empty
+    /// mainnet mempool. If one ever occurs the view ages out to
+    /// `Degraded`, Class M is skipped, and `verifier_phase2_degraded_total`
+    /// climbs: loud, alertable, and in the safe direction. Serving the
+    /// empty set instead would reject every template on the network.
+    pub async fn install_at(&self, txids: HashSet<[u8; 32]>, last_refresh_unix_ms: u64) -> bool {
+        if txids.len() < MIN_INSTALLABLE_MEMPOOL_SIZE {
+            let refusals = self.empty_responses.fetch_add(1, Ordering::Relaxed) + 1;
+            let inner = self.inner.read().await;
+            warn!(
+                size = txids.len(),
+                min_installable = MIN_INSTALLABLE_MEMPOOL_SIZE,
+                empty_responses = refusals,
+                primed = inner.primed,
+                served_size = inner.txids.len(),
+                "getrawmempool succeeded but returned an empty set; refusing to install it as \
+                 the mempool view. A fresh empty view would score every template 100% unknown. \
+                 Check that bitcoind has finished loading mempool.dat and is on the intended \
+                 chain; the served view now ages toward Degraded"
+            );
+            return false;
+        }
         let mut inner = self.inner.write().await;
         inner.txids = Arc::new(txids);
         inner.last_refresh_unix_ms = Some(last_refresh_unix_ms);
         inner.primed = true;
+        true
     }
 
     /// Spawn a tokio task that polls bitcoind every `poll_interval`.
@@ -151,8 +230,12 @@ impl MempoolView {
                     Ok(txids) => {
                         let set: HashSet<[u8; 32]> = txids.into_iter().collect();
                         let size = set.len();
-                        self.install(set).await;
-                        debug!(size, "mempool view refreshed");
+                        // `install` warns on its own when it refuses, so
+                        // this only reports the refresh that did happen
+                        // rather than claiming one that did not.
+                        if self.install(set).await {
+                            debug!(size, "mempool view refreshed");
+                        }
                     }
                     Err(RpcError::Http(e)) if e.is_timeout() => {
                         warn!(error = %e, "mempool refresh timed out; serving last view");
@@ -394,6 +477,33 @@ mod tests {
             }
             other => panic!("expected Stale, got {other:?}"),
         }
+    }
+
+    /// The refusal is reported to the caller, so the polling task can
+    /// tell a refresh from a refusal, and it is counted for the
+    /// `verifier_mempool_empty_responses` gauge.
+    #[tokio::test]
+    async fn empty_install_is_refused_and_counted() {
+        let view = MempoolView::new(60);
+        assert_eq!(view.empty_responses(), 0);
+
+        assert!(
+            !view.install(HashSet::new()).await,
+            "an empty set must report as not installed"
+        );
+        assert_eq!(view.empty_responses(), 1);
+        assert_eq!(view.snapshot().await.state, MempoolState::Unprimed);
+
+        assert!(
+            view.install(HashSet::from([txid(1)])).await,
+            "a non-empty set must install"
+        );
+        assert_eq!(view.snapshot().await.state, MempoolState::Fresh);
+        assert_eq!(
+            view.empty_responses(),
+            1,
+            "a successful install must not touch the refusal count"
+        );
     }
 
     #[test]

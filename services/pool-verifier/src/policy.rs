@@ -215,6 +215,91 @@ pub struct PolicyMempool {
     pub rpc_pass: String,
 }
 
+/// Markers that identify a shipped fill-me-in value rather than a real
+/// setting. `deploy/policy-prod.toml` and `deploy/env.prod.example` use
+/// the `TODO_SET_*` form; the rest are here because an operator copying
+/// a value out of a vendor doc is as likely to leave one of those.
+///
+/// Matched case-insensitively anywhere in the value. A real bitcoind
+/// endpoint containing one of these substrings is not a shape that
+/// occurs; a placeholder that validates is, and it costs a soak.
+const PLACEHOLDER_MARKERS: [&str; 7] = [
+    "TODO",
+    "CHANGEME",
+    "CHANGE_ME",
+    "REPLACE_ME",
+    "REPLACEME",
+    "PLACEHOLDER",
+    "FIXME",
+];
+
+/// Whether `value` is missing or still carries a fill-me-in marker.
+///
+/// Empty counts: a key that is present but blank and a key that still
+/// says `TODO_SET_...` fail the operator the same way, and both must
+/// reach the same boot gate.
+pub fn is_placeholder_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.starts_with('<') {
+        // `<NODE_HOST>` / `<your-node>` style fills.
+        return true;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    PLACEHOLDER_MARKERS
+        .iter()
+        .any(|marker| upper.contains(marker))
+}
+
+impl PolicyMempool {
+    /// Boot gate for the Class M check: with `enforce = true`, refuse
+    /// to start on credentials that are missing or still placeholder
+    /// shaped. Returns the operator-facing reason on rejection.
+    ///
+    /// `resolved_rpc_pass` is the password after the
+    /// `VELDRA_BITCOIND_RPC_PASS` env var has been preferred over the
+    /// TOML field, so the whole decision is one function rather than
+    /// half here and half at the call site.
+    ///
+    /// This is deliberately **not** part of [`PolicyConfig::validate`].
+    /// `state::safe_initial_policy` swallows a validation failure and
+    /// continues on a permissive built-in policy that accepts every
+    /// template, so routing this through `validate` would turn a
+    /// shipped placeholder from "checks nothing" into "accepts
+    /// everything" — a worse silent degradation, not a loud failure.
+    /// The gate belongs on the boot path, where the only outcome is a
+    /// non-zero exit.
+    pub fn require_usable_credentials(&self, resolved_rpc_pass: &str) -> Result<(), String> {
+        if is_placeholder_value(&self.rpc_url) {
+            return Err(format!(
+                "rpc_url is missing or still a placeholder ({:?})",
+                self.rpc_url
+            ));
+        }
+        if !(self.rpc_url.starts_with("http://") || self.rpc_url.starts_with("https://")) {
+            return Err(format!(
+                "rpc_url must be an http(s) bitcoind JSON-RPC endpoint, got {:?}",
+                self.rpc_url
+            ));
+        }
+        if is_placeholder_value(&self.rpc_user) {
+            return Err(format!(
+                "rpc_user is missing or still a placeholder ({:?})",
+                self.rpc_user
+            ));
+        }
+        if resolved_rpc_pass.trim().is_empty() {
+            return Err(
+                "rpc_pass is empty (set VELDRA_BITCOIND_RPC_PASS, or [policy.mempool] rpc_pass)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for PolicyMempool {
     fn default() -> Self {
         Self {
@@ -3025,5 +3110,53 @@ mod tests {
             Some(VerdictReason::V2InvariantMempoolToleranceExceeded)
         );
         assert_eq!(result.phase2, Phase2Attribution::Rejected);
+    }
+
+    // ── Class M boot gate: shipped placeholder credentials ──────
+
+    /// The bitcoind credential gate, exercised at the shapes an
+    /// operator actually produces.
+    #[test]
+    fn mempool_credentials_gate_rejects_placeholders_and_accepts_real_values() {
+        let mut mp = PolicyMempool {
+            enforce: true,
+            rpc_url: "http://127.0.0.1:8332".to_string(),
+            rpc_user: "veldra".to_string(),
+            ..PolicyMempool::default()
+        };
+        assert!(mp.require_usable_credentials("hunter2").is_ok());
+
+        // The exact string deploy/policy-prod.toml ships.
+        mp.rpc_url = "TODO_SET_MAINNET_BITCOIND_RPC_URL".to_string();
+        let err = mp
+            .require_usable_credentials("hunter2")
+            .expect_err("placeholder rpc_url must be rejected");
+        assert!(err.contains("rpc_url"), "got: {err}");
+
+        // Empty is rejected on the same path, not a different one.
+        mp.rpc_url = String::new();
+        assert!(mp.require_usable_credentials("hunter2").is_err());
+
+        // A runbook-style angle-bracket fill.
+        mp.rpc_url = "<NODE_HOST>".to_string();
+        assert!(mp.require_usable_credentials("hunter2").is_err());
+
+        // Scheme-less host: not reachable as a JSON-RPC endpoint, and
+        // this is the shape a half-edited placeholder leaves behind.
+        mp.rpc_url = "127.0.0.1:8332".to_string();
+        assert!(mp.require_usable_credentials("hunter2").is_err());
+
+        mp.rpc_url = "http://127.0.0.1:8332".to_string();
+        mp.rpc_user = "TODO_SET_BITCOIND_RPC_USER".to_string();
+        let err = mp
+            .require_usable_credentials("hunter2")
+            .expect_err("placeholder rpc_user must be rejected");
+        assert!(err.contains("rpc_user"), "got: {err}");
+
+        mp.rpc_user = "veldra".to_string();
+        let err = mp
+            .require_usable_credentials("   ")
+            .expect_err("blank rpc_pass must be rejected");
+        assert!(err.contains("rpc_pass"), "got: {err}");
     }
 }

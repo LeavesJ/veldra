@@ -944,6 +944,12 @@ pub(crate) async fn handle_tcp_connection<R, W>(
             // it once and evaluate with Class M wired; the same snapshot
             // refreshes the view gauges below. Phase 1 path otherwise.
             let mempool_snap = if let Some(view) = state_clone.mempool_view.as_ref() {
+                // Refused empty polls are view health rather than
+                // per-template attribution, so they ride the same
+                // mirror as the age and size gauges below.
+                metrics
+                    .mempool_empty_responses
+                    .set(i64::try_from(view.empty_responses()).unwrap_or(i64::MAX));
                 Some(view.snapshot().await)
             } else {
                 None

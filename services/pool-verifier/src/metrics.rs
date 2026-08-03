@@ -68,6 +68,25 @@ pub(crate) struct VerifierMetrics {
     /// regtest and shadow-mode synthetic feeds report near zero.
     pub(crate) mempool_view_size: Gauge<i64, AtomicI64>,
 
+    /// Successful `getrawmempool` responses that came back empty and
+    /// were therefore refused as a view (`MIN_INSTALLABLE_MEMPOOL_SIZE`
+    /// in `mempool_view.rs`), counted since process start.
+    ///
+    /// The `Unprimed` and `Degraded` states that follow a run of these
+    /// are the symptom; this is the cause, and it separates "bitcoind
+    /// is unreachable" from "bitcoind answers, with nothing in it",
+    /// which need different operator responses. Nonzero on a mainnet
+    /// node means the RPC endpoint is not the node it is supposed to
+    /// be, or has not finished loading `mempool.dat`.
+    ///
+    /// Monotone but exported as a gauge, not a counter, because the
+    /// value is mirrored from an atomic owned by the library crate's
+    /// polling task at the same ingress call site that already mirrors
+    /// `mempool_view_age_seconds` and `mempool_view_size`. `increase()`
+    /// and `> 0` alert on it exactly as they would on a counter. Not a
+    /// counter, so no `_total` suffix.
+    pub(crate) mempool_empty_responses: Gauge<i64, AtomicI64>,
+
     /// PB-26. Inbound NDJSON ingress connections refused because the
     /// concurrent connection cap (`VELDRA_VERIFIER_MAX_CONNECTIONS`)
     /// was already saturated. A healthy pool never ticks this: the
@@ -121,6 +140,11 @@ pub(crate) struct VerifierMetrics {
 }
 
 impl VerifierMetrics {
+    // A flat declaration list: one construction and one `register` call
+    // per metric, no branching. Splitting it to satisfy a line count
+    // would put half the registry in a helper with one caller and make
+    // "is this metric registered?" a two-file question.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn new_registered(registry: &mut Registry) -> Self {
         let m = Self {
             verdicts_total: Family::default(),
@@ -131,6 +155,7 @@ impl VerifierMetrics {
             phase2_checks_total: Family::default(),
             mempool_view_age_seconds: Gauge::default(),
             mempool_view_size: Gauge::default(),
+            mempool_empty_responses: Gauge::default(),
             connections_refused_total: Counter::default(),
             connections_refused_per_ip_total: Counter::default(),
             connections_reaped_idle_total: Counter::default(),
@@ -181,6 +206,14 @@ impl VerifierMetrics {
             "verifier_mempool_view_size",
             "Number of distinct txids in the verifier's mempool view",
             m.mempool_view_size.clone(),
+        );
+        registry.register(
+            "verifier_mempool_empty_responses",
+            "Successful getrawmempool responses that returned an empty set and were refused \
+             as a mempool view. A fresh empty view would score every template 100% unknown, \
+             so the prior view is kept and ages toward Degraded instead. Nonzero on mainnet \
+             means the RPC endpoint is wrong or bitcoind has not loaded mempool.dat",
+            m.mempool_empty_responses.clone(),
         );
         registry.register(
             "verifier_connections_refused",
@@ -296,6 +329,8 @@ mod tests {
         assert!(body.contains("verifier_mempool_view_age_seconds"));
         assert!(body.contains("verifier_mempool_view_size"));
         assert!(!body.contains("verifier_mempool_view_size_total"));
+        assert!(body.contains("verifier_mempool_empty_responses"));
+        assert!(!body.contains("verifier_mempool_empty_responses_total"));
         assert!(body.contains("verifier_connections_active"));
         assert!(!body.contains("verifier_connections_active_total"));
     }

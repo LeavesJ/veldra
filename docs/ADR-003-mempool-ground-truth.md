@@ -338,10 +338,34 @@ verifier_phase2_degraded_total       counter      bitcoind unavailable beyond fa
 verifier_mempool_view_age_seconds    gauge        seconds since last successful refresh
 verifier_mempool_view_size           gauge        current HashSet<Txid> count
 verifier_phase2_checks_total{result} counter vec  result in {agreed, rejected, skipped, stale, unprimed}
+verifier_mempool_empty_responses     gauge        successful getrawmempool calls refused for being empty
 ```
 
-Four new metrics. Dashboards consume `verifier_mempool_view_age_seconds`
+Five metrics. Dashboards consume `verifier_mempool_view_age_seconds`
 and `verifier_phase2_degraded_total` for operator alerting.
+
+`verifier_mempool_empty_responses` was added after the shipped code
+diverged from the D3 write-up above: a successful `getrawmempool` that
+returns an empty set is treated as a refresh failure, not as ground
+truth. Installing it as `Fresh` would score 100% of every non-empty
+template's transactions as unknown and drive Class M to
+`ToleranceExceeded` on the whole network, which in a launch-gate soak
+is a false-positive storm indistinguishable from a real detection. The
+prior view is kept and ages toward `Degraded` on the normal D3 ladder.
+The floor is one txid, not a plausibility estimate of mainnet depth: a
+positive floor would be a guess about which chain the node is on, while
+zero is wrong on every network for a node that has finished loading
+`mempool.dat`. Monotone, but a gauge rather than a counter because it
+is mirrored from the library crate's polling task at the same ingress
+call site as the two view gauges.
+
+`mempool_rpc_url` and `mempool_rpc_user` are load-bearing when
+`mempool_enforce = true`: the verifier refuses to start on a value that
+is empty, placeholder-shaped (`TODO`, `CHANGEME`, `<HOST>`, ...) or not
+an `http(s)` endpoint, and on an empty resolved password. Warning and
+continuing without a mempool view, which is what the code did first,
+produced a verifier that answered `/health`, climbed `verdicts_total`
+and checked nothing.
 
 ## Action Items
 

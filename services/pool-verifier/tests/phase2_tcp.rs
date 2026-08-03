@@ -374,6 +374,19 @@ struct Booted {
     mock: MockState,
 }
 
+/// A plausible non-empty mempool that contains none of the template's
+/// transactions. This is what the fabrication scenario actually looks
+/// like on a live node: tens of thousands of real txids, none of which
+/// is the one the template invented.
+///
+/// Booting the mock with `vec![]` no longer produces a rejection: an
+/// empty successful `getrawmempool` is refused as a view rather than
+/// installed as Fresh, because a Fresh empty view scores 100% of every
+/// template unknown and turns Class M into a false-positive storm.
+fn decoy_display_hex_txids(count: u8) -> Vec<String> {
+    (1..=count).map(|b| hex::encode([b; 32])).collect()
+}
+
 async fn boot_verifier_with_mock(display_hex_txids: Vec<String>) -> Booted {
     boot_verifier_with_mock_overrides(display_hex_txids, PolicyOverrides::default()).await
 }
@@ -502,8 +515,9 @@ async fn phase2_tcp_happy_path_full_overlap_emits_accept() {
 #[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
 async fn phase2_tcp_fabrication_path_emits_tolerance_exceeded() {
     let (template, _display_hex) = regtest_segwit_template_and_display_hex();
-    // Empty mempool view; template's 1 non-coinbase tx is unknown.
-    let booted = boot_verifier_with_mock(vec![]).await;
+    // Populated mempool view that does not carry the template's 1
+    // non-coinbase tx: 1/1 unknown, above the 4% tolerance.
+    let booted = boot_verifier_with_mock(decoy_display_hex_txids(8)).await;
 
     let verdict = round_trip_template(booted.verifier_port, template).await;
     drop(booted);
@@ -525,13 +539,13 @@ async fn phase2_tcp_fabrication_path_emits_tolerance_exceeded() {
 #[tokio::test]
 #[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
 async fn phase2_tcp_subsequent_template_uses_refreshed_view() {
-    // Boot with empty mempool, replace the txid set, wait for poll,
+    // Boot with a decoy mempool, replace the txid set, wait for poll,
     // assert the next template is accepted. Verifies the polling
     // task installs new snapshots without a process restart.
     let (template, display_hex) = regtest_segwit_template_and_display_hex();
-    let booted = boot_verifier_with_mock(vec![]).await;
+    let booted = boot_verifier_with_mock(decoy_display_hex_txids(8)).await;
 
-    // Confirm initial reject under empty view.
+    // Confirm initial reject under the non-overlapping view.
     let verdict_a = round_trip_template(booted.verifier_port, template.clone()).await;
     assert!(!verdict_a.accepted);
 
@@ -612,6 +626,49 @@ async fn phase2_tcp_kill_the_mock_drives_view_to_degraded() {
     assert!(
         degraded >= 1,
         "expected verifier_phase2_degraded_total >= 1 after kill, got {degraded}\n\
+         --- metrics ---\n{metrics}"
+    );
+}
+
+/// Class M soak hazard, at the wire.
+///
+/// A bitcoind that answers `getrawmempool` with `200 OK []` (still
+/// loading `mempool.dat`, wrong chain, just restarted) must not be
+/// installed as a Fresh view. If it were, every template on the
+/// network would score 100% unknown and reject, and the launch-gate
+/// soak would record a false-positive storm indistinguishable from a
+/// real detection.
+///
+/// The template must therefore ACCEPT (Class M skipped on an unprimed
+/// view, Phase 1 falls through) and `/metrics` must show the refusal.
+#[tokio::test]
+#[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
+async fn phase2_tcp_empty_mempool_response_is_refused_not_served() {
+    let (template, _display_hex) = regtest_segwit_template_and_display_hex();
+    let booted = boot_verifier_with_mock(vec![]).await;
+
+    let verdict = round_trip_template(booted.verifier_port, template).await;
+    assert!(
+        verdict.accepted,
+        "an empty getrawmempool must skip Class M, not reject; reason={:?} detail={:?}",
+        verdict.reason_code, verdict.reason_detail
+    );
+
+    let metrics = fetch_metrics_text(booted.http_port).await;
+    let refused = parse_counter(&metrics, "verifier_mempool_empty_responses");
+    let unprimed = parse_counter(
+        &metrics,
+        "verifier_phase2_checks_total{result=\"unprimed\"}",
+    );
+    drop(booted);
+    assert!(
+        refused >= 1,
+        "expected verifier_mempool_empty_responses >= 1, got {refused}\n\
+         --- metrics ---\n{metrics}"
+    );
+    assert!(
+        unprimed >= 1,
+        "an unprimed view must stay observable per template, got {unprimed}\n\
          --- metrics ---\n{metrics}"
     );
 }
