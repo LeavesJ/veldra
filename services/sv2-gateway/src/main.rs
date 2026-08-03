@@ -2211,10 +2211,12 @@ fn build_template_propose(
         coinbase_sigops: template.coinbase_sigops,
         template_weight: template.template_weight,
         gateway_instance_id: Some(gateway_instance_id.to_string()),
-        // ADR-002 Phase 1: the SV2 gateway does not yet serialize raw
-        // block bytes. The shield runs only for senders that populate
-        // this field. Phase 1b work lands the wire encoding path.
-        raw_block_hex: None,
+        // PB-19 / Phase 1b: forward the template-manager's assembled
+        // raw block verbatim so the shield runs on the gateway path
+        // too. None when the upstream did not assemble (older
+        // template-manager or assembly failure, both counted by
+        // verifier_shield_skipped_total).
+        raw_block_hex: template.raw_block_hex.clone(),
     }
 }
 

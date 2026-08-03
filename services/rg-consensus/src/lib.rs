@@ -381,8 +381,9 @@ pub fn re_derive_merkle_root(raw_block: &[u8]) -> Result<[u8; 32], ConsensusViol
 }
 
 /// Re-derive the witness commitment. Returns `None` when the block
-/// contains no segwit transactions and therefore requires no
-/// commitment; returns `Some` with the 32 byte commitment otherwise.
+/// carries no witness data anywhere (coinbase included) and
+/// therefore requires no commitment; returns `Some` with the 32
+/// byte commitment otherwise.
 ///
 /// # Errors
 ///
@@ -394,16 +395,16 @@ pub fn re_derive_witness_commitment(
         detail: "block_deserialize",
     })?;
 
-    // BIP-141: a block carries a witness commitment iff any non
-    // coinbase transaction contains witness data. The coinbase
-    // witness holds only the reserved value, not true segwit data.
-    let has_segwit = block
+    // Bitcoin Core's unexpected-witness rule counts every
+    // transaction including the coinbase: a block with witness data
+    // anywhere and no commitment is invalid, so the commitment
+    // requirement scan must not skip the coinbase.
+    let has_witness = block
         .txdata
         .iter()
-        .skip(1)
         .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
 
-    if !has_segwit {
+    if !has_witness {
         return Ok(None);
     }
 
@@ -542,14 +543,14 @@ pub fn check_merkle_root_internal(block: &ParsedBlock) -> Result<(), ConsensusVi
 /// Verify the coinbase witness commitment matches the BIP-141
 /// witness root commitment computed over the block body.
 ///
-/// Three outcomes:
-/// - Legacy block (no segwit transactions): returns `Ok(())`.
-/// - Segwit transactions present, commitment in coinbase
-///   `OP_RETURN` matches the computed value: returns `Ok(())`.
-/// - Segwit transactions present and commitment missing: returns
+/// Outcomes:
+/// - Legacy block (no witness data anywhere): returns `Ok(())`.
+/// - Witness data present, commitment in coinbase `OP_RETURN`
+///   matches the computed value: returns `Ok(())`.
+/// - Witness data present and commitment missing: returns
 ///   [`ConsensusViolation::WitnessCommitmentMissing`].
-/// - Segwit transactions present and commitment disagrees with
-///   computed value: returns [`ConsensusViolation::WitnessCommitmentMismatch`].
+/// - Witness data present and commitment disagrees with computed
+///   value: returns [`ConsensusViolation::WitnessCommitmentMismatch`].
 ///
 /// # Errors
 ///
@@ -564,18 +565,19 @@ pub fn check_witness_commitment_internal(block: &ParsedBlock) -> Result<(), Cons
             detail: "block_has_no_coinbase",
         })?;
 
-    // BIP-141: a block carries a witness commitment iff any non
-    // coinbase transaction contains witness data.
-    let has_segwit = block
+    // Bitcoin Core's unexpected-witness rule counts every
+    // transaction including the coinbase: a block with witness data
+    // anywhere and no commitment is invalid, so the commitment
+    // requirement scan must not skip the coinbase.
+    let has_witness = block
         .0
         .txdata
         .iter()
-        .skip(1)
         .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
 
     let declared = extract_witness_commitment_from_coinbase(coinbase);
 
-    match (has_segwit, declared) {
+    match (has_witness, declared) {
         (false, _) => Ok(()),
         (true, None) => Err(ConsensusViolation::WitnessCommitmentMissing),
         (true, Some(decl)) => {
@@ -644,15 +646,80 @@ pub fn tx_count(block: &ParsedBlock) -> u32 {
 }
 
 /// Total legacy sigops summed across every input `script_sig` and
-/// every output `script_pubkey` in the block.
+/// every output `script_pubkey` in the block, **including the
+/// coinbase**.
 ///
 /// Unit semantics match [`count_sigops`]: legacy count, not BIP-141
-/// sigop cost. Callers comparing against `TemplatePropose.total_sigops`
-/// must populate the declared field with the same legacy count to
-/// avoid false mismatches. BIP-141 cost is a Phase 1.5 concern.
+/// sigop cost.
+///
+/// Inclusion set (PB-19, pinned here because this crate exposes two
+/// sigop accessors whose only difference is the set they sum, which is
+/// exactly the difference that went unnoticed once): this is the
+/// WHOLE-block figure, which is what the consensus ceiling in
+/// [`check_sigops_max`] must measure. It is NOT
+/// the right operand for the Class D comparison against
+/// `TemplatePropose::total_sigops`, whose wire contract is BIP-141
+/// cost over the NON-coinbase transactions only (the GBT
+/// `transactions[]` convention). Use [`non_coinbase_sigops`] there;
+/// summing the coinbase into a floor compared against a non-coinbase
+/// declaration rejects honest templates whenever the payout script
+/// carries sigops.
 pub fn total_sigops(block: &ParsedBlock) -> u32 {
     let mut total: u64 = 0;
     for tx in &block.0.txdata {
+        for input in &tx.input {
+            total = total.saturating_add(input.script_sig.count_sigops_legacy() as u64);
+        }
+        for output in &tx.output {
+            total = total.saturating_add(output.script_pubkey.count_sigops_legacy() as u64);
+        }
+    }
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
+/// Sum of BIP-141 weights of the non-coinbase transactions, in
+/// weight units. This matches the producer-side declaration
+/// convention for `TemplatePropose::template_weight` (the sum of GBT
+/// `transactions[].weight`, which excludes the coinbase and the
+/// header), so the shield's Class D comparison uses this accessor
+/// rather than whole-block weight (PB-19).
+pub fn non_coinbase_tx_weight(block: &ParsedBlock) -> u64 {
+    block
+        .0
+        .txdata
+        .iter()
+        .skip(1)
+        .map(|t| t.weight().to_wu())
+        .sum()
+}
+
+/// Legacy sigops summed across the non-coinbase transactions. Equals
+/// [`total_sigops`] minus [`coinbase_sigops`] except at the `u32`
+/// saturation boundary, where each figure clamps independently. This
+/// matches the producer-side declaration convention for
+/// `TemplatePropose::total_sigops` (the sum of GBT
+/// `transactions[].sigops`, which excludes the coinbase), so the
+/// shield's Class D sigop floor uses this accessor rather than the
+/// whole-block figure (PB-19).
+///
+/// Unit semantics match [`total_sigops`]: legacy count, not BIP-141
+/// sigop cost. The caller scales the legacy count by the BIP-141
+/// factor of 4 to reach the provable cost floor.
+///
+/// This exists because the Class D comparison and the consensus
+/// ceiling check need different inclusion sets: `check_sigops_max`
+/// measures the whole block against the consensus limit, while the
+/// Class D floor must line up with a declaration the producer built
+/// from non-coinbase transactions alone.
+///
+/// Caveat shared with [`non_coinbase_tx_weight`] and
+/// [`check_non_coinbase_null_prevout`]: `skip(1)` means "not the first
+/// transaction", not "not the coinbase". No shield check currently
+/// asserts that `txdata[0]` is a coinbase, so all three rest on that
+/// unchecked assumption.
+pub fn non_coinbase_sigops(block: &ParsedBlock) -> u32 {
+    let mut total: u64 = 0;
+    for tx in block.0.txdata.iter().skip(1) {
         for input in &tx.input {
             total = total.saturating_add(input.script_sig.count_sigops_legacy() as u64);
         }
@@ -712,6 +779,290 @@ pub fn bip34_height(block: &ParsedBlock) -> Result<u32, ConsensusViolation> {
     decode_bip34_height(bytes).ok_or(ConsensusViolation::CoinbaseBip34Missing)
 }
 
+// ─── Tier 3: belt-and-suspenders checks (ADR-002 Phase 1.5) ────────
+//
+// Standalone consensus ceilings and structural rules. Unlike Class D
+// these need no declared field from `TemplatePropose`; unlike Class S
+// they guard absolute consensus limits rather than internal
+// consistency. Deferred from Phase 1 #4b as Tier 3 per the ADR-002
+// criticality tiering, wired in Phase 1.5.
+
+/// Consensus maximum block weight in weight units (BIP-141).
+const MAX_BLOCK_WEIGHT_WU: u64 = 4_000_000;
+
+/// Consensus maximum block sigop cost (BIP-141).
+const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+
+/// BIP-141 scale factor mapping legacy sigops to sigop cost.
+const WITNESS_SCALE_FACTOR: u64 = 4;
+
+/// Consensus lower bound on the coinbase `script_sig` length in
+/// bytes (Bitcoin's original `CheckTransaction` coinbase
+/// script-size rule, `bad-cb-length`).
+const MIN_COINBASE_SCRIPT_LEN: usize = 2;
+
+/// Consensus upper bound on the coinbase `script_sig` length in
+/// bytes (same `bad-cb-length` rule as the lower bound).
+const MAX_COINBASE_SCRIPT_LEN: usize = 100;
+
+/// Minimum block header version since BIP-65 lock-in (version 4).
+/// BIP-9 style top-bits versions (`0x2000_0000` and up) clear the
+/// floor; only genuinely low legacy versions (1 through 3) and
+/// negative versions fall below it.
+const HEADER_VERSION_FLOOR: i32 = 4;
+
+/// Verify the coinbase `script_sig` length sits inside the
+/// consensus range of 2 through 100 bytes (Bitcoin Core
+/// `bad-cb-length`; BIP-34 separately mandates the height push,
+/// checked by [`check_coinbase_bip34_present`]).
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::CoinbaseScriptLength`] when the
+/// length is outside the range, or
+/// [`ConsensusViolation::DecodeFailed`] when the block has no
+/// coinbase or the coinbase has no input.
+pub fn check_coinbase_script_length(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    let coinbase = block
+        .0
+        .txdata
+        .first()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "block_has_no_coinbase",
+        })?;
+    let input = coinbase
+        .input
+        .first()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "coinbase_has_no_input",
+        })?;
+    let len = input.script_sig.len();
+    if !(MIN_COINBASE_SCRIPT_LEN..=MAX_COINBASE_SCRIPT_LEN).contains(&len) {
+        return Err(ConsensusViolation::CoinbaseScriptLength);
+    }
+    Ok(())
+}
+
+/// Verify the coinbase carries at least one output. A transaction
+/// with an empty output vector is invalid under consensus rules and
+/// a coinbase with no outputs pays nobody, which no honest template
+/// builder emits.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::CoinbaseOutputCount`] on an empty
+/// output vector, or [`ConsensusViolation::DecodeFailed`] when the
+/// block has no coinbase.
+pub fn check_coinbase_output_count(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    let coinbase = block
+        .0
+        .txdata
+        .first()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "block_has_no_coinbase",
+        })?;
+    if coinbase.output.is_empty() {
+        return Err(ConsensusViolation::CoinbaseOutputCount);
+    }
+    Ok(())
+}
+
+/// Verify total block weight does not exceed the 4,000,000 WU
+/// consensus maximum (BIP-141).
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::WeightExceedsMax`] when the block
+/// weight crosses the ceiling.
+pub fn check_weight_max(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    if block.0.weight().to_wu() > MAX_BLOCK_WEIGHT_WU {
+        return Err(ConsensusViolation::WeightExceedsMax);
+    }
+    Ok(())
+}
+
+/// Verify block sigops do not exceed the consensus maximum.
+///
+/// Unit semantics follow [`total_sigops`]: the facade counts legacy
+/// sigops, so the comparison scales the legacy count by the BIP-141
+/// factor of 4 against the 80,000 sigop-cost ceiling. Legacy count
+/// times 4 is a lower bound for true BIP-141 cost (P2SH and witness
+/// sigops add to it), so this check never fires on a block that a
+/// full accounting would accept.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::SigopsExceedMax`] when the scaled
+/// legacy count crosses the ceiling.
+pub fn check_sigops_max(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    let scaled = u64::from(total_sigops(block)).saturating_mul(WITNESS_SCALE_FACTOR);
+    if scaled > MAX_BLOCK_SIGOPS_COST {
+        return Err(ConsensusViolation::SigopsExceedMax);
+    }
+    Ok(())
+}
+
+/// Verify no non-coinbase transaction carries a null previous
+/// output. A null prevout outside the coinbase position would mint
+/// value out of nothing; consensus forbids it.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::NonCoinbaseNullPrevout`] on the
+/// first offending input.
+pub fn check_non_coinbase_null_prevout(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    for tx in block.0.txdata.iter().skip(1) {
+        for input in &tx.input {
+            if input.previous_output.is_null() {
+                return Err(ConsensusViolation::NonCoinbaseNullPrevout);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify the block header version meets the BIP-65 floor of 4.
+/// Historic version 1 through 3 blocks predate the active soft fork
+/// set; a new template carrying one signals a broken or hostile
+/// template builder.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::HeaderVersionLow`] when the
+/// consensus-encoded version is below the floor.
+pub fn check_header_version(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    if block.0.header.version.to_consensus() < HEADER_VERSION_FLOOR {
+        return Err(ConsensusViolation::HeaderVersionLow);
+    }
+    Ok(())
+}
+
+/// Verify no transaction id appears twice in the block body.
+/// Duplicate txids enable the CVE-2012-2459 merkle malleation
+/// family and never occur in an honest template.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::DuplicateTx`] on the first
+/// repeated txid.
+pub fn check_duplicate_tx(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    let mut seen = std::collections::HashSet::with_capacity(block.0.txdata.len());
+    for tx in &block.0.txdata {
+        if !seen.insert(tx.compute_txid()) {
+            return Err(ConsensusViolation::DuplicateTx);
+        }
+    }
+    Ok(())
+}
+
+// ─── Template block assembly (PB-19 / ADR-002 Phase 1b) ────────────
+//
+// The shield re-derives; Phase 1b needs the mirror image: the
+// template-manager must SHIP raw block bytes so the shield has
+// something to re-derive from. Assembly stays behind the facade for
+// the same R-154 reason parsing does: exactly one crate owns
+// rust-bitcoin, and only plain types cross the boundary.
+
+/// Inputs for [`assemble_template_block`]. Every field is a plain
+/// type; the coinbase arrives in legacy (non-witness) serialization
+/// exactly as the SV2 job path builds it (`prefix || extranonce ||
+/// suffix` with the extranonce slot zero-filled).
+pub struct TemplateBlockParts<'a> {
+    /// Block header version, consensus encoding (GBT `version`).
+    pub version: i32,
+    /// Previous block hash in INTERNAL byte order (display hex from
+    /// GBT must be byte-reversed by the caller).
+    pub prev_hash: [u8; 32],
+    /// Header timestamp (GBT `curtime`).
+    pub time: u32,
+    /// Compact difficulty target (GBT `bits` as consensus `u32`).
+    pub bits: u32,
+    /// Legacy-serialized coinbase transaction.
+    pub coinbase_legacy: &'a [u8],
+    /// Raw serialized non-coinbase transactions (GBT
+    /// `transactions[].data`), witness encoding preserved.
+    pub txs_raw: &'a [Vec<u8>],
+}
+
+/// Assemble an unmined template block from its parts: attach the
+/// BIP-141 reserved witness to the coinbase when a commitment output
+/// is present, compute the header merkle root over the body, and
+/// serialize with a zero nonce.
+///
+/// Fail-fast contract: a witness-carrying transaction set with no
+/// commitment output in the coinbase is refused rather than shipped,
+/// because Bitcoin Core rejects such a block (unexpected-witness) and
+/// the shield would flag it downstream anyway.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::DecodeFailed`] when the coinbase or
+/// any transaction fails to deserialize, or
+/// [`ConsensusViolation::WitnessCommitmentMissing`] per the fail-fast
+/// contract above.
+pub fn assemble_template_block(
+    parts: &TemplateBlockParts<'_>,
+) -> Result<Vec<u8>, ConsensusViolation> {
+    use bitcoin::consensus::serialize;
+
+    let mut coinbase: bitcoin::Transaction =
+        deserialize(parts.coinbase_legacy).map_err(|_| ConsensusViolation::DecodeFailed {
+            detail: "coinbase_deserialize",
+        })?;
+
+    let mut txdata: Vec<bitcoin::Transaction> = Vec::with_capacity(1 + parts.txs_raw.len());
+    let mut any_witness = false;
+    for raw in parts.txs_raw {
+        let tx: bitcoin::Transaction =
+            deserialize(raw).map_err(|_| ConsensusViolation::DecodeFailed {
+                detail: "template_tx_deserialize",
+            })?;
+        any_witness = any_witness || tx.input.iter().any(|i| !i.witness.is_empty());
+        txdata.push(tx);
+    }
+
+    let has_commitment = extract_witness_commitment_from_coinbase(&coinbase).is_some();
+    if any_witness && !has_commitment {
+        return Err(ConsensusViolation::WitnessCommitmentMissing);
+    }
+    if has_commitment {
+        // BIP-141 reserved value: exactly one 32-byte zero element,
+        // matching what bitcoind's `default_witness_commitment`
+        // commits to.
+        let input = coinbase
+            .input
+            .first_mut()
+            .ok_or(ConsensusViolation::DecodeFailed {
+                detail: "coinbase_has_no_input",
+            })?;
+        input.witness = bitcoin::Witness::from_slice(&[[0u8; 32]]);
+    }
+
+    let mut all_txs = Vec::with_capacity(1 + txdata.len());
+    all_txs.push(coinbase);
+    all_txs.extend(txdata);
+
+    let mut block = Block {
+        header: bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(parts.version),
+            prev_blockhash: bitcoin::BlockHash::from_byte_array(parts.prev_hash),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time: parts.time,
+            bits: bitcoin::CompactTarget::from_consensus(parts.bits),
+            nonce: 0,
+        },
+        txdata: all_txs,
+    };
+    let merkle = block
+        .compute_merkle_root()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "merkle_root_empty_block",
+        })?;
+    block.header.merkle_root = merkle;
+
+    Ok(serialize(&block))
+}
+
 // ─── Class M accessors: mempool ground truth (Phase 2 / ADR-003) ──
 
 /// Return the list of non-coinbase transaction ids in the block, in
@@ -734,17 +1085,20 @@ pub fn template_txids(block: &ParsedBlock) -> Vec<[u8; 32]> {
 
 // ─── Internal helpers ──────────────────────────────────────────────
 
-/// Locate the first BIP-141 witness commitment output in a coinbase.
+/// Locate the BIP-141 witness commitment output in a coinbase.
 /// Returns the 32-byte commitment when present.
 ///
 /// Format per BIP-141: `OP_RETURN OP_PUSHBYTES_36 0xaa21a9ed <32 bytes>`.
-/// The first matching output wins.
+/// When more than one output matches the pattern, BIP-141 assigns
+/// the commitment to the one with the highest output index; Bitcoin
+/// Core's `GetWitnessCommitmentIndex` keeps the last match and the
+/// shield must agree or it diverges on blocks Core accepts.
 fn extract_witness_commitment_from_coinbase(coinbase: &bitcoin::Transaction) -> Option<[u8; 32]> {
     const OP_RETURN: u8 = 0x6a;
     const OP_PUSHBYTES_36: u8 = 0x24;
     const MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
 
-    for output in &coinbase.output {
+    for output in coinbase.output.iter().rev() {
         let bytes = output.script_pubkey.as_bytes();
         if bytes.len() >= 38
             && bytes[0] == OP_RETURN
@@ -1027,6 +1381,96 @@ mod tests {
     }
 
     #[test]
+    fn non_coinbase_sigops_excludes_the_coinbase() {
+        // Genesis is coinbase-only and its payout is a bare-pubkey
+        // CHECKSIG, so the whole-block figure is non-zero while the
+        // non-coinbase figure must be zero. This is the asymmetry the
+        // Class D sigop floor depends on: a sigop-bearing payout must
+        // not raise a floor compared against a declaration the
+        // producer built from non-coinbase transactions alone.
+        let bytes = genesis_bytes();
+        let block = parse_block(&bytes).unwrap();
+        assert_eq!(
+            total_sigops(&block),
+            coinbase_sigops(&block),
+            "genesis carries only the coinbase, so whole-block == coinbase"
+        );
+        assert!(
+            coinbase_sigops(&block) > 0,
+            "genesis payout must carry sigops or this test proves nothing"
+        );
+        assert_eq!(
+            non_coinbase_sigops(&block),
+            0,
+            "non_coinbase_sigops must exclude the coinbase"
+        );
+    }
+
+    #[test]
+    fn non_coinbase_sigops_is_total_minus_coinbase_on_a_multi_tx_block() {
+        // The invariant that keeps the two accessors honest against
+        // each other on a block that actually has a body. Both the
+        // coinbase and the single body transaction pay to P2PKH, so
+        // each contributes exactly one legacy sigop and a split that
+        // silently included or dropped the coinbase would be visible.
+        let p2pkh = |v: &mut Vec<u8>| {
+            v.push(0x19);
+            v.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            v.extend_from_slice(&[0xcd; 20]);
+            v.extend_from_slice(&[0x88, 0xac]);
+        };
+
+        let mut cb = Vec::new();
+        cb.extend_from_slice(&2u32.to_le_bytes());
+        cb.push(0x01);
+        cb.extend_from_slice(&[0u8; 32]);
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        cb.push(0x02);
+        cb.extend_from_slice(&[0x01, 0x66]); // BIP-34 push of height 102
+        cb.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        cb.push(0x01);
+        cb.extend_from_slice(&5_000_000_000u64.to_le_bytes());
+        p2pkh(&mut cb);
+        cb.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&2u32.to_le_bytes());
+        tx.push(0x01);
+        tx.extend_from_slice(&[0x11; 32]); // non-null prevout
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(0x00); // empty scriptSig
+        tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        tx.push(0x01);
+        tx.extend_from_slice(&1_000u64.to_le_bytes());
+        p2pkh(&mut tx);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+
+        let raw = assemble_template_block(&TemplateBlockParts {
+            version: 0x2000_0000,
+            prev_hash: [0x44; 32],
+            time: 1_700_000_000,
+            bits: 0x207f_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[tx],
+        })
+        .expect("assembles");
+        let block = parse_block(&raw).expect("parses");
+
+        assert_eq!(
+            coinbase_sigops(&block),
+            1,
+            "P2PKH coinbase payout is 1 sigop"
+        );
+        assert_eq!(non_coinbase_sigops(&block), 1, "the body tx is 1 sigop");
+        assert_eq!(total_sigops(&block), 2, "whole block is both");
+        assert_eq!(
+            u64::from(non_coinbase_sigops(&block)) + u64::from(coinbase_sigops(&block)),
+            u64::from(total_sigops(&block)),
+            "non_coinbase + coinbase must reconstruct the whole-block figure"
+        );
+    }
+
+    #[test]
     fn coinbase_sigops_on_genesis_equals_total() {
         // Genesis has exactly one transaction (the coinbase). All
         // sigops are coinbase sigops.
@@ -1109,6 +1553,242 @@ mod tests {
         );
     }
 
+    // ── Template block assembly (PB-19 / ADR-002 Phase 1b) ─────────
+
+    /// Helper: legacy-serialize a minimal coinbase paying `value` to
+    /// an `OP_TRUE` output, with a BIP-34 push of `height` plus
+    /// `extranonce` zero bytes in the scriptSig, and optionally a
+    /// BIP-141 commitment output carrying `commitment`.
+    fn legacy_coinbase_bytes(
+        height_push: &[u8],
+        extranonce: usize,
+        value: u64,
+        commitment: Option<[u8; 32]>,
+    ) -> Vec<u8> {
+        use bitcoin::consensus::serialize;
+        let mut script_sig = height_push.to_vec();
+        script_sig.extend(std::iter::repeat_n(0u8, extranonce));
+        let mut outputs = vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(value),
+            script_pubkey: bitcoin::ScriptBuf::from(vec![0x51u8]),
+        }];
+        if let Some(c) = commitment {
+            let mut wc = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+            wc.extend_from_slice(&c);
+            outputs.push(bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::from(wc),
+            });
+        }
+        let cb = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from(script_sig),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: outputs,
+        };
+        serialize(&cb)
+    }
+
+    /// Helper: a minimal segwit transaction (one witness element)
+    /// spending the given prevout, serialized with witness.
+    fn segwit_tx_bytes(prevout: bitcoin::OutPoint) -> Vec<u8> {
+        use bitcoin::consensus::serialize;
+        let mut tx = simple_tx(prevout);
+        tx.input[0].witness = bitcoin::Witness::from_slice(&[[0x42u8; 32]]);
+        serialize(&tx)
+    }
+
+    #[test]
+    fn assemble_legacy_only_block_passes_every_shield_check() {
+        // Coinbase-only, no witness anywhere, no commitment needed.
+        let cb = legacy_coinbase_bytes(&[0x01, 0x66], 4, 5_000_000_000, None);
+        let parts = TemplateBlockParts {
+            version: 4,
+            prev_hash: [0x11; 32],
+            time: 1_700_000_000,
+            bits: 0x2070_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[],
+        };
+        let raw = assemble_template_block(&parts).expect("assembles");
+        let block = parse_block(&raw).expect("assembled block parses");
+        check_merkle_root_internal(&block).expect("merkle root agrees");
+        check_witness_commitment_internal(&block).expect("no commitment needed");
+        check_coinbase_bip34_present(&block).expect("height push present");
+        assert_eq!(bip34_height(&block).unwrap(), 0x66);
+        check_coinbase_script_length(&block).expect("script in range");
+        check_coinbase_output_count(&block).expect("one output");
+        check_weight_max(&block).expect("tiny block");
+        check_sigops_max(&block).expect("no sigops");
+        check_non_coinbase_null_prevout(&block).expect("only coinbase");
+        check_header_version(&block).expect("version 4");
+        check_duplicate_tx(&block).expect("single tx");
+        assert_eq!(re_derive_coinbase_value(&raw).unwrap(), 5_000_000_000);
+        assert_eq!(tx_count(&block), 1);
+    }
+
+    #[test]
+    fn assemble_segwit_block_commitment_agrees_with_shield() {
+        use bitcoin::consensus::deserialize;
+        // Build the segwit tx first so the expected commitment can be
+        // computed over the real wtxids with the zero reserved value,
+        // exactly what bitcoind's default_witness_commitment does.
+        let cb_txid_placeholder = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+            vout: 0,
+        };
+        let tx_raw = segwit_tx_bytes(cb_txid_placeholder);
+        let tx: bitcoin::Transaction = deserialize(&tx_raw).unwrap();
+
+        // wtxid merkle with coinbase slot zeroed (BIP-141).
+        let leaves = [[0u8; 32], tx.compute_wtxid().to_byte_array()];
+        let mut cat = [0u8; 64];
+        cat[..32].copy_from_slice(&leaves[0]);
+        cat[32..].copy_from_slice(&leaves[1]);
+        let witness_root = sha256d::Hash::hash(&cat).to_byte_array();
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&witness_root);
+        // reserved value = 32 zero bytes, already zeroed in buf[32..].
+        let commitment = sha256d::Hash::hash(&buf).to_byte_array();
+
+        let cb = legacy_coinbase_bytes(&[0x02, 0x34, 0x12], 8, 2_500_000_000, Some(commitment));
+        let parts = TemplateBlockParts {
+            version: 0x2000_0000,
+            prev_hash: [0x33; 32],
+            time: 1_700_000_100,
+            bits: 0x2070_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: std::slice::from_ref(&tx_raw),
+        };
+        let raw = assemble_template_block(&parts).expect("assembles");
+        let block = parse_block(&raw).expect("parses");
+        check_merkle_root_internal(&block).expect("merkle agrees");
+        check_witness_commitment_internal(&block)
+            .expect("assembled commitment must satisfy the shield");
+        assert_eq!(tx_count(&block), 2);
+        assert_eq!(template_txids(&block).len(), 1);
+    }
+
+    #[test]
+    fn assemble_rejects_witness_txs_without_commitment() {
+        let cb = legacy_coinbase_bytes(&[0x01, 0x66], 4, 5_000_000_000, None);
+        let tx_raw = segwit_tx_bytes(bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+            vout: 0,
+        });
+        let parts = TemplateBlockParts {
+            version: 4,
+            prev_hash: [0x11; 32],
+            time: 1_700_000_000,
+            bits: 0x2070_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[tx_raw],
+        };
+        assert_eq!(
+            assemble_template_block(&parts),
+            Err(ConsensusViolation::WitnessCommitmentMissing),
+            "assembling an invalid block must fail fast, not ship"
+        );
+    }
+
+    #[test]
+    fn assemble_rejects_garbage_inputs() {
+        let junk: &[u8] = &[0xff; 8];
+        let parts = TemplateBlockParts {
+            version: 4,
+            prev_hash: [0; 32],
+            time: 0,
+            bits: 0x2070_ffff,
+            coinbase_legacy: junk,
+            txs_raw: &[],
+        };
+        assert!(matches!(
+            assemble_template_block(&parts),
+            Err(ConsensusViolation::DecodeFailed { .. })
+        ));
+
+        let cb = legacy_coinbase_bytes(&[0x01, 0x66], 4, 1, None);
+        let parts = TemplateBlockParts {
+            version: 4,
+            prev_hash: [0; 32],
+            time: 0,
+            bits: 0x2070_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[vec![0xff; 8]],
+        };
+        assert!(matches!(
+            assemble_template_block(&parts),
+            Err(ConsensusViolation::DecodeFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn assemble_header_fields_round_trip() {
+        use bitcoin::consensus::deserialize;
+        let cb = legacy_coinbase_bytes(&[0x01, 0x66], 4, 5_000_000_000, None);
+        let parts = TemplateBlockParts {
+            version: 4,
+            prev_hash: [0xab; 32],
+            time: 1_699_999_999,
+            bits: 0x1d00_ffff,
+            coinbase_legacy: &cb,
+            txs_raw: &[],
+        };
+        let raw = assemble_template_block(&parts).unwrap();
+        let block: Block = deserialize(&raw).unwrap();
+        assert_eq!(block.header.version.to_consensus(), 4);
+        assert_eq!(block.header.prev_blockhash.to_byte_array(), [0xab; 32]);
+        assert_eq!(block.header.time, 1_699_999_999);
+        assert_eq!(block.header.bits.to_consensus(), 0x1d00_ffff);
+        assert_eq!(block.header.nonce, 0, "template blocks are unmined");
+    }
+
+    #[test]
+    fn witness_commitment_extractor_prefers_highest_output_index() {
+        use bitcoin::Transaction;
+        use bitcoin::consensus::deserialize;
+        // BIP-141: "If there are more than one scriptPubKey matching
+        // the pattern, the one with highest output index is assumed
+        // to be the commitment." Bitcoin Core keeps the last match;
+        // the shield must agree or it diverges on blocks Core
+        // accepts.
+        let bytes = genesis_bytes();
+        let block: Block = deserialize(&bytes).unwrap();
+        let mut coinbase: Transaction = block.txdata[0].clone();
+        for fill in [0x11u8, 0x42u8] {
+            let mut commit = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+            commit.extend_from_slice(&[fill; 32]);
+            coinbase.output.push(bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::from(commit),
+            });
+        }
+        assert_eq!(
+            extract_witness_commitment_from_coinbase(&coinbase),
+            Some([0x42; 32]),
+            "highest output index must win"
+        );
+    }
+
+    #[test]
+    fn witness_commitment_missing_when_only_coinbase_has_witness() {
+        // Bitcoin Core's unexpected-witness rule counts every
+        // transaction including the coinbase: any witness data in a
+        // block without a commitment is invalid. A scan that skips
+        // the coinbase false-accepts that block.
+        let mut b = genesis_block_mut();
+        b.txdata[0].input[0].witness = bitcoin::Witness::from_slice(&[[0u8; 32]]);
+        assert_eq!(
+            check_witness_commitment_internal(&ParsedBlock(b)),
+            Err(ConsensusViolation::WitnessCommitmentMissing)
+        );
+    }
+
     #[test]
     fn extract_witness_commitment_returns_none_on_legacy_coinbase() {
         // Genesis coinbase has no OP_RETURN witness commitment.
@@ -1116,5 +1796,196 @@ mod tests {
         let block: Block = deserialize(&bytes).unwrap();
         let coinbase = &block.txdata[0];
         assert_eq!(extract_witness_commitment_from_coinbase(coinbase), None);
+    }
+
+    // ── Tier 3 belt-and-suspenders checks (ADR-002 Phase 1.5) ──────
+
+    /// Helper: deserialize the mainnet genesis block into a mutable
+    /// `bitcoin::Block` so Tier 3 tests can build synthetic
+    /// violation vectors. Checks under test are standalone, so a
+    /// mutated body does not need a recomputed header merkle root.
+    fn genesis_block_mut() -> Block {
+        use bitcoin::consensus::deserialize;
+        deserialize(&genesis_bytes()).unwrap()
+    }
+
+    /// Helper: minimal non-coinbase transaction spending `prevout`.
+    fn simple_tx(prevout: bitcoin::OutPoint) -> bitcoin::Transaction {
+        bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: prevout,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn coinbase_script_length_passes_on_genesis() {
+        let block = parse_block(&genesis_bytes()).unwrap();
+        check_coinbase_script_length(&block).expect("genesis coinbase script is 77 bytes");
+    }
+
+    #[test]
+    fn coinbase_script_length_rejects_oversize() {
+        let mut b = genesis_block_mut();
+        b.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from(vec![0x51u8; 101]);
+        assert_eq!(
+            check_coinbase_script_length(&ParsedBlock(b)),
+            Err(ConsensusViolation::CoinbaseScriptLength)
+        );
+    }
+
+    #[test]
+    fn coinbase_script_length_rejects_undersize() {
+        let mut b = genesis_block_mut();
+        b.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from(vec![0x51u8; 1]);
+        assert_eq!(
+            check_coinbase_script_length(&ParsedBlock(b)),
+            Err(ConsensusViolation::CoinbaseScriptLength)
+        );
+    }
+
+    #[test]
+    fn coinbase_output_count_passes_on_genesis() {
+        let block = parse_block(&genesis_bytes()).unwrap();
+        check_coinbase_output_count(&block).expect("genesis coinbase has one output");
+    }
+
+    #[test]
+    fn coinbase_output_count_rejects_empty_outputs() {
+        let mut b = genesis_block_mut();
+        b.txdata[0].output.clear();
+        assert_eq!(
+            check_coinbase_output_count(&ParsedBlock(b)),
+            Err(ConsensusViolation::CoinbaseOutputCount)
+        );
+    }
+
+    #[test]
+    fn weight_max_passes_on_genesis() {
+        let block = parse_block(&genesis_bytes()).unwrap();
+        check_weight_max(&block).expect("genesis weight is far below 4M WU");
+    }
+
+    #[test]
+    fn weight_max_rejects_oversized_block() {
+        // A single ~1.1 MB non-witness output pushes base weight
+        // (size * 4) past the 4,000,000 WU consensus ceiling.
+        let mut b = genesis_block_mut();
+        b.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from(vec![0x6au8; 1_100_000]);
+        assert_eq!(
+            check_weight_max(&ParsedBlock(b)),
+            Err(ConsensusViolation::WeightExceedsMax)
+        );
+    }
+
+    #[test]
+    fn sigops_max_passes_on_genesis() {
+        let block = parse_block(&genesis_bytes()).unwrap();
+        check_sigops_max(&block).expect("genesis sigops are far below the ceiling");
+    }
+
+    #[test]
+    fn sigops_max_rejects_excess() {
+        // 20,001 OP_CHECKSIG bytes = 20,001 legacy sigops = 80,004
+        // sigop cost after the BIP-141 x4 scale, over the 80,000 max.
+        let mut b = genesis_block_mut();
+        b.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from(vec![0xacu8; 20_001]);
+        assert_eq!(
+            check_sigops_max(&ParsedBlock(b)),
+            Err(ConsensusViolation::SigopsExceedMax)
+        );
+    }
+
+    #[test]
+    fn null_prevout_passes_on_coinbase_only_block() {
+        let block = parse_block(&genesis_bytes()).unwrap();
+        check_non_coinbase_null_prevout(&block).expect("coinbase-only block has no violation");
+    }
+
+    #[test]
+    fn null_prevout_rejects_noncoinbase_null() {
+        let mut b = genesis_block_mut();
+        b.txdata.push(simple_tx(bitcoin::OutPoint::null()));
+        assert_eq!(
+            check_non_coinbase_null_prevout(&ParsedBlock(b)),
+            Err(ConsensusViolation::NonCoinbaseNullPrevout)
+        );
+    }
+
+    #[test]
+    fn null_prevout_passes_on_regular_second_tx() {
+        let mut b = genesis_block_mut();
+        let cb_txid = b.txdata[0].compute_txid();
+        b.txdata.push(simple_tx(bitcoin::OutPoint {
+            txid: cb_txid,
+            vout: 0,
+        }));
+        check_non_coinbase_null_prevout(&ParsedBlock(b))
+            .expect("regular prevout in second tx is fine");
+    }
+
+    #[test]
+    fn header_version_low_rejects_genesis_v1() {
+        // Genesis is a version-1 block: below the BIP-65 v4 floor.
+        let block = parse_block(&genesis_bytes()).unwrap();
+        assert_eq!(
+            check_header_version(&block),
+            Err(ConsensusViolation::HeaderVersionLow)
+        );
+    }
+
+    #[test]
+    fn header_version_four_passes() {
+        let mut b = genesis_block_mut();
+        b.header.version = bitcoin::block::Version::from_consensus(4);
+        check_header_version(&ParsedBlock(b)).expect("version 4 meets the floor");
+    }
+
+    #[test]
+    fn header_version_top_bits_passes() {
+        // Modern BIP-9 style version (0x20000000) is above the floor.
+        let mut b = genesis_block_mut();
+        b.header.version = bitcoin::block::Version::from_consensus(0x2000_0000);
+        check_header_version(&ParsedBlock(b)).expect("BIP-9 top-bits version meets the floor");
+    }
+
+    #[test]
+    fn duplicate_tx_rejects_repeated_body_tx() {
+        let mut b = genesis_block_mut();
+        let cb_txid = b.txdata[0].compute_txid();
+        let tx = simple_tx(bitcoin::OutPoint {
+            txid: cb_txid,
+            vout: 0,
+        });
+        b.txdata.push(tx.clone());
+        b.txdata.push(tx);
+        assert_eq!(
+            check_duplicate_tx(&ParsedBlock(b)),
+            Err(ConsensusViolation::DuplicateTx)
+        );
+    }
+
+    #[test]
+    fn duplicate_tx_passes_on_distinct_txs() {
+        let mut b = genesis_block_mut();
+        let cb_txid = b.txdata[0].compute_txid();
+        b.txdata.push(simple_tx(bitcoin::OutPoint {
+            txid: cb_txid,
+            vout: 0,
+        }));
+        b.txdata.push(simple_tx(bitcoin::OutPoint {
+            txid: cb_txid,
+            vout: 1,
+        }));
+        check_duplicate_tx(&ParsedBlock(b)).expect("distinct txids pass");
     }
 }

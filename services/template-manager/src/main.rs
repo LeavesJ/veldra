@@ -375,6 +375,79 @@ fn bip34_height_push(height: u32) -> Vec<u8> {
     result
 }
 
+/// Decode a display-order (RPC big-endian) block hash hex string into
+/// internal byte order. Returns `None` on invalid hex or wrong length.
+fn display_hex_to_internal(display_hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(display_hex).ok()?;
+    let mut internal: [u8; 32] = bytes.try_into().ok()?;
+    internal.reverse();
+    Some(internal)
+}
+
+/// Assemble the full raw template block and hex-encode it for
+/// `raw_block_hex` (PB-19 / ADR-002 Phase 1b).
+///
+/// The coinbase is the SV2 job coinbase with the extranonce slot
+/// zero-filled: `prefix || 0u8 x extranonce_size || suffix`, the same
+/// bytes miners will ultimately vary, so every declared field the
+/// shield re-derives (value, sigops, BIP-34 height, commitment) is
+/// consistent by construction. Assembly itself happens behind the
+/// rg-consensus facade (R-154).
+///
+/// Failure policy: log loudly and return `None`. The propose still
+/// ships without the field and the verifier counts the skip in
+/// `verifier_shield_skipped_total`, so an assembly regression is
+/// visible on the dashboard rather than silently dropping templates.
+#[allow(clippy::too_many_arguments)]
+fn assemble_raw_block_hex(
+    block_version: u32,
+    nbits: u32,
+    curtime: u32,
+    prev_hash_display: &str,
+    cb_prefix: &[u8],
+    cb_suffix: &[u8],
+    extranonce_size: usize,
+    txs_raw: &[Vec<u8>],
+) -> Option<String> {
+    let Some(prev_hash) = display_hex_to_internal(prev_hash_display) else {
+        warn!(
+            prev_hash = %prev_hash_display,
+            "raw block assembly skipped: prev_hash is not 32 bytes of hex"
+        );
+        return None;
+    };
+
+    let mut coinbase_legacy =
+        Vec::with_capacity(cb_prefix.len() + extranonce_size + cb_suffix.len());
+    coinbase_legacy.extend_from_slice(cb_prefix);
+    coinbase_legacy.extend(std::iter::repeat_n(0u8, extranonce_size));
+    coinbase_legacy.extend_from_slice(cb_suffix);
+
+    // Bit-pattern preserving u32 -> i32: GBT `version` is a consensus
+    // int32 transported unsigned.
+    let version = i32::from_le_bytes(block_version.to_le_bytes());
+
+    let parts = rg_consensus::TemplateBlockParts {
+        version,
+        prev_hash,
+        time: curtime,
+        bits: nbits,
+        coinbase_legacy: &coinbase_legacy,
+        txs_raw,
+    };
+    match rg_consensus::assemble_template_block(&parts) {
+        Ok(raw) => Some(hex::encode(raw)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "raw block assembly failed; propose ships without raw_block_hex \
+                 and the shield will count the skip"
+            );
+            None
+        }
+    }
+}
+
 /// Build coinbase transaction prefix and suffix, split at the extranonce
 /// boundary.
 ///
@@ -406,6 +479,19 @@ fn build_coinbase_halves(
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let height_push = bip34_height_push(block_height);
     let scriptsig_len = height_push.len() + coinbase_aux.len() + extranonce_size;
+
+    // Consensus `bad-cb-length`: the coinbase scriptSig must be 2..=100
+    // bytes. A larger one produces a block Bitcoin Core rejects and the
+    // shield flags as `v2_invariant_coinbase_script_length` (PB-19; the
+    // previous 252-byte single-byte-varint cap was necessary but not
+    // sufficient).
+    anyhow::ensure!(
+        scriptsig_len <= 100,
+        "coinbase scriptSig exceeds the 100-byte consensus cap: {scriptsig_len} \
+         (height push {} + coinbaseaux {} + extranonce {extranonce_size})",
+        height_push.len(),
+        coinbase_aux.len()
+    );
 
     // ── PREFIX ──
     let mut prefix = Vec::with_capacity(41 + height_push.len() + coinbase_aux.len());
@@ -788,6 +874,30 @@ impl TemplateSource for BitcoindTemplateSource {
         // each tree level, not raw txids.
         let merkle_branch = compute_merkle_branch(&txids)?;
 
+        // PB-19 / Phase 1b: assemble the full raw block so the shield
+        // has bytes to re-derive from. GBT supplies every non-coinbase
+        // tx pre-serialized; the coinbase is the job coinbase with a
+        // zero-filled extranonce slot.
+        let txs_raw: Vec<Vec<u8>> = tpl
+            .transactions
+            .iter()
+            .map(|tx| tx.raw_tx.clone())
+            .collect();
+        let nbits = bits_to_nbits(&tpl.bits);
+        #[allow(clippy::cast_possible_truncation)]
+        // Safe: Unix timestamps fit in u32 until year 2106
+        let curtime_u32 = tpl.current_time as u32;
+        let raw_block_hex = assemble_raw_block_hex(
+            tpl.version,
+            nbits,
+            curtime_u32,
+            &prev_hash,
+            &cb_prefix,
+            &cb_suffix,
+            self.extranonce_size,
+            &txs_raw,
+        );
+
         // Extract GBT extras for the /latest endpoint.
         let extras = GbtExtras {
             block_version: tpl.version,
@@ -818,10 +928,9 @@ impl TemplateSource for BitcoindTemplateSource {
                 coinbase_sigops,
                 template_weight: Some(template_weight),
                 gateway_instance_id: None,
-                // ADR-002 Phase 1: template-manager does not yet emit
-                // raw block bytes. The shield pass is skipped for its
-                // proposals. Phase 1b wires raw_block_hex end to end.
-                raw_block_hex: None,
+                // PB-19 / Phase 1b: the shield runs against these
+                // bytes. None only when assembly failed (logged).
+                raw_block_hex,
             },
             Some(extras),
         )))
@@ -964,6 +1073,11 @@ struct LatestTemplate {
     total_sigops: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     coinbase_sigops: Option<u32>,
+    /// PB-19 / Phase 1b: hex of the assembled raw template block for
+    /// the Invariant Shield. Absent when assembly failed or the
+    /// source cannot assemble (stratum).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_block_hex: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1657,6 +1771,7 @@ async fn run_manager_loop(
                         template_weight: propose.template_weight,
                         total_sigops: propose.total_sigops,
                         coinbase_sigops: propose.coinbase_sigops,
+                        raw_block_hex: propose.raw_block_hex.clone(),
                     });
                 }
             }
@@ -2001,6 +2116,74 @@ fn extract_coinbase_sigops(raw: &serde_json::Value) -> Option<u32> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── PB-19 / Phase 1b: raw block assembly ───────────────────────
+
+    #[test]
+    fn coinbase_halves_reject_scriptsig_over_100_bytes() {
+        // Consensus bad-cb-length caps the coinbase scriptSig at 100
+        // bytes; a 252-byte cap ships coinbases Core rejects and the
+        // shield flags (v2_invariant_coinbase_script_length). Height
+        // push (2) + aux (0) + extranonce (99) = 101: must fail.
+        let r = build_coinbase_halves(102, 5_000_000_000, &[0x51], 99, &[], None);
+        assert!(r.is_err(), "scriptSig of 101 bytes must be refused");
+        // 98 extranonce bytes = exactly 100: allowed.
+        let r = build_coinbase_halves(102, 5_000_000_000, &[0x51], 98, &[], None);
+        assert!(r.is_ok(), "scriptSig of exactly 100 bytes is valid");
+    }
+
+    #[test]
+    fn display_hex_to_internal_reverses_byte_order() {
+        let display = hex::encode((0..32u8).collect::<Vec<u8>>());
+        let internal = display_hex_to_internal(&display).expect("valid hex");
+        assert_eq!(internal[0], 31, "internal order is display reversed");
+        assert_eq!(internal[31], 0);
+        assert!(display_hex_to_internal("zz").is_none());
+        assert!(display_hex_to_internal("aabb").is_none(), "wrong length");
+    }
+
+    #[test]
+    fn assemble_raw_block_hex_produces_shield_clean_block() {
+        // Legacy-only template (no txs, no commitment): the assembled
+        // hex must parse and satisfy every shield check the verifier
+        // will run against it, using the same facade.
+        let (prefix, suffix) =
+            build_coinbase_halves(102, 5_000_000_000, &[0x51], 8, &[], None).expect("halves");
+        let prev_display: String = "ab".repeat(32);
+        let hex_str = assemble_raw_block_hex(
+            0x2000_0000,
+            0x207f_ffff,
+            1_700_000_000,
+            &prev_display,
+            &prefix,
+            &suffix,
+            8,
+            &[],
+        )
+        .expect("assembly succeeds");
+        let raw = hex::decode(&hex_str).expect("valid hex");
+        let block = rg_consensus::parse_block(&raw).expect("parses");
+        rg_consensus::check_merkle_root_internal(&block).expect("merkle agrees");
+        rg_consensus::check_witness_commitment_internal(&block).expect("legacy ok");
+        rg_consensus::check_coinbase_bip34_present(&block).expect("height push");
+        assert_eq!(rg_consensus::bip34_height(&block).unwrap(), 102);
+        rg_consensus::check_coinbase_script_length(&block).expect("script len");
+        rg_consensus::check_header_version(&block).expect("version ok");
+        assert_eq!(
+            rg_consensus::re_derive_coinbase_value(&raw).unwrap(),
+            5_000_000_000
+        );
+        assert_eq!(rg_consensus::tx_count(&block), 1);
+    }
+
+    #[test]
+    fn assemble_raw_block_hex_returns_none_on_bad_prev_hash() {
+        let (prefix, suffix) =
+            build_coinbase_halves(102, 5_000_000_000, &[0x51], 8, &[], None).expect("halves");
+        assert!(
+            assemble_raw_block_hex(4, 0x207f_ffff, 0, "nothex", &prefix, &suffix, 8, &[]).is_none()
+        );
+    }
 
     #[test]
     fn bip34_height_zero() {

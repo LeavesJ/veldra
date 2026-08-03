@@ -12,6 +12,7 @@ serde_json = "1"
 anyhow = "1"
 rg-protocol = { path = "../rg-protocol" }
 reservegrid-common = { path = "../reservegrid-common" }
+rg-consensus = { path = "../rg-consensus" }
 bitcoincore-rpc = "0.18"
 toml = "0.8"
 axum = "0.8"

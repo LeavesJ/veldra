@@ -102,13 +102,12 @@ fn parse_txid_hex(hex_str: &str) -> Result<[u8; 32], RpcError> {
         warn!(len = hex_str.len(), "unexpected txid hex length");
         return Err(RpcError::InvalidTxidHex(hex_str.to_string()));
     }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let s = &hex_str[i * 2..i * 2 + 2];
-        *byte =
-            u8::from_str_radix(s, 16).map_err(|_| RpcError::InvalidTxidHex(hex_str.to_string()))?;
-    }
-    Ok(out)
+    // hex::decode walks bytes, never char boundaries, so a malformed
+    // multi-byte UTF-8 string from a broken RPC endpoint surfaces as
+    // an error instead of a slice panic inside the polling task.
+    let decoded =
+        hex::decode(hex_str).map_err(|_| RpcError::InvalidTxidHex(hex_str.to_string()))?;
+    <[u8; 32]>::try_from(decoded).map_err(|_| RpcError::InvalidTxidHex(hex_str.to_string()))
 }
 
 #[derive(Serialize)]
@@ -160,5 +159,20 @@ mod tests {
     fn parse_txid_hex_rejects_non_hex() {
         let bad = "g".repeat(64);
         assert!(parse_txid_hex(&bad).is_err());
+    }
+
+    #[test]
+    fn parse_txid_hex_rejects_multibyte_utf8_without_panic() {
+        // 61 ASCII bytes + one 2-byte UTF-8 char + 1 ASCII byte is
+        // exactly 64 bytes, passing the length gate, but a fixed
+        // byte-offset slice at position 62 splits the char and
+        // panics. A malformed txid string from a broken or hostile
+        // RPC endpoint must surface as an error, not kill the
+        // polling task.
+        let mut s = "a".repeat(61);
+        s.push('é');
+        s.push('b');
+        assert_eq!(s.len(), 64, "test string must be 64 bytes");
+        assert!(parse_txid_hex(&s).is_err());
     }
 }

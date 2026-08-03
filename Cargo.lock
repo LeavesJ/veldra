@@ -5735,6 +5735,7 @@ dependencies = [
  "hmac",
  "prometheus-client",
  "reservegrid-common",
+ "rg-consensus",
  "rg-protocol",
  "serde",
  "serde_json",

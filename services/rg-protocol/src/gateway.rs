@@ -112,7 +112,13 @@ pub const DIFF1_TARGET_BE: [u8; 32] = [
 /// Maximum size of a single NDJSON line on the internal gateway-to-verifier
 /// TCP stream. Lines exceeding this limit are rejected with
 /// `internal_line_too_large`.
-pub const MAX_INTERNAL_LINE_BYTES: usize = 1_048_576; // 1 MiB
+// PB-19 / Phase 1b: sized for `raw_block_hex`. A mainnet block caps at
+// 4,000,000 WU, so at most 4 MB serialized, 8 MB hex-encoded, plus the
+// JSON envelope; 20 MiB leaves better than 2x headroom. The gateway
+// `verifier_stream` read side enforces this constant per line; the
+// verifier ingress enforces it once PB-18's bounded reads merge (until
+// then its read loop is unbounded, which tolerates any size).
+pub const MAX_INTERNAL_LINE_BYTES: usize = 20 * 1024 * 1024; // 20 MiB
 
 /// NDJSON envelope for messages on the gateway-to-verifier TCP stream.
 ///

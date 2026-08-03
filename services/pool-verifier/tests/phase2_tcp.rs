@@ -313,11 +313,14 @@ async fn round_trip_template(port: u16, template: TemplatePropose) -> TemplateVe
 fn regtest_segwit_template_and_display_hex() -> (TemplatePropose, Vec<String>) {
     let bytes =
         hex::decode(REGTEST_SEGWIT_BLOCK_HEX.trim()).expect("REGTEST_SEGWIT_BLOCK_HEX decodes");
-    let weight =
-        rg_consensus::re_derive_template_weight(&bytes).expect("regtest weight re-derives");
     let parsed = rg_consensus::parse_block(&bytes).expect("regtest block parses");
-    let total_sigops = rg_consensus::total_sigops(&parsed);
-    let coinbase_sigops = rg_consensus::coinbase_sigops(&parsed);
+    // PB-19 producer conventions: non-coinbase weight sum, sigops as
+    // the legacy x4 cost floor, non-coinbase tx_count.
+    let weight = rg_consensus::non_coinbase_tx_weight(&parsed);
+    let total_sigops = u32::try_from(u64::from(rg_consensus::non_coinbase_sigops(&parsed)) * 4)
+        .expect("fixture sigop cost fits u32");
+    let coinbase_sigops = u32::try_from(u64::from(rg_consensus::coinbase_sigops(&parsed)) * 4)
+        .expect("fixture coinbase sigop cost fits u32");
     let coinbase_value =
         rg_consensus::re_derive_coinbase_value(&bytes).expect("regtest coinbase value re-derives");
     let txids_internal = rg_consensus::template_txids(&parsed);
@@ -337,7 +340,7 @@ fn regtest_segwit_template_and_display_hex() -> (TemplatePropose, Vec<String>) {
         block_height: 102,
         prev_hash: "a".repeat(64),
         coinbase_value,
-        tx_count: 2,
+        tx_count: 1,
         total_fees: 0,
         observed_weight: None,
         created_at_unix_ms: None,
