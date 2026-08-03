@@ -216,11 +216,10 @@ enum BoundedLine {
     /// Clean EOF with no pending bytes.
     Eof,
     /// The peer sent `max_bytes` bytes without a newline. Protocol
-    /// error: the caller drops the connection immediately. Stricter
-    /// than the gateway's read side (which skips oversized lines and
-    /// disconnects after three) because a bounded reader cannot
-    /// resync to the next newline; both sides share the same 1 MiB
-    /// budget.
+    /// error: the caller drops the connection immediately, because a
+    /// bounded reader cannot resync to the next newline. The gateway's
+    /// read side does the same since PB-23; both sides share the same
+    /// `MAX_INTERNAL_LINE_BYTES` budget (20 MiB).
     OverLimit,
 }
 
