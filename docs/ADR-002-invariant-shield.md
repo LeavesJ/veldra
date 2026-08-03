@@ -24,11 +24,33 @@ Added: `v2_invariant_coinbase_prevout_not_null`, a Tier 3 structural
 check asserting `txdata[0]` carries exactly one input whose previous
 output is null. This **widens** v2.0 rather than completing it.
 
-Exploit value is low and is stated honestly here: `total_sigops` is the
-attacker's own field, and the Tier 3 consensus ceiling
-`check_sigops_max` already measures the whole block. This is a
-correctness and defense-in-depth fix that makes every `skip(1)` above
-provably correct, not the closure of an urgent hole.
+**Severity, corrected.** The first draft of this amendment called
+exploit value "low" and said this was "not the closure of an urgent
+hole". The T2 review falsified that by execution. With
+`check_coinbase_null_prevout` removed from the Tier 3 array,
+`check_invariant_shield` returns `Agreed` on a template whose
+`txdata[0]` spends a real outpoint, which is a block Bitcoin Core
+rejects in `CheckBlock` with `bad-cb-missing` because
+`CTransaction::IsCoinBase` is exactly the one-input-with-null-prevout
+predicate this check ports. Agreeing to a block that causes consensus
+rejection is the harm class the Tier 1 table in
+`docs/three-mode-architecture.md` labels CRITICAL, alongside
+`v2_invariant_coinbase_height_mismatch`. "A validating node would
+catch it" is not a mitigation for the shield, because catching what
+would otherwise reach a node is the shield's whole purpose.
+
+Two claims from that first draft survive and are kept, because both
+are still true and both bound the damage. `total_sigops` is the
+attacker's own field, so the sigop-accounting consequence in
+particular hands him nothing he could not declare directly. The Tier 3
+ceiling `check_sigops_max` measures the whole block against the
+consensus limit and never depended on index 0 being labelled
+correctly, so that ceiling was not blind.
+
+What was NOT demonstrated, and is not claimed here: any path to stolen
+funds, and any exploit that survives a validating node. Real-world
+exposure stays bounded by Core rejecting such a block outright. That
+is a bound on blast radius, not a reason to grade the defect low.
 
 Count impact, superseding the Phase 1 figures below:
 `VerdictReason::ALL` 37 to 38, `ReasonCode::ALL` 95 to 96,

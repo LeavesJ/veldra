@@ -266,14 +266,14 @@ impl ConsensusViolation {
     ];
 
     /// Degraded sentinel emitted when the shield is scaffolded but
-    /// the parser is not wired. Kept distinct from the 18 invariant
+    /// the parser is not wired. Kept distinct from the 23 invariant
     /// codes so dashboards can alert on "shield disabled" separately
     /// from "shield disagreed".
     pub const NOT_IMPLEMENTED_CODE: &str = "v2_invariant_not_implemented";
 
     /// Canonical `snake_case` reason code string for this violation.
     ///
-    /// The 18 invariant variants map to the canonical strings in
+    /// The 23 invariant variants map to the canonical strings in
     /// [`ConsensusViolation::ALL_CODES`]. `NotImplemented` maps to
     /// [`ConsensusViolation::NOT_IMPLEMENTED_CODE`] so it never
     /// collides with a real invariant mismatch in export data.
@@ -706,6 +706,10 @@ fn sum_legacy_sigops<'a>(txs: impl Iterator<Item = &'a bitcoin::Transaction>) ->
 /// `transactions[].weight`, which excludes the coinbase and the
 /// header), so the shield's Class D comparison uses this accessor
 /// rather than whole-block weight (PB-19).
+///
+/// The `skip(1)` precondition is established by
+/// [`check_coinbase_null_prevout`]; see the note on
+/// [`non_coinbase_sigops`].
 pub fn non_coinbase_tx_weight(block: &ParsedBlock) -> u64 {
     block
         .0
@@ -735,11 +739,14 @@ pub fn non_coinbase_tx_weight(block: &ParsedBlock) -> u64 {
 /// Class D floor must line up with a declaration the producer built
 /// from non-coinbase transactions alone.
 ///
-/// Caveat shared with [`non_coinbase_tx_weight`] and
+/// Precondition shared with [`non_coinbase_tx_weight`] and
 /// [`check_non_coinbase_null_prevout`]: `skip(1)` means "not the first
-/// transaction", not "not the coinbase". No shield check currently
-/// asserts that `txdata[0]` is a coinbase, so all three rest on that
-/// unchecked assumption.
+/// transaction". It means "not the coinbase" only because
+/// [`check_coinbase_null_prevout`] asserts `txdata[0]` really is a
+/// coinbase (PB-20). That check runs inside the shield's Tier 3 array,
+/// so on any template the shield admitted all three derivations are
+/// over the set they claim. Unwiring it puts all three back on an
+/// unchecked assumption over attacker-controlled bytes.
 pub fn non_coinbase_sigops(block: &ParsedBlock) -> u32 {
     sum_legacy_sigops(block.0.txdata.iter().skip(1))
 }
@@ -911,6 +918,11 @@ pub fn check_sigops_max(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
 /// Verify no non-coinbase transaction carries a null previous
 /// output. A null prevout outside the coinbase position would mint
 /// value out of nothing; consensus forbids it.
+///
+/// The `skip(1)` precondition is established by
+/// [`check_coinbase_null_prevout`], which owns index 0 and is the only
+/// reason this function's exclusion of it is sound; see the note on
+/// [`non_coinbase_sigops`].
 ///
 /// # Errors
 ///
@@ -1274,10 +1286,10 @@ mod tests {
     #[test]
     fn not_implemented_code_is_outside_all_codes() {
         // NotImplemented is a degraded sentinel, not a real
-        // invariant mismatch. It must not collide with the 18.
+        // invariant mismatch. It must not collide with the 23.
         assert!(
             !ConsensusViolation::ALL_CODES.contains(&ConsensusViolation::NOT_IMPLEMENTED_CODE),
-            "NOT_IMPLEMENTED_CODE must be distinct from the 18 shield codes",
+            "NOT_IMPLEMENTED_CODE must be distinct from the 23 shield codes",
         );
         assert!(
             ConsensusViolation::NOT_IMPLEMENTED_CODE.starts_with("v2_invariant_"),
@@ -1996,6 +2008,18 @@ mod tests {
         // the wrong iterator to any of them breaks this identity.
         // Well below the u32 saturation boundary, where the three
         // clamp independently and the identity does not hold.
+        //
+        // Known blind spot, so do not read this test as covering more
+        // than it does: the identity is invariant under ANY change to
+        // the shared `sum_legacy_sigops` body, because that one body
+        // feeds all three sides. Deleting the `script_sig` arm scales
+        // every figure down together and the identity still holds. The
+        // absolute values live in
+        // `sigop_accessors_count_script_sig_and_script_pubkey`; the
+        // independent-clamp contract, which is the only thing that
+        // separates `non_coinbase_sigops` from `total - coinbase`,
+        // lives in
+        // `sigop_accessors_clamp_independently_at_the_u32_boundary`.
         let mut shapes: Vec<bitcoin::Block> = Vec::new();
 
         shapes.push(genesis_block_mut()); // coinbase only
@@ -2026,6 +2050,114 @@ mod tests {
                 "shape {i}: total != coinbase + non_coinbase"
             );
         }
+    }
+
+    #[test]
+    fn sigop_accessors_count_script_sig_and_script_pubkey() {
+        // Absolute values, hand computed, over a shape where BOTH
+        // terms of `sum_legacy_sigops` are non-zero on BOTH sides of
+        // the coinbase split. Before this test no shipped test
+        // exercised a `script_sig` carrying a legacy sigop at all, so
+        // deleting the `script_sig` arm of the shared body passed the
+        // whole suite: the reconcile test above only asserts an
+        // identity, and every other sigop test puts its opcodes in a
+        // `script_pubkey`.
+        //
+        // 0xac is OP_CHECKSIG, worth one legacy sigop each, and a run
+        // of them decodes as that many opcodes because none of them
+        // pushes. Genesis is only the carrier here; every script that
+        // contributes is overwritten below, so the expected figures do
+        // not depend on what genesis happens to contain.
+        let mut b = genesis_block_mut();
+        b.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from(vec![0xacu8; 3]);
+        b.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from(vec![0xacu8; 2]);
+        let cb_txid = b.txdata[0].compute_txid();
+        let mut spender = simple_tx(bitcoin::OutPoint {
+            txid: cb_txid,
+            vout: 0,
+        });
+        spender.input[0].script_sig = bitcoin::ScriptBuf::from(vec![0xacu8; 7]);
+        spender.output[0].script_pubkey = bitcoin::ScriptBuf::from(vec![0xacu8; 4]);
+        b.txdata.push(spender);
+        let p = ParsedBlock(b);
+
+        // coinbase: 3 in the scriptSig + 2 in the scriptPubKey.
+        assert_eq!(
+            coinbase_sigops(&p),
+            5,
+            "coinbase must count both its scriptSig and its scriptPubKey"
+        );
+        // body tx: 7 in the scriptSig + 4 in the scriptPubKey.
+        assert_eq!(
+            non_coinbase_sigops(&p),
+            11,
+            "non-coinbase must count both its scriptSig and its scriptPubKey"
+        );
+        assert_eq!(total_sigops(&p), 16, "whole block is 5 + 11");
+        // The four terms are pairwise distinct, so a body that dropped
+        // any one arm lands on a different number rather than on
+        // another legal-looking total.
+        assert_eq!(
+            count_sigops(&bitcoin::consensus::serialize(&p.0)).expect("re-serializes"),
+            16,
+            "the raw-bytes accessor must agree with the parsed one"
+        );
+    }
+
+    #[test]
+    #[ignore = "allocates ~205 MiB of script bytes; run with --ignored"]
+    fn sigop_accessors_clamp_independently_at_the_u32_boundary() {
+        // The documented contract on `non_coinbase_sigops` is that it
+        // equals `total_sigops` minus `coinbase_sigops` EXCEPT at the
+        // u32 boundary, where each figure clamps independently. That
+        // exception is the only observable difference between the
+        // shipped body and a `total - coinbase` collapse, so it is the
+        // only thing that can hold the accessor to summing its own set.
+        //
+        // Ignored by default because reaching the boundary is
+        // inherently expensive: OP_CHECKMULTISIG (0xae) is the densest
+        // legacy opcode at MAX_PUBKEYS_PER_MULTISIG = 20 sigops per
+        // byte, so 2^32 sigops costs ~205 MiB of script bytes and two
+        // full scans of it. There is no cheap construction; the
+        // arithmetic bound is the cost.
+        const PER_BYTE: u64 = 20;
+        // 20 * 214_748_364 = 4_294_967_280, which is u32::MAX - 15:
+        // large enough that adding the coinbase's 20 crosses the
+        // boundary, small enough that this figure does not clamp on
+        // its own.
+        const BODY_BYTES: usize = 214_748_364;
+        const BODY_SIGOPS: u32 = 4_294_967_280;
+        assert_eq!(PER_BYTE * BODY_BYTES as u64, u64::from(BODY_SIGOPS));
+
+        let mut b = genesis_block_mut();
+        b.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::new();
+        b.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from(vec![0xaeu8; 1]);
+        let cb_txid = b.txdata[0].compute_txid();
+        let mut spender = simple_tx(bitcoin::OutPoint {
+            txid: cb_txid,
+            vout: 0,
+        });
+        spender.input[0].script_sig = bitcoin::ScriptBuf::from(vec![0xaeu8; BODY_BYTES]);
+        b.txdata.push(spender);
+        let p = ParsedBlock(b);
+
+        assert_eq!(coinbase_sigops(&p), 20, "one OP_CHECKMULTISIG");
+        assert_eq!(
+            total_sigops(&p),
+            u32::MAX,
+            "20 + 4_294_967_280 exceeds u32::MAX, so the whole-block figure clamps"
+        );
+        // The collapse would return u32::MAX - 20 = 4_294_967_275 here.
+        assert_eq!(
+            non_coinbase_sigops(&p),
+            BODY_SIGOPS,
+            "non_coinbase_sigops must sum its own set, not subtract the coinbase from a clamped total"
+        );
+        assert!(
+            u64::from(coinbase_sigops(&p)) + u64::from(non_coinbase_sigops(&p))
+                > u64::from(total_sigops(&p)),
+            "this shape is past the boundary, so the reconcile identity must NOT hold here"
+        );
     }
 
     // ── PB-20: txdata[0] must actually BE a coinbase ──────────────
