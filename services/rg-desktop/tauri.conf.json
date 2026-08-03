@@ -58,7 +58,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/LeavesJ/veldra/releases/latest/download/update.json"
+        "https://github.com/LeavesJ/ReserveGrid-OS/releases/latest/download/update.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEREM0QyNDUyOUIyODM1QzEKUldUQk5TaWJVaVE5M2NDbnNoVm9PdVF3MC9oay9oUVNNcGdWTXU5S0lzcTdBMG9za3Z4VFZiNzMK"
     }

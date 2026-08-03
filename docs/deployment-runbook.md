@@ -96,8 +96,8 @@ are noted where they apply.
 ## Step 1: Clone and Configure Environment
 
 ```bash
-git clone https://github.com/veldra/reservegrid-os.git
-cd reservegrid-os
+git clone https://github.com/LeavesJ/ReserveGrid-OS.git
+cd ReserveGrid-OS
 cp deploy/env.prod.example .env
 ```
 

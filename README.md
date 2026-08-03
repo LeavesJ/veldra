@@ -1,12 +1,14 @@
 ## ReserveGrid OS
 
+A [Veldra, Inc.](https://veldra.org) product.
+
 **ReserveGrid OS** is a policy driven verification, mining gateway, and observability stack for Bitcoin mining pools. It sits between the template source and miners, inspecting candidate block templates against operator defined policy and routing Stratum V2 work to connected workers. Operators get a full dashboard with live metrics, structured logs, and Prometheus instrumentation out of the box.
 
 Built in Rust. Ships as a native macOS/Linux desktop app (`rg-desktop`) with embedded dashboard, or as a `docker compose up` server stack for headless deployment.
 
 **Current version:** v2.0.0-rc1
 
-**v2.0 highlights (release candidate):** Independent consensus re-derivation against raw block bytes (Phase 1) plus mempool ground truth via direct bitcoind RPC (Phase 2) ship above the v1.1.0 policy + gateway + observability baseline. Production validation soak in progress; final v2.0.0 ships once the soak completes cleanly. See the [v2.0.0-rc1 release notes](https://github.com/LeavesJ/veldra/releases/tag/v2.0.0-rc1) for the full list.
+**v2.0 highlights (release candidate):** Independent consensus re-derivation against raw block bytes (Phase 1) plus mempool ground truth via direct bitcoind RPC (Phase 2) ship above the v1.1.0 policy + gateway + observability baseline. Production validation soak in progress; final v2.0.0 ships once the soak completes cleanly. See the [v2.0.0-rc1 release notes](https://github.com/LeavesJ/ReserveGrid-OS/releases/tag/v2.0.0-rc1) for the full list.
 
 ---
 
