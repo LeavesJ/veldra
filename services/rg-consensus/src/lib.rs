@@ -273,14 +273,14 @@ impl ConsensusViolation {
     ];
 
     /// Degraded sentinel emitted when the shield is scaffolded but
-    /// the parser is not wired. Kept distinct from the 23 invariant
+    /// the parser is not wired. Kept distinct from the 24 invariant
     /// codes so dashboards can alert on "shield disabled" separately
     /// from "shield disagreed".
     pub const NOT_IMPLEMENTED_CODE: &str = "v2_invariant_not_implemented";
 
     /// Canonical `snake_case` reason code string for this violation.
     ///
-    /// The 23 invariant variants map to the canonical strings in
+    /// The 24 invariant variants map to the canonical strings in
     /// [`ConsensusViolation::ALL_CODES`]. `NotImplemented` maps to
     /// [`ConsensusViolation::NOT_IMPLEMENTED_CODE`] so it never
     /// collides with a real invariant mismatch in export data.
@@ -740,6 +740,14 @@ fn sum_legacy_sigops<'a>(txs: impl Iterator<Item = &'a bitcoin::Transaction>) ->
 /// The `skip(1)` precondition is established by
 /// [`check_coinbase_null_prevout`]; see the note on
 /// [`non_coinbase_sigops`].
+///
+/// The `.sum()` below is unchecked but cannot overflow `u64`: its only
+/// production caller is pool-verifier, whose HTTP layer caps every
+/// request body at 1 MiB (`RequestBodyLimitLayer` in
+/// `services/pool-verifier/src/http.rs:103`) before `raw_block_hex`
+/// is decoded, so the parsed block is bounded to well under 1 MiB and
+/// BIP-141 weight is at most roughly 4x serialized size, many orders
+/// of magnitude below `u64::MAX`.
 pub fn non_coinbase_tx_weight(block: &ParsedBlock) -> u64 {
     block
         .0
@@ -1380,10 +1388,10 @@ mod tests {
     #[test]
     fn not_implemented_code_is_outside_all_codes() {
         // NotImplemented is a degraded sentinel, not a real
-        // invariant mismatch. It must not collide with the 23.
+        // invariant mismatch. It must not collide with the 24.
         assert!(
             !ConsensusViolation::ALL_CODES.contains(&ConsensusViolation::NOT_IMPLEMENTED_CODE),
-            "NOT_IMPLEMENTED_CODE must be distinct from the 23 shield codes",
+            "NOT_IMPLEMENTED_CODE must be distinct from the 24 shield codes",
         );
         assert!(
             ConsensusViolation::NOT_IMPLEMENTED_CODE.starts_with("v2_invariant_"),

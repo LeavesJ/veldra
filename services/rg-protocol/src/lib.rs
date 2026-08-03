@@ -208,13 +208,13 @@ pub enum VerdictReason {
     #[serde(rename = "v2_invariant_sigops_exceed_max")]
     V2InvariantSigopsExceedMax,
 
-    /// Non coinbase transaction carries a null prevout.
     /// A coinbase output value, or their total, falls outside
     /// Bitcoin's `MoneyRange`, or the total does not fit `u64`
     /// (PB-21).
     #[serde(rename = "v2_invariant_coinbase_value_exceeds_max")]
     V2InvariantCoinbaseValueExceedsMax,
 
+    /// Non coinbase transaction carries a null prevout.
     #[serde(rename = "v2_invariant_nontcb_null_prevout")]
     V2InvariantNontcbNullPrevout,
 

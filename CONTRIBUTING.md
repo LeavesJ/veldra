@@ -28,6 +28,15 @@ review.
 rustup install 1.92
 rustup default 1.92
 
+# Build the rg-dashboard frontend first. rust-embed bakes
+# services/rg-dashboard/frontend/dist into the rg-dashboard binary, and
+# dist/ is gitignored, so a fresh clone cannot build or test the
+# workspace until this step runs (matches the CI `build-test` job).
+cd services/rg-dashboard/frontend
+npm ci
+npm run build
+cd -
+
 # Build the workspace
 cargo build --workspace
 

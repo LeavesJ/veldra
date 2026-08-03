@@ -17,9 +17,12 @@ pub struct AppState {
 
     /// Phase 2 mempool view. `None` when `[policy.mempool] enforce`
     /// is `false` (default); the shield then runs Phase 1 only.
-    /// `Some(view)` when the polling task is wired at startup; the
-    /// shield's `evaluate_dynamic` reads a snapshot per template
-    /// and routes through `check_invariant_shield_with_mempool`.
+    /// `Some(view)` when the polling task is wired at startup;
+    /// `evaluate_dynamic_phase2` reads a snapshot per template and
+    /// passes it straight to `check_invariant_shield_inner`.
+    /// `check_invariant_shield_with_mempool` is a single-expression
+    /// wrapper over that same inner function, called only from
+    /// `tests/phase2_eval.rs`.
     pub mempool_view: Option<std::sync::Arc<MempoolView>>,
 }
 

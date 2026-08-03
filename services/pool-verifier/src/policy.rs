@@ -739,11 +739,13 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
 
 /// Run the v2.0 Invariant Shield pass against a template.
 ///
-/// Scope: 19 invariants wired. Tier 1 + Tier 2 shipped in Phase 1 #4b;
+/// Scope: 20 invariants wired. Tier 1 + Tier 2 shipped in Phase 1 #4b;
 /// seven Tier 3 belt-and-suspenders checks landed in Phase 1.5,
 /// completing ADR-002's ratified table of 18. PB-20 then added an
 /// eighth Tier 3 check, `CoinbasePrevoutNotNull`, which WIDENS that
-/// table to 19 rather than completing it (ADR-002 Amendment 1).
+/// table to 19 rather than completing it (ADR-002 Amendment 1). PB-21
+/// then added a ninth Tier 3 check, `CoinbaseValueExceedsMax`, which
+/// widens it again to 20 (ADR-002 Amendment 2).
 ///
 /// Wired invariants:
 ///
@@ -917,8 +919,11 @@ fn check_invariant_shield_inner(
         }
     };
 
-    // Single deserialize. All Class S checks and Class D accessors
-    // operate on the resulting ParsedBlock without re-parsing.
+    // All Class S checks and every Class D accessor below except
+    // CoinbaseValueMismatch operate on this ParsedBlock without
+    // re-parsing. CoinbaseValueMismatch's `re_derive_coinbase_value`
+    // takes `raw_block` directly and deserializes it a second time
+    // internally, so this is not a single deserialize overall.
     let parsed = match rg_consensus::parse_block(&raw_block) {
         Ok(p) => p,
         Err(v) => {
@@ -1114,10 +1119,17 @@ fn check_invariant_shield_inner(
     }
 
     // ── Tier 3: belt-and-suspenders checks (Phase 1.5) ────────────
-    // Standalone consensus ceilings and structural rules, in ADR-002
-    // table order. No declared field needed; each check reads only
-    // the parsed block. First violation wins, matching the Class S
-    // and Class D short-circuit discipline above.
+    // Standalone consensus ceilings and structural rules. No declared
+    // field needed; each check reads only the parsed block. First
+    // violation wins, matching the Class S and Class D short-circuit
+    // discipline above.
+    //
+    // Order is no longer ADR-002 table order: PB-21's
+    // `check_coinbase_value_max` runs right after `check_weight_max`
+    // and `check_sigops_max`, alongside them in the ceiling family
+    // (ADR-002 Amendment 2), rather than at the table position after
+    // `check_coinbase_null_prevout`. Order is behaviorally significant
+    // here (first violation wins) and is intentionally left as-is.
     let tier3_checks: [Tier3Check; 9] = [
         rg_consensus::check_coinbase_script_length,
         rg_consensus::check_coinbase_output_count,
@@ -2157,7 +2169,7 @@ mod tests {
     #[test]
     fn shield_violation_mapping_is_distinct_across_invariants() {
         // Catch silent collapses to a single VerdictReason across the
-        // 23 shield variants. NotImplemented is the shield-disabled
+        // 24 shield variants. NotImplemented is the shield-disabled
         // sentinel and intentionally routes to InternalError.
         let mut seen: Vec<VerdictReason> = ConsensusViolation::ALL
             .iter()

@@ -78,12 +78,13 @@ None at the RC layer. The 22 new `v2_invariant_*` reason codes are additive acro
 
 ## Upgrade from v1.1.0
 
-1. Pull the `v2.0.0-rc1` tag and rebuild: `cargo build --workspace --exclude rg-desktop --release`.
-2. Verify the pre-commit gates: `cargo fmt --all --check && cargo clippy --workspace --exclude rg-desktop --all-targets -- -D warnings && cargo test --workspace --exclude rg-desktop`.
-3. Add `[policy.mempool]` configuration to `config/policy.toml` if running observe or inline mode against a real bitcoind. Keep `[policy.mempool] enforce = false` to defer Phase 2 enablement until you are ready to point the verifier at a bitcoind RPC endpoint.
-4. Set `VELDRA_BITCOIND_RPC_USER` plus `VELDRA_BITCOIND_RPC_PASS` env vars on the pool-verifier service when enabling Phase 2. The verifier prefers the env var to the on-disk `[policy.mempool] rpc_pass` value to keep secrets out of `policy.toml`.
-5. Rebuild and deploy: `docker compose build && docker compose up -d`.
-6. Verify Phase 2 health on the metrics endpoint: `curl -s http://localhost:8081/metrics | grep -E 'verifier_phase2|verifier_mempool_view'`. Expect `verifier_phase2_checks_total{result="agreed"}` to increment, `verifier_mempool_view_age_seconds` to stay under 60, and `verifier_mempool_view_size` to be non-zero.
-7. Operators running the canonical one-week production observation cycle: capture the T-1 baseline via `scripts/phase2-baseline.sh` and follow the runbook at `docs/runbooks/phase2-shadow-soak.md`.
+1. Pull the `v2.0.0-rc1` tag. Build the rg-dashboard frontend first: `cd services/rg-dashboard/frontend && npm ci && npm run build && cd -`. This step is required before any cargo build or test: rust-embed bakes the gitignored `dist/` output into the rg-dashboard binary, and CI runs this same step ahead of `cargo build` in the `build-test` job.
+2. Rebuild: `cargo build --workspace --exclude rg-desktop --release`.
+3. Verify the pre-commit gates: `cargo fmt --all --check && cargo clippy --workspace --exclude rg-desktop --all-targets -- -D warnings && cargo test --workspace --exclude rg-desktop`.
+4. Add `[policy.mempool]` configuration to `config/policy.toml` if running observe or inline mode against a real bitcoind. Keep `[policy.mempool] enforce = false` to defer Phase 2 enablement until you are ready to point the verifier at a bitcoind RPC endpoint.
+5. Set `VELDRA_BITCOIND_RPC_USER` plus `VELDRA_BITCOIND_RPC_PASS` env vars on the pool-verifier service when enabling Phase 2. The verifier prefers the env var to the on-disk `[policy.mempool] rpc_pass` value to keep secrets out of `policy.toml`.
+6. Rebuild and deploy: `docker compose build && docker compose up -d`.
+7. Verify Phase 2 health on the metrics endpoint: `curl -s http://localhost:8081/metrics | grep -E 'verifier_phase2|verifier_mempool_view'`. Expect `verifier_phase2_checks_total{result="agreed"}` to increment, `verifier_mempool_view_age_seconds` to stay under 60, and `verifier_mempool_view_size` to be non-zero.
+8. Operators running the canonical one-week production observation cycle: capture the T-1 baseline via `scripts/phase2-baseline.sh` and follow the runbook at `docs/runbooks/phase2-shadow-soak.md`.
 
 See [CHANGELOG.md](https://github.com/LeavesJ/ReserveGrid-OS/blob/main/CHANGELOG.md) for the complete list of changes.
