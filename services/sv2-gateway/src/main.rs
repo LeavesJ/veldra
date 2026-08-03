@@ -146,6 +146,49 @@ async fn api_key_middleware(req: Request<Body>, next: Next) -> Response {
     next.run(req).await
 }
 
+/// Install the process-level rustls `CryptoProvider` before any TLS
+/// consumer in this process can reach a builder (PB-30).
+///
+/// `rustls` 0.23 picks a provider from its enabled crate features, and
+/// this binary enables two: `tokio-rustls` pulls `aws-lc-rs` and
+/// `reqwest`'s `rustls-tls` pulls `ring`. With two candidates the choice
+/// is ambiguous, so `ClientConfig::builder()` in `build_verifier_tls`
+/// panicked with "Could not automatically determine the process-level
+/// `CryptoProvider` from Rustls crate features" the moment
+/// `verifier.tls_ca_cert` was set, taking the process down during
+/// startup. PB-28 fixed the verifier end of that same channel and left
+/// this end dead, which is why the mTLS path had never once completed.
+///
+/// `aws_lc_rs` is the same provider `pool-verifier` installs, so the two
+/// ends of the verdict channel never run different providers.
+///
+/// This is a copy of `pool-verifier/src/main.rs::install_crypto_provider`,
+/// not a shared helper: two call sites are a copy, and the alternative
+/// is a `tokio-rustls` edge in `reservegrid-common`, which every service
+/// links, including the several that carry no TLS at all.
+///
+/// `install_default` returns `Err` only when a provider is already
+/// installed, which is the state this wants, so that arm proceeds. The
+/// post-condition is checked rather than assumed: no provider at this
+/// point is a startup failure, not a panic deferred to the first
+/// handshake.
+fn install_crypto_provider() -> Result<(), String> {
+    use tokio_rustls::rustls::crypto::{CryptoProvider, aws_lc_rs};
+
+    if CryptoProvider::get_default().is_none()
+        && aws_lc_rs::default_provider().install_default().is_err()
+    {
+        info!("rustls CryptoProvider was installed concurrently; using the installed one");
+    }
+    if CryptoProvider::get_default().is_none() {
+        return Err(
+            "no rustls CryptoProvider is installed after install_default; TLS cannot start"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -153,6 +196,14 @@ fn main() -> ExitCode {
     init_tracing();
 
     info!(config_path = %cli.config, "starting sv2-gateway");
+
+    // Ahead of every rustls consumer in the process, and ahead of the
+    // config load, so a provider that cannot install is a startup error
+    // rather than a panic on the first verifier connection.
+    if let Err(e) = install_crypto_provider() {
+        error!(error = %e, "failed to install the rustls CryptoProvider");
+        return ExitCode::FAILURE;
+    }
 
     // Load and validate configuration.
     let config_text = match std::fs::read_to_string(&cli.config) {

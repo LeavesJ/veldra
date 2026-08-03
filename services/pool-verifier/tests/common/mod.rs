@@ -1,13 +1,13 @@
 //! Shared harness for the pool-verifier ingress integration tests.
 //!
-//! `ingress_conn_cap.rs` (PB-26) and `ingress_reaping.rs` (PB-27) both
-//! boot the real release binary, drive it over a real socket, and assert
-//! on wire behaviour or on a shipped `/metrics` sample rather than on an
-//! internal counter. PB-27 is the third caller of the scratch-dir,
-//! subprocess, connect, and propose helpers, and `ingress_conn_cap.rs`
-//! said in prose that the shared module was waiting for exactly that, so
-//! the helpers live here now and that file imports them instead of
-//! keeping its own copies.
+//! `ingress_conn_cap.rs` (PB-26), `ingress_reaping.rs` (PB-27, PB-28)
+//! and `https_surface.rs` (PB-30) all boot the real release binary,
+//! drive it over a real socket, and assert on wire behaviour or on a
+//! shipped `/metrics` sample rather than on an internal counter. PB-27
+//! is the third caller of the scratch-dir, subprocess, connect, and
+//! propose helpers, and `ingress_conn_cap.rs` said in prose that the
+//! shared module was waiting for exactly that, so the helpers live here
+//! now and that file imports them instead of keeping its own copies.
 //!
 //! `phase2_tcp.rs` keeps its own copies on purpose: its policy file
 //! carries a `[policy.mempool]` section, it spawns a mock bitcoind RPC
@@ -172,6 +172,11 @@ pub struct BootOptions {
     /// Generate a self-signed cert and boot the ingress with TLS, so
     /// the TLS handshake path is under test.
     pub tls: bool,
+    /// `VELDRA_TLS_SELF_SIGNED=1`: serve the HTTP surface (`/metrics`,
+    /// `/health`, the dashboard) over HTTPS. Independent of `tls`, which
+    /// is the NDJSON ingress. PB-30: HTTPS on with ingress TLS off is
+    /// the shipped default and the combination that had no test.
+    pub https_self_signed: bool,
 }
 
 impl Default for BootOptions {
@@ -183,6 +188,7 @@ impl Default for BootOptions {
             idle_timeout_secs: None,
             bind_host: "127.0.0.1",
             tls: false,
+            https_self_signed: false,
         }
     }
 }
@@ -232,6 +238,9 @@ pub async fn boot_verifier(opts: BootOptions) -> Booted {
         std::fs::write(&key_path, key_pem).expect("write key pem");
         cmd.env("VELDRA_VERIFIER_TLS_CERT", &cert_path)
             .env("VELDRA_VERIFIER_TLS_KEY", &key_path);
+    }
+    if opts.https_self_signed {
+        cmd.env("VELDRA_TLS_SELF_SIGNED", "1");
     }
 
     let child = cmd.spawn().expect("spawn pool-verifier");
@@ -516,6 +525,87 @@ pub async fn tls_connect(
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// `GET path` over HTTPS against the verifier's HTTP surface, returning
+/// the status code and the response body.
+///
+/// PB-30 needs the status, not "did anything come back", so this speaks
+/// HTTP/1.1 down a `tokio-rustls` session rather than using `reqwest`.
+/// Two reasons: the provider is passed to the client builder explicitly,
+/// so a missing process-level install on the server side cannot be
+/// masked by one this test process happens to have made, and the raw
+/// status line is the observable the report has to quote.
+pub async fn https_get(http_port: u16, path: &str, deadline: Duration) -> (u16, String) {
+    use tokio_rustls::rustls::{ClientConfig, crypto};
+
+    let provider = Arc::new(crypto::aws_lc_rs::default_provider());
+    let mut config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("client protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+        .with_no_client_auth();
+    // `axum-server` offers h2 and http/1.1. Pin http/1.1 so the request
+    // written below is the protocol actually negotiated.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let addr = format!("127.0.0.1:{http_port}");
+
+    let start = Instant::now();
+    let mut last = "no attempt completed".to_string();
+    while start.elapsed() < deadline {
+        match https_get_once(&connector, &addr, path).await {
+            Ok(response) => return response,
+            Err(e) => last = e,
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("HTTPS GET {path} on {addr} never answered within {deadline:?}; last error: {last}");
+}
+
+async fn https_get_once(
+    connector: &tokio_rustls::TlsConnector,
+    addr: &str,
+    path: &str,
+) -> Result<(u16, String), String> {
+    use tokio::io::AsyncReadExt as _;
+    use tokio_rustls::rustls::pki_types::ServerName;
+
+    let tcp = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("tcp connect: {e}"))?;
+    let name = ServerName::try_from("localhost").map_err(|e| format!("server name: {e}"))?;
+    let mut tls = connector
+        .connect(name, tcp)
+        .await
+        .map_err(|e| format!("tls handshake: {e}"))?;
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("write request: {e}"))?;
+    tls.flush().await.map_err(|e| format!("flush: {e}"))?;
+
+    let mut raw = Vec::new();
+    tls.read_to_end(&mut raw)
+        .await
+        .map_err(|e| format!("read response: {e}"))?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+
+    let status_line = text.lines().next().ok_or("empty response")?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| format!("no status code in `{status_line}`"))?
+        .parse()
+        .map_err(|e| format!("status code in `{status_line}`: {e}"))?;
+    let body = text
+        .split_once("\r\n\r\n")
+        .map_or_else(String::new, |(_headers, body)| body.to_string());
+    Ok((status, body))
 }
 
 /// Accepts any server certificate. Test-only, and only reachable from

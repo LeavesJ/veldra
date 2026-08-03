@@ -293,6 +293,58 @@ async fn tls_handshake_that_never_starts_is_reaped() {
     .await;
 }
 
+/// (c2) PB-30 / I3. The handshake kill must not be reported as an idle
+/// timeout.
+///
+/// `TLS_HANDSHAKE_BUDGET` is a hardcoded 10 s constant
+/// (`ingress.rs:239`), but the kill it drives incremented
+/// `verifier_connections_reaped_idle_total`, which `metrics.rs` and
+/// `deploy/env.prod.example` both attribute to
+/// `VELDRA_VERIFIER_IDLE_TIMEOUT_SECS`. An operator watching that
+/// counter climb raises the documented env var and nothing changes,
+/// which is the worst shape a metric can have: it points at a knob that
+/// cannot affect it.
+///
+/// The idle budget here is 600 s, so nothing in this test can be an
+/// idle reap. Any tick on the idle counter is a misattribution.
+#[tokio::test]
+async fn handshake_kill_is_counted_apart_from_the_idle_budget() {
+    let booted = boot_verifier(BootOptions {
+        label: "pb30-handshake-attr",
+        max_connections: 2,
+        max_connections_per_ip: Some(0),
+        idle_timeout_secs: Some(600),
+        tls: true,
+        ..BootOptions::default()
+    })
+    .await;
+    let addr = booted.v4_addr();
+
+    let mut squatter_a = connect(&addr, Duration::from_secs(30)).await;
+    let mut squatter_b = connect(&addr, Duration::from_secs(5)).await;
+    assert!(
+        closed_within(&mut squatter_a, REAP_DEADLINE).await,
+        "the handshake budget must end a peer that never sends a ClientHello"
+    );
+    assert!(
+        closed_within(&mut squatter_b, REAP_DEADLINE).await,
+        "the handshake budget must end a peer that never sends a ClientHello"
+    );
+
+    let body = scrape_metrics(booted.http_port).await;
+    assert_eq!(
+        sample_value(&body, "verifier_connections_reaped_handshake_total"),
+        2,
+        "both handshake kills must be counted under the budget that caused them:\n{body}"
+    );
+    assert_eq!(
+        sample_value(&body, "verifier_connections_reaped_idle_total"),
+        0,
+        "the idle budget was 600 s and nothing here reached it; a tick here sends the \
+         operator to VELDRA_VERIFIER_IDLE_TIMEOUT_SECS, which cannot affect this kill:\n{body}"
+    );
+}
+
 /// (d) One IP must not be able to take the whole ingress. The global cap
 /// is per process, so before PB-27 a single source address could hold
 /// every slot.

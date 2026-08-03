@@ -63,29 +63,13 @@ pub(crate) fn build_tcp_tls_acceptor() -> Result<Option<TlsAcceptor>, String> {
     let cert_path = cert_path.clone();
     let key_path = key_path.clone();
 
-    // PB-28. `rustls` 0.23 picks a process-level `CryptoProvider` from
-    // its enabled crate features, and this workspace enables both:
-    // `axum-server`'s `tls-rustls` pulls `aws-lc-rs` and `reqwest`'s
-    // `rustls-tls-webpki-roots` pulls `ring`. With two candidates the
-    // choice is ambiguous, so `ServerConfig::builder()` panics with
-    // "Could not automatically determine the process-level
-    // CryptoProvider from Rustls crate features" and the verifier dies
-    // during startup the moment TLS is configured. That is why no test
-    // ever saw it: none of them booted the ingress in TLS mode.
-    //
-    // `aws_lc_rs` is rustls' own default and the provider the HTTPS
-    // side of this same process (axum-server) already builds against,
-    // so pinning it keeps one provider in the binary rather than two
-    // behaviours. `install_default` returns `Err` only when a provider
-    // is already installed, which is exactly the state we want, so it
-    // is not a swallowed failure.
-    if tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_none()
-        && tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .is_err()
-    {
-        info!("rustls CryptoProvider was installed concurrently; using the installed one");
-    }
+    // The process-level rustls `CryptoProvider` that
+    // `ServerConfig::builder()` below needs is installed by
+    // `main::install_crypto_provider`, which runs before this function
+    // is called. PB-28 installed it here instead, which put it behind
+    // the `return Ok(None)` above: with the ingress TLS env vars unset,
+    // which is the shipped default, the install never ran and the HTTPS
+    // server took the very panic it was added to fix (PB-30).
 
     // Load server certificate chain.
     let cert_pem = std::fs::read(&cert_path).map_err(|e| format!("read cert {cert_path}: {e}"))?;
@@ -160,11 +144,11 @@ pub(crate) fn generate_self_signed_cert() -> anyhow::Result<(Vec<u8>, Vec<u8>)> 
 /// it opens a fresh `TcpStream` per template and drops it once the
 /// verdict comes back (`template-manager/src/main.rs:1697`, consumed
 /// by `send_and_receive` at `:1816`), so at `poll_secs = 5` it wants a
-/// free slot every few seconds and holds one for under its own 3 s
-/// verdict timeout. A pool running a handful of each for HA sits in
-/// the single digits at any instant, so 32 is several times the real
-/// steady-state peak and still absorbs reconnect churn plus an
-/// operator's diagnostic connection.
+/// free slot every few seconds and holds one for under its own 4 s
+/// verdict timeout (`template-manager/src/main.rs:1679`). A pool
+/// running a handful of each for HA sits in the single digits at any
+/// instant, so 32 is several times the real steady-state peak and still
+/// absorbs reconnect churn plus an operator's diagnostic connection.
 ///
 /// The per-template reconnect is why PB-27 matters as much as PB-26:
 /// squatting the cap does not merely degrade throughput, it starves
@@ -493,7 +477,12 @@ async fn serve_admitted_connection(
                 warn!(peer = %peer, error = %e, "TLS accept failed");
             }
             Err(_elapsed) => {
-                metrics.connections_reaped_idle_total.inc();
+                // PB-30 / I3. Counted apart from the idle reap on
+                // purpose: `TLS_HANDSHAKE_BUDGET` is a constant, so an
+                // operator who saw this on the idle counter would raise
+                // `VELDRA_VERIFIER_IDLE_TIMEOUT_SECS` and change
+                // nothing.
+                metrics.connections_reaped_handshake_total.inc();
                 warn!(
                     peer = %peer,
                     budget_secs = TLS_HANDSHAKE_BUDGET.as_secs(),

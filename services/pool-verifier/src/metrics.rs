@@ -93,7 +93,24 @@ pub(crate) struct VerifierMetrics {
     /// closing. A steady rate with no attacker present means the budget
     /// is below the legitimate peer's heartbeat interval; a burst means
     /// sockets are being parked deliberately.
+    ///
+    /// PB-30: the TLS handshake kill is **not** counted here. See
+    /// `connections_reaped_handshake_total`.
     pub(crate) connections_reaped_idle_total: Counter,
+
+    /// PB-30. Ingress connections ended by `TLS_HANDSHAKE_BUDGET`
+    /// (`ingress.rs`), the total elapsed time a peer gets to complete
+    /// the TLS handshake after being admitted.
+    ///
+    /// Separate from `connections_reaped_idle_total` because the two
+    /// point at different controls, and one of them is not a control at
+    /// all: the handshake budget is a hardcoded constant, so raising
+    /// `VELDRA_VERIFIER_IDLE_TIMEOUT_SECS`, which is what the idle
+    /// counter's own documentation tells an operator to do, cannot move
+    /// this number. A tick here means a peer took a slot and never
+    /// started TLS, which is either a scanner or a client pointed at
+    /// the wrong port, never a budget that needs widening.
+    pub(crate) connections_reaped_handshake_total: Counter,
 
     /// PB-27. Ingress slots currently held. Without it, "the cap is too
     /// low", "slots are leaking" and "a squatter is present" are
@@ -117,6 +134,7 @@ impl VerifierMetrics {
             connections_refused_total: Counter::default(),
             connections_refused_per_ip_total: Counter::default(),
             connections_reaped_idle_total: Counter::default(),
+            connections_reaped_handshake_total: Counter::default(),
             connections_active: Gauge::default(),
         };
         registry.register(
@@ -180,8 +198,16 @@ impl VerifierMetrics {
         registry.register(
             "verifier_connections_reaped_idle",
             "NDJSON ingress connections ended by the no-progress deadline \
-             (VELDRA_VERIFIER_IDLE_TIMEOUT_SECS) rather than by the peer closing",
+             (VELDRA_VERIFIER_IDLE_TIMEOUT_SECS) rather than by the peer closing. \
+             Excludes TLS handshake kills; see verifier_connections_reaped_handshake_total",
             m.connections_reaped_idle_total.clone(),
+        );
+        registry.register(
+            "verifier_connections_reaped_handshake",
+            "NDJSON ingress connections ended because the TLS handshake did not complete \
+             within the ingress handshake budget. That budget is a hardcoded constant, so \
+             VELDRA_VERIFIER_IDLE_TIMEOUT_SECS does not affect this counter",
+            m.connections_reaped_handshake_total.clone(),
         );
         registry.register(
             "verifier_connections_active",
@@ -228,6 +254,7 @@ mod tests {
         m.connections_refused_total.inc();
         m.connections_refused_per_ip_total.inc();
         m.connections_reaped_idle_total.inc();
+        m.connections_reaped_handshake_total.inc();
         m.verdicts_total
             .get_or_create(&VerdictLabels {
                 accepted: "true".to_string(),
@@ -258,6 +285,7 @@ mod tests {
             "verifier_connections_refused_total",
             "verifier_connections_refused_per_ip_total",
             "verifier_connections_reaped_idle_total",
+            "verifier_connections_reaped_handshake_total",
         ] {
             assert!(body.contains(name), "missing exported counter `{name}`");
             let doubled = format!("{name}_total");
