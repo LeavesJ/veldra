@@ -28,6 +28,13 @@ prometheus-client = { workspace = true }
 subtle = "2"
 tower-http = { version = "0.6", features = ["limit"] }
 hex = "0.4"
+# PB-27. `tokio::net::TcpStream` exposes `set_nodelay` and `set_linger`
+# but no keepalive setter, and nothing in `services/` set SO_KEEPALIVE
+# before, which is why a gateway host that vanished without FIN burned
+# an ingress slot permanently. Not a new crate in the build: tokio
+# already depends on the same socket2 0.6, so this is a direct edge to a
+# graph member, not an addition to the graph.
+socket2 = "0.6"
 
 [[bin]]
 name = "pool-verifier"
@@ -57,6 +64,14 @@ hex = "0.4"
 # this crate above. `ingress_conn_cap.rs` scrapes the public /metrics
 # endpoint to assert the PB-26 refusal is observable.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Also not new: both already build for this crate above. PB-28's boot
+# test (`ingress_reaping.rs`) has to start the ingress in TLS mode and
+# complete a real handshake against it, so the test binary needs to mint
+# a self-signed cert (rcgen) and drive a client session (tokio-rustls).
+# `ingress::generate_self_signed_cert` is crate-private and an
+# integration test is a separate crate, so it cannot be reused.
+rcgen = "0.13"
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true

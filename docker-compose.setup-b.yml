@@ -49,6 +49,13 @@ services:
       # (network_mode: host), and the legitimate population is one
       # template-manager plus one sv2-gateway stream.
       VELDRA_VERIFIER_MAX_CONNECTIONS: "${VELDRA_VERIFIER_MAX_CONNECTIONS:-32}"
+      # PB-27 per-IP ceiling and no-progress budget, both at the shipped
+      # default. The ingress is loopback-only here, so the per-IP limit
+      # is not the load-bearing control on this node; the idle budget
+      # is, because template-manager opens a fresh connection per
+      # template and a stuck one would otherwise hold its slot forever.
+      VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP: "${VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP:-8}"
+      VELDRA_VERIFIER_IDLE_TIMEOUT_SECS: "${VELDRA_VERIFIER_IDLE_TIMEOUT_SECS:-60}"
     volumes:
       - ./deploy:/config:rw
       - ./config:/devconfig:ro

@@ -9,6 +9,7 @@ use tracing::info;
 mod dashboard;
 mod handlers;
 mod http;
+mod idle_stream;
 mod ingress;
 mod mempool_client;
 mod metrics;
@@ -72,6 +73,38 @@ struct Cli {
         value_parser = clap::value_parser!(u32).range(1..),
     )]
     max_connections: u32,
+
+    /// Maximum concurrent NDJSON ingress connections from any one
+    /// source address (PB-27). The global cap above is per process, so
+    /// without this one address can take every slot and lock out the
+    /// gateway and template-manager; the reported probe did exactly
+    /// that with eight sockets. `0` disables per-IP enforcement, for a
+    /// deployment whose legitimate peers all arrive through one L4
+    /// proxy address and therefore have no per-IP signal to enforce on.
+    #[arg(
+        long,
+        env = "VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP",
+        default_value_t = ingress::DEFAULT_MAX_INGRESS_CONNECTIONS_PER_IP,
+    )]
+    max_connections_per_ip: u32,
+
+    /// Seconds an ingress connection may make no progress in either
+    /// direction before it is closed and its slot returned (PB-27).
+    ///
+    /// Measured since the last byte that actually moved, never from the
+    /// connection's start, so a multi-megabyte `raw_block_hex` line
+    /// arriving slowly is not reaped. Raise it only when a legitimate
+    /// peer genuinely goes quiet for longer than the default; sv2-gateway
+    /// heartbeats every 5 s. Zero is rejected: disabling the budget
+    /// restores the PB-27 defect, where a silent socket holds its slot
+    /// for the life of the process.
+    #[arg(
+        long,
+        env = "VELDRA_VERIFIER_IDLE_TIMEOUT_SECS",
+        default_value_t = ingress::DEFAULT_INGRESS_IDLE_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    idle_timeout_secs: u64,
 }
 
 // ── Tracing ─────────────────────────────────────────────────
@@ -202,6 +235,10 @@ fn build_phase2_mempool_view(
 
 // ── Main ─────────────────────────────────────────────────────
 
+// Startup wiring is linear by nature: parse, validate, load state, spawn
+// the two servers. Splitting it to satisfy a line count would add a
+// layer that makes nothing easier to read or to change.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let log_reload = init_tracing();
@@ -213,6 +250,8 @@ async fn main() -> anyhow::Result<()> {
     let http_addr = cli.http_addr;
     let policy_path = cli.policy_file;
     let max_connections = cli.max_connections;
+    let max_connections_per_ip = cli.max_connections_per_ip;
+    let idle_timeout_secs = cli.idle_timeout_secs;
 
     // Prefer VELDRA_MODE; fall back to deprecated VELDRA_DASH_MODE for backward
     // compat with existing docker-compose files. Emit a warning so operators
@@ -300,6 +339,8 @@ async fn main() -> anyhow::Result<()> {
             tcp_tls_acceptor,
             tcp_metrics,
             max_connections,
+            max_connections_per_ip,
+            idle_timeout_secs,
         )
         .await
         {

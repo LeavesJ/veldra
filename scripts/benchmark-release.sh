@@ -10,10 +10,14 @@
 #   cargo build --release -p rg-load-test
 #
 # Scenario 6 opens 100 concurrent connections, which is far above what a
-# production pool ever holds. docker-compose.yml therefore sets
-# VELDRA_VERIFIER_MAX_CONNECTIONS=256 for this stack (PB-26). Pointing
-# this script at a stack running the shipped default of 32 will show
-# refused connections and a rising verifier_connections_refused_total.
+# production pool ever holds, and it opens all of them from one host.
+# docker-compose.yml therefore sets VELDRA_VERIFIER_MAX_CONNECTIONS=256
+# (PB-26) and VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP=256 (PB-27) for
+# this stack. Pointing this script at a stack running the shipped
+# defaults of 32 and 8 will show refused connections and a rising
+# verifier_connections_refused_total or
+# verifier_connections_refused_per_ip_total; the per-IP counter is the
+# one that tells you the global cap is not what is binding.
 #
 # Usage:
 #   ./scripts/benchmark-release.sh
