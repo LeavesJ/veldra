@@ -149,4 +149,12 @@ docs/DEVLOG.md.spotchecks
 
 # Derived PDFs from tracked markdown briefs. Markdown is the single source
 # of truth; regenerate via `pandoc <source>.md -o <source>.pdf` when needed.
+# The -v1 file is a superseded render kept only for local comparison.
 docs/site-redesign-content-additions.pdf
+docs/site-redesign-content-additions-v1.pdf
+
+# Private site working notes (AUDIT, DEV-STATUS, MOBILE-PLAN, SEO-DIAGNOSTIC).
+# Part of the enumerated private-doc block, NOT derived output, so the
+# private-docs pattern in scripts/gate.sh carries a matching `docs/site/`
+# alternative per invariant 7.
+docs/site/
