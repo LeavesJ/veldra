@@ -718,6 +718,9 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
         ConsensusViolation::WeightExceedsMax => VerdictReason::V2InvariantWeightExceedsMax,
         ConsensusViolation::SigopsExceedMax => VerdictReason::V2InvariantSigopsExceedMax,
         ConsensusViolation::NonCoinbaseNullPrevout => VerdictReason::V2InvariantNontcbNullPrevout,
+        ConsensusViolation::CoinbasePrevoutNotNull => {
+            VerdictReason::V2InvariantCoinbasePrevoutNotNull
+        }
         ConsensusViolation::HeaderVersionLow => VerdictReason::V2InvariantHeaderVersionLow,
         ConsensusViolation::DuplicateTx => VerdictReason::V2InvariantDuplicateTx,
         // v2.0 Invariant Shield Phase 2 (ADR-003)
@@ -1107,12 +1110,13 @@ fn check_invariant_shield_inner(
     // table order. No declared field needed; each check reads only
     // the parsed block. First violation wins, matching the Class S
     // and Class D short-circuit discipline above.
-    let tier3_checks: [Tier3Check; 7] = [
+    let tier3_checks: [Tier3Check; 8] = [
         rg_consensus::check_coinbase_script_length,
         rg_consensus::check_coinbase_output_count,
         rg_consensus::check_weight_max,
         rg_consensus::check_sigops_max,
         rg_consensus::check_non_coinbase_null_prevout,
+        rg_consensus::check_coinbase_null_prevout,
         rg_consensus::check_header_version,
         rg_consensus::check_duplicate_tx,
     ];
@@ -2522,6 +2526,107 @@ mod tests {
             }
             other => panic!("expected Rejected(V2InvariantCoinbaseBip34Missing) got {other:?}"),
         }
+    }
+
+    /// Rewrite the coinbase prevout in the serialized regtest
+    /// fixture and fix up the merkle root, which is what an attacker
+    /// controlling `raw_block_hex` would do anyway since the header
+    /// is theirs too.
+    ///
+    /// Offsets, same derivation the BIP-34 test above documents:
+    /// header 80, tx count varint 1, coinbase version 4, segwit
+    /// marker+flag 2, input count varint 1 => prevout txid at
+    /// 88..120 and prevout index at 120..124.
+    fn tamper_coinbase_prevout(txid: [u8; 32], vout: u32) -> String {
+        let mut bytes = hex::decode(REGTEST_SEGWIT_BLOCK_HEX.trim()).unwrap();
+        assert_eq!(
+            &bytes[88..120],
+            &[0u8; 32],
+            "fixture shape changed: bytes 88..120 are not the coinbase's null prevout txid"
+        );
+        assert_eq!(
+            &bytes[120..124],
+            &0xFFFF_FFFFu32.to_le_bytes(),
+            "fixture shape changed: bytes 120..124 are not the 0xFFFFFFFF prevout index"
+        );
+        bytes[88..120].copy_from_slice(&txid);
+        bytes[120..124].copy_from_slice(&vout.to_le_bytes());
+        fixup_merkle_root_in_block(&mut bytes);
+        hex::encode(bytes)
+    }
+
+    // ── PB-20: txdata[0] must actually BE a coinbase ──────────────
+
+    #[test]
+    fn shield_rejects_pb20_non_coinbase_at_index_zero() {
+        // The exact shape the PB-20 review executed and recorded as
+        // returning Agreed: index 0 spends prevout 0x11..11:7, so
+        // every skip(1) "non-coinbase" accessor silently reads the
+        // wrong set. Nothing before Tier 3 notices, because the
+        // tamper leaves weight, sigops, tx_count, coinbase value and
+        // the BIP-34 height push untouched and the merkle root is
+        // fixed up.
+        let t = TemplatePropose {
+            raw_block_hex: Some(tamper_coinbase_prevout([0x11; 32], 7)),
+            ..regtest_segwit_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbasePrevoutNotNull);
+            }
+            other => panic!("expected Rejected(V2InvariantCoinbasePrevoutNotNull) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_rejects_pb20_shape_with_coinbase_sigops_omitted() {
+        // PB-20 records that the shape also passed with
+        // coinbase_sigops absent, which is the stock-Core shape
+        // (Core omits `coinbasetxn`). Pin that the rejection does
+        // not depend on the attacker volunteering that field.
+        let t = TemplatePropose {
+            raw_block_hex: Some(tamper_coinbase_prevout([0x11; 32], 7)),
+            coinbase_sigops: None,
+            total_sigops: None,
+            ..regtest_segwit_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbasePrevoutNotNull);
+            }
+            other => panic!("expected Rejected(V2InvariantCoinbasePrevoutNotNull) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_rejects_pb20_half_coinbase_null_txid_wrong_index() {
+        // All-zero txid but index 0, the case a txid-only check
+        // would wave through.
+        let t = TemplatePropose {
+            raw_block_hex: Some(tamper_coinbase_prevout([0u8; 32], 0)),
+            ..regtest_segwit_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbasePrevoutNotNull);
+            }
+            other => panic!("expected Rejected(V2InvariantCoinbasePrevoutNotNull) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_still_agrees_on_the_untampered_fixture() {
+        // Guard against the new Tier 3 check rejecting honest
+        // templates: the same fixture, unmodified, must still pass.
+        // Without this the three tests above would also pass if
+        // check_coinbase_null_prevout rejected everything.
+        assert!(
+            matches!(
+                check_invariant_shield(&regtest_segwit_template()),
+                ShieldOutcome::Agreed
+            ),
+            "PB-20 check must not reject the honest regtest fixture"
+        );
     }
 
     // ── PB-18(a): Phase 2 Class M attribution ─────────────────────

@@ -123,12 +123,18 @@ The shield emits one of three outcomes per template:
   the verdict carries the matching `v2_invariant_*` reason code and a
   human-readable detail string.
 
-### Wired invariants (18 of 18)
+### Wired invariants (19 of 19)
 
 Phase 1 #4b wired eleven of the eighteen checks: ten invariants split
 into Tier 1 (critical) and Tier 2 (high), plus the decode-failed
 structural fault path. Phase 1.5 wired the remaining seven Tier 3
 belt-and-suspenders checks, completing the ADR-002 check set.
+
+PB-20 then added a nineteenth, `v2_invariant_coinbase_prevout_not_null`,
+widening the ratified table rather than completing it (ADR-002
+Amendment 1). It asserts `txdata[0]` really is a coinbase, which is the
+precondition every `skip(1)` "non-coinbase" derivation had assumed
+without checking.
 
 **Tier 1 (CRITICAL, direct attack vectors against pool revenue or
 consensus rejection)**
@@ -166,6 +172,7 @@ v2_invariant_coinbase_output_count      coinbase has at least one output
 v2_invariant_weight_exceeds_max         total weight <= 4_000_000 WU
 v2_invariant_sigops_exceed_max          legacy sigops x4 <= 80_000 sigop cost
 v2_invariant_nontcb_null_prevout        non-coinbase txs do not have null prevouts
+v2_invariant_coinbase_prevout_not_null  txdata[0] IS a coinbase: one input, null prevout
 v2_invariant_header_version_low         header.version >= 4 (BIP-65 floor)
 v2_invariant_duplicate_tx               no duplicate txid in the block body
 ```

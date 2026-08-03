@@ -104,6 +104,12 @@ pub enum ConsensusViolation {
     /// Non coinbase transaction carries a null prevout.
     NonCoinbaseNullPrevout,
 
+    /// `txdata[0]` is not a coinbase: its first input does not carry
+    /// the null previous output (all-zero txid, index `0xFFFFFFFF`),
+    /// or it has no inputs, or the body has no transactions at all,
+    /// or it carries more than the single input a coinbase may have.
+    CoinbasePrevoutNotNull,
+
     /// Block header version below active soft fork floor.
     HeaderVersionLow,
 
@@ -213,6 +219,7 @@ impl ConsensusViolation {
         ConsensusViolation::WeightExceedsMax,
         ConsensusViolation::SigopsExceedMax,
         ConsensusViolation::NonCoinbaseNullPrevout,
+        ConsensusViolation::CoinbasePrevoutNotNull,
         ConsensusViolation::HeaderVersionLow,
         ConsensusViolation::DuplicateTx,
         ConsensusViolation::MempoolTxUnknown { txid: [0; 32] },
@@ -225,8 +232,8 @@ impl ConsensusViolation {
         ConsensusViolation::NotImplemented,
     ];
 
-    /// All canonical reason code strings carried by the 22 shield
-    /// violation variants (18 Phase 1 + 4 Phase 2 Class M).
+    /// All canonical reason code strings carried by the 23 shield
+    /// violation variants (19 Phase 1 + 4 Phase 2 Class M).
     /// `NotImplemented` intentionally routes to a separate degraded
     /// sentinel and is not in this list.
     ///
@@ -249,6 +256,7 @@ impl ConsensusViolation {
         "v2_invariant_weight_exceeds_max",
         "v2_invariant_sigops_exceed_max",
         "v2_invariant_nontcb_null_prevout",
+        "v2_invariant_coinbase_prevout_not_null",
         "v2_invariant_header_version_low",
         "v2_invariant_duplicate_tx",
         "v2_invariant_mempool_tx_unknown",
@@ -299,6 +307,7 @@ impl ConsensusViolation {
             ConsensusViolation::WeightExceedsMax => "v2_invariant_weight_exceeds_max",
             ConsensusViolation::SigopsExceedMax => "v2_invariant_sigops_exceed_max",
             ConsensusViolation::NonCoinbaseNullPrevout => "v2_invariant_nontcb_null_prevout",
+            ConsensusViolation::CoinbasePrevoutNotNull => "v2_invariant_coinbase_prevout_not_null",
             ConsensusViolation::HeaderVersionLow => "v2_invariant_header_version_low",
             ConsensusViolation::DuplicateTx => "v2_invariant_duplicate_tx",
             ConsensusViolation::MempoolTxUnknown { .. } => "v2_invariant_mempool_tx_unknown",
@@ -665,8 +674,22 @@ pub fn tx_count(block: &ParsedBlock) -> u32 {
 /// declaration rejects honest templates whenever the payout script
 /// carries sigops.
 pub fn total_sigops(block: &ParsedBlock) -> u32 {
+    sum_legacy_sigops(block.0.txdata.iter())
+}
+
+/// Sum legacy sigops (scriptSig plus scriptPubKey) over an arbitrary
+/// set of transactions, saturating at `u32::MAX`.
+///
+/// This exists because `total_sigops`, `non_coinbase_sigops`, and
+/// `coinbase_sigops` all need it and differ ONLY in the set they
+/// iterate. Three verbatim copies of this loop is what PB-19's
+/// inclusion-set defect hid inside: the arithmetic was never the
+/// thing that varied, the set was. Keeping the arithmetic here once
+/// and the set at each call site makes the difference the only thing
+/// a reader has to check.
+fn sum_legacy_sigops<'a>(txs: impl Iterator<Item = &'a bitcoin::Transaction>) -> u32 {
     let mut total: u64 = 0;
-    for tx in &block.0.txdata {
+    for tx in txs {
         for input in &tx.input {
             total = total.saturating_add(input.script_sig.count_sigops_legacy() as u64);
         }
@@ -718,16 +741,7 @@ pub fn non_coinbase_tx_weight(block: &ParsedBlock) -> u64 {
 /// asserts that `txdata[0]` is a coinbase, so all three rest on that
 /// unchecked assumption.
 pub fn non_coinbase_sigops(block: &ParsedBlock) -> u32 {
-    let mut total: u64 = 0;
-    for tx in block.0.txdata.iter().skip(1) {
-        for input in &tx.input {
-            total = total.saturating_add(input.script_sig.count_sigops_legacy() as u64);
-        }
-        for output in &tx.output {
-            total = total.saturating_add(output.script_pubkey.count_sigops_legacy() as u64);
-        }
-    }
-    u32::try_from(total).unwrap_or(u32::MAX)
+    sum_legacy_sigops(block.0.txdata.iter().skip(1))
 }
 
 /// Legacy sigops summed across the coinbase transaction only.
@@ -736,17 +750,9 @@ pub fn non_coinbase_sigops(block: &ParsedBlock) -> u32 {
 ///
 /// Unit semantics match [`total_sigops`].
 pub fn coinbase_sigops(block: &ParsedBlock) -> u32 {
-    let Some(coinbase) = block.0.txdata.first() else {
-        return 0;
-    };
-    let mut total: u64 = 0;
-    for input in &coinbase.input {
-        total = total.saturating_add(input.script_sig.count_sigops_legacy() as u64);
-    }
-    for output in &coinbase.output {
-        total = total.saturating_add(output.script_pubkey.count_sigops_legacy() as u64);
-    }
-    u32::try_from(total).unwrap_or(u32::MAX)
+    // `take(1)` on an empty body yields nothing and sums to 0, which
+    // is what the previous `first()`-with-early-return did.
+    sum_legacy_sigops(block.0.txdata.iter().take(1))
 }
 
 /// Extract the BIP-34 block height from the coinbase script.
@@ -917,6 +923,50 @@ pub fn check_non_coinbase_null_prevout(block: &ParsedBlock) -> Result<(), Consen
                 return Err(ConsensusViolation::NonCoinbaseNullPrevout);
             }
         }
+    }
+    Ok(())
+}
+
+/// Verify `txdata[0]` actually IS a coinbase (PB-20).
+///
+/// This crate exposes three accessors that derive a "non-coinbase"
+/// set by skipping index 0 ([`non_coinbase_sigops`],
+/// [`non_coinbase_tx_weight`], [`check_non_coinbase_null_prevout`]),
+/// plus a `tx_count`-minus-one convention in the verifier. `skip(1)`
+/// means "not the first transaction"; it means "not the coinbase"
+/// only if index 0 is a coinbase, and nothing asserted that.
+/// `raw_block_hex` is attacker controlled on the wire, so this check
+/// turns the shared assumption into a checked precondition and every
+/// `skip(1)` above becomes provably correct.
+///
+/// A coinbase is defined here as exactly one input whose previous
+/// output is null. In `bitcoin` 0.32.8 `OutPoint::is_null()` is
+/// equality against `OutPoint::null()`, whose `vout` is `u32::MAX`,
+/// so it already covers the `0xFFFFFFFF` index; the unit test
+/// `outpoint_is_null_subsumes_the_0xffffffff_index` pins that rather
+/// than leaving it to a reading of the dependency.
+///
+/// This is deliberately structural only. It does not re-check the
+/// BIP-34 height push or the script length, which
+/// [`check_coinbase_script_length`] and [`bip34_height`] already own.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::CoinbasePrevoutNotNull`] when the
+/// body is empty, when index 0 has no inputs, when it has more than
+/// one input, or when that single input's prevout is not null.
+pub fn check_coinbase_null_prevout(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    let Some(coinbase) = block.0.txdata.first() else {
+        return Err(ConsensusViolation::CoinbasePrevoutNotNull);
+    };
+    // Exactly one input: a second input spends a real outpoint no
+    // matter what input[0] claims, which is the value-minting shape
+    // check_non_coinbase_null_prevout exists to forbid elsewhere.
+    let [input] = coinbase.input.as_slice() else {
+        return Err(ConsensusViolation::CoinbasePrevoutNotNull);
+    };
+    if !input.previous_output.is_null() {
+        return Err(ConsensusViolation::CoinbasePrevoutNotNull);
     }
     Ok(())
 }
@@ -1164,24 +1214,28 @@ fn decode_bip34_height(script: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// The 22 shield variants (18 Phase 1 plus 4 Phase 2 Class M)
+    /// The 23 shield variants (19 Phase 1 plus 4 Phase 2 Class M)
     /// must each map to a distinct canonical code listed in
-    /// `ALL_CODES`, and `ALL_CODES` must have length 22.
+    /// `ALL_CODES`, and `ALL_CODES` must have length 23.
+    ///
+    /// Phase 1 went from 18 to 19 with PB-20's
+    /// `v2_invariant_coinbase_prevout_not_null`, which widens ADR-002's
+    /// ratified table rather than completing it.
     #[test]
-    fn all_codes_has_twenty_two_invariant_entries() {
+    fn all_codes_has_twenty_three_invariant_entries() {
         assert_eq!(
             ConsensusViolation::ALL_CODES.len(),
-            22,
+            23,
             "ALL_CODES length must match ADR-002 Phase 1 + ADR-003 Phase 2 check set"
         );
     }
 
     #[test]
-    fn all_has_twenty_three_entries_scaffold_plus_shield() {
-        // 22 shield variants plus NotImplemented sentinel.
+    fn all_has_twenty_four_entries_scaffold_plus_shield() {
+        // 23 shield variants plus NotImplemented sentinel.
         assert_eq!(
             ConsensusViolation::ALL.len(),
-            23,
+            24,
             "ALL length drift: did you add a variant?"
         );
     }
@@ -1931,6 +1985,152 @@ mod tests {
         }));
         check_non_coinbase_null_prevout(&ParsedBlock(b))
             .expect("regular prevout in second tx is fine");
+    }
+
+    #[test]
+    fn sigop_accessors_reconcile_across_shapes() {
+        // Rule-of-three extraction guard (PB-20). The three
+        // accessors share one summing helper and differ only in the
+        // set they iterate, so total must equal coinbase plus
+        // non-coinbase on every shape. An extraction slip that fed
+        // the wrong iterator to any of them breaks this identity.
+        // Well below the u32 saturation boundary, where the three
+        // clamp independently and the identity does not hold.
+        let mut shapes: Vec<bitcoin::Block> = Vec::new();
+
+        shapes.push(genesis_block_mut()); // coinbase only
+
+        let mut two = genesis_block_mut(); // coinbase + one spending tx
+        let cb = two.txdata[0].compute_txid();
+        two.txdata
+            .push(simple_tx(bitcoin::OutPoint { txid: cb, vout: 0 }));
+        shapes.push(two);
+
+        let mut heavy = genesis_block_mut(); // sigops on both sides
+        heavy.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from(vec![0xacu8; 5]);
+        let hcb = heavy.txdata[0].compute_txid();
+        let mut spender = simple_tx(bitcoin::OutPoint { txid: hcb, vout: 0 });
+        spender.output[0].script_pubkey = bitcoin::ScriptBuf::from(vec![0xaeu8; 3]);
+        heavy.txdata.push(spender);
+        shapes.push(heavy);
+
+        let mut empty = genesis_block_mut(); // no transactions at all
+        empty.txdata.clear();
+        shapes.push(empty);
+
+        for (i, b) in shapes.into_iter().enumerate() {
+            let p = ParsedBlock(b);
+            assert_eq!(
+                u64::from(total_sigops(&p)),
+                u64::from(coinbase_sigops(&p)) + u64::from(non_coinbase_sigops(&p)),
+                "shape {i}: total != coinbase + non_coinbase"
+            );
+        }
+    }
+
+    // ── PB-20: txdata[0] must actually BE a coinbase ──────────────
+    // Every `skip(1)` consumer in this crate reads index 0 as "the
+    // coinbase" without anyone checking it. raw_block_hex is
+    // attacker controlled, so the assumption needs a check of its
+    // own.
+
+    #[test]
+    fn coinbase_null_prevout_passes_on_genesis() {
+        let block = parse_block(&genesis_bytes()).unwrap();
+        check_coinbase_null_prevout(&block).expect("genesis txdata[0] is a real coinbase");
+    }
+
+    #[test]
+    fn coinbase_null_prevout_rejects_pb20_attack_shape() {
+        // The exact shape the PB-20 review executed: index 0 spends a
+        // real outpoint, so `skip(1)` silently excludes a transaction
+        // that is not a coinbase from every non-coinbase accessor.
+        let mut b = genesis_block_mut();
+        b.txdata[0].input[0].previous_output = bitcoin::OutPoint {
+            txid: "1111111111111111111111111111111111111111111111111111111111111111"
+                .parse()
+                .expect("literal txid parses"),
+            vout: 7,
+        };
+        assert_eq!(
+            check_coinbase_null_prevout(&ParsedBlock(b)),
+            Err(ConsensusViolation::CoinbasePrevoutNotNull)
+        );
+    }
+
+    #[test]
+    fn coinbase_null_prevout_rejects_null_txid_with_wrong_index() {
+        // Half a coinbase: all-zero txid but a vout that is not
+        // 0xFFFFFFFF. This is the case the check would miss if it
+        // compared only the txid.
+        let mut b = genesis_block_mut();
+        b.txdata[0].input[0].previous_output = bitcoin::OutPoint {
+            txid: bitcoin::hashes::Hash::all_zeros(),
+            vout: 0,
+        };
+        assert_eq!(
+            check_coinbase_null_prevout(&ParsedBlock(b)),
+            Err(ConsensusViolation::CoinbasePrevoutNotNull)
+        );
+    }
+
+    #[test]
+    fn coinbase_null_prevout_rejects_empty_txdata() {
+        // A body with no transactions has no coinbase to vouch for.
+        let mut b = genesis_block_mut();
+        b.txdata.clear();
+        assert_eq!(
+            check_coinbase_null_prevout(&ParsedBlock(b)),
+            Err(ConsensusViolation::CoinbasePrevoutNotNull)
+        );
+    }
+
+    #[test]
+    fn coinbase_null_prevout_rejects_inputless_coinbase() {
+        // `input[0]` is indexed by the check; an empty input vector
+        // must be a violation, never a panic.
+        let mut b = genesis_block_mut();
+        b.txdata[0].input.clear();
+        assert_eq!(
+            check_coinbase_null_prevout(&ParsedBlock(b)),
+            Err(ConsensusViolation::CoinbasePrevoutNotNull)
+        );
+    }
+
+    #[test]
+    fn coinbase_null_prevout_rejects_multi_input_coinbase() {
+        // A real coinbase carries exactly one input. A second input
+        // means index 0 is spending value, whatever input[0] says.
+        let mut b = genesis_block_mut();
+        let cb_txid = b.txdata[0].compute_txid();
+        b.txdata[0].input.push(bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: cb_txid,
+                vout: 0,
+            },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        });
+        assert_eq!(
+            check_coinbase_null_prevout(&ParsedBlock(b)),
+            Err(ConsensusViolation::CoinbasePrevoutNotNull)
+        );
+    }
+
+    #[test]
+    fn outpoint_is_null_subsumes_the_0xffffffff_index() {
+        // PB-20 specifies "is_null() AND index 0xFFFFFFFF". Pin that
+        // the second clause is redundant in bitcoin =0.32.8 rather
+        // than trusting a reading of the dependency: is_null() is
+        // equality against OutPoint::null(), whose vout is u32::MAX.
+        assert!(bitcoin::OutPoint::null().is_null());
+        assert_eq!(bitcoin::OutPoint::null().vout, 0xFFFF_FFFF);
+        let wrong_index = bitcoin::OutPoint {
+            txid: bitcoin::hashes::Hash::all_zeros(),
+            vout: 0xFFFF_FFFE,
+        };
+        assert!(!wrong_index.is_null());
     }
 
     #[test]

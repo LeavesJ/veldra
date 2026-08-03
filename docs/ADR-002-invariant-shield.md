@@ -2,9 +2,38 @@
 
 **Status:** Accepted, implemented (Phase 1 shipped 2026-04-21 through
 2026-04-29; Phase 1.5 Tier 3 completion shipped 2026-07-22 — all 18
-checks wired)
+checks wired). **Amended 2026-08-02 by PB-20: the ratified table of 18
+is widened to 19.** See "Amendment 1" below; the 18-count statements in
+the sections underneath record what was originally ratified and are
+left as written.
 **Date:** 2026-04-21
 **Deciders:** Jarron (Veldra, Inc.)
+
+## Amendment 1 (2026-08-02, PB-20): a 19th invariant
+
+The ratified table below defines three accessors that derive a
+"non-coinbase" set with `skip(1)`: `non_coinbase_sigops`,
+`non_coinbase_tx_weight`, and `check_non_coinbase_null_prevout`, plus a
+`tx_count`-minus-one convention in the verifier. `skip(1)` means "not
+the first transaction". It means "not the coinbase" only if `txdata[0]`
+is a coinbase, and no check in the ratified set asserted that.
+`raw_block_hex` is fully attacker controlled on the wire, so all four
+rested on an unchecked assumption.
+
+Added: `v2_invariant_coinbase_prevout_not_null`, a Tier 3 structural
+check asserting `txdata[0]` carries exactly one input whose previous
+output is null. This **widens** v2.0 rather than completing it.
+
+Exploit value is low and is stated honestly here: `total_sigops` is the
+attacker's own field, and the Tier 3 consensus ceiling
+`check_sigops_max` already measures the whole block. This is a
+correctness and defense-in-depth fix that makes every `skip(1)` above
+provably correct, not the closure of an urgent hole.
+
+Count impact, superseding the Phase 1 figures below:
+`VerdictReason::ALL` 37 to 38, `ReasonCode::ALL` 95 to 96,
+`ConsensusViolation::ALL_CODES` 22 to 23, `ConsensusViolation::ALL` 23
+to 24, Tier 3 array 7 to 8, invariants wired 18 of 18 to 19 of 19.
 
 ## Context
 
@@ -320,6 +349,7 @@ Proposed canonical strings (snake_case, `v2_invariant_` prefix):
 | Block weight exceeds consensus maximum | `v2_invariant_weight_exceeds_max` |
 | Block sigops exceed consensus maximum | `v2_invariant_sigops_exceed_max` |
 | Non coinbase transaction carries null prevout | `v2_invariant_nontcb_null_prevout` |
+| `txdata[0]` is not a coinbase (Amendment 1, PB-20) | `v2_invariant_coinbase_prevout_not_null` |
 | Block header version below active soft fork floor | `v2_invariant_header_version_low` |
 | Duplicate transaction in block body | `v2_invariant_duplicate_tx` |
 | Raw block bytes fail to deserialize | `v2_invariant_decode_failed` |
