@@ -126,6 +126,27 @@ pub(crate) fn generate_self_signed_cert() -> anyhow::Result<(Vec<u8>, Vec<u8>)> 
     Ok((cert_pem, key_pem))
 }
 
+/// Default ceiling on concurrent NDJSON ingress connections (PB-26),
+/// used when `VELDRA_VERIFIER_MAX_CONNECTIONS` is unset.
+///
+/// Sized for a production mainnet pool, not for a load generator. The
+/// ingress population is services, not miners: sv2-gateway holds one
+/// persistent stream and reconnects it (`verifier_stream.rs`), and
+/// template-manager does the same. A pool running a handful of each
+/// for HA sits in the single digits, so 32 is several times the real
+/// steady-state peak and still absorbs reconnect churn, where a
+/// half-open peer's permit has not been released yet, plus an
+/// operator's diagnostic connection.
+///
+/// The number is also a memory bound. Every live connection can hold
+/// a line buffer up to `MAX_INTERNAL_LINE_BYTES` (20 MiB since
+/// PB-19), so the cap pins worst-case ingress buffer residency near
+/// 640 MiB instead of leaving it unbounded. Deployments that drive
+/// the ingress harder than production, such as the 100-connection
+/// burst in `scripts/benchmark-release.sh`, raise it explicitly in
+/// their compose file rather than lowering the shipped default.
+pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
+
 /// System error boundary: reason codes not produced by policy evaluation.
 ///
 /// `VerdictReason::PolicyLoadError`       — emitted when policy lock is poisoned
@@ -135,6 +156,10 @@ pub(crate) fn generate_self_signed_cert() -> anyhow::Result<(Vec<u8>, Vec<u8>)> 
 ///                                          degraded-mode tier selection.
 /// `VerdictReason::InternalError`         — emitted on unexpected handler failures
 ///                                          (e.g., serialize errors).
+// Eight parameters is over the clippy threshold. Splitting them into a
+// struct would only rename the same values at the one call site in
+// main.rs, so the seam is not earned.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tcp_server(
     app_state: AppState,
     addr: String,
@@ -143,6 +168,7 @@ pub(crate) async fn run_tcp_server(
     log_id_counter: LogIdCounter,
     tls_acceptor: Option<TlsAcceptor>,
     metrics: Arc<crate::metrics::VerifierMetrics>,
+    max_connections: u32,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     let tls_mode = if tls_acceptor.is_some() {
@@ -150,7 +176,12 @@ pub(crate) async fn run_tcp_server(
     } else {
         "plaintext"
     };
-    info!(addr = %addr, tls = tls_mode, "TCP listening");
+    info!(
+        addr = %addr,
+        tls = tls_mode,
+        max_connections,
+        "TCP listening"
+    );
     if tls_acceptor.is_none() && !addr.starts_with("127.0.0.1") && !addr.starts_with("[::1]") {
         tracing::warn!(
             addr = %addr,
@@ -160,8 +191,48 @@ pub(crate) async fn run_tcp_server(
         );
     }
 
+    // PB-26. Cap how many ingress connections are live at once.
+    //
+    // The listener takes unauthenticated peers (the TLS acceptor above
+    // is built `.with_no_client_auth()`, and shadow/observe compose
+    // bind it on 0.0.0.0:9090), and each admitted connection can hold
+    // a line buffer up to `MAX_INTERNAL_LINE_BYTES`. PB-18's bounded
+    // read caps one connection; nothing capped their number, so the
+    // per-connection bound multiplied by an unbounded count is still
+    // unbounded. Killing the verifier this way does not fail closed:
+    // the gateway's `auto_degrade` (default true) sees the dead
+    // verifier, suspends enforcement, and keeps shipping templates, so
+    // this cap is protecting the Invariant Shield, not just the
+    // process.
+    //
+    // Refuse rather than accept-then-wait. A peer parked on a permit
+    // queue still owns an accepted socket and a slot in this process,
+    // so a queue is the same exhaustion arriving more slowly, and a
+    // legitimate gateway would rather get an immediate close and
+    // retry through its existing reconnect loop than hang.
+    //
+    // A bare `Semaphore` rather than a wrapper type: this is one
+    // `try_acquire_owned` call, the same shape `sv2-bridge`'s accept
+    // loop already uses, and a struct around it would have exactly
+    // one caller.
+    let conn_permits = Arc::new(tokio::sync::Semaphore::new(
+        usize::try_from(max_connections).unwrap_or(usize::MAX),
+    ));
+
     loop {
-        let (tcp_stream, _peer) = listener.accept().await?;
+        let (tcp_stream, peer) = listener.accept().await?;
+
+        let Ok(permit) = Arc::clone(&conn_permits).try_acquire_owned() else {
+            metrics.connections_refused_total.inc();
+            warn!(
+                peer = %peer,
+                max_connections,
+                "ingress connection refused: concurrent connection cap reached"
+            );
+            drop(tcp_stream);
+            continue;
+        };
+
         let state_clone = app_state.clone();
         let log = verdict_log.clone();
         let url_clone = mempool_url.clone();
@@ -170,6 +241,10 @@ pub(crate) async fn run_tcp_server(
         let conn_metrics = metrics.clone();
 
         tokio::spawn(async move {
+            // Held for the connection's whole lifetime, including the
+            // TLS handshake. Dropping the task returns the slot.
+            let _permit = permit;
+
             // Upgrade to TLS if configured, then split into reader/writer.
             if let Some(acceptor) = acceptor {
                 match acceptor.accept(tcp_stream).await {

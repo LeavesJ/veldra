@@ -34,3 +34,4 @@ Production configuration templates. Copy and customize before deploying.
 | `reject_coinbase_zero` | false | true |
 | `VELDRA_LOG_FORMAT` | pretty | json |
 | `VELDRA_AUTH_TRUST_PROXY` | 0 | 1 |
+| `VELDRA_VERIFIER_MAX_CONNECTIONS` | 256 in `docker-compose.yml` (benchmark stack) | 32 (shipped default) |
