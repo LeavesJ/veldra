@@ -81,6 +81,16 @@ services:
       # hold. Only two legitimate streams connect here: template-manager
       # and sv2-gateway.
       VELDRA_VERIFIER_MAX_CONNECTIONS: "${VELDRA_VERIFIER_MAX_CONNECTIONS:-32}"
+      # PB-27 per-IP ceiling, pinned at the shipped default. The global
+      # cap alone let one address hold every slot; through a published
+      # port an external peer arrives as the docker bridge address, so
+      # this bounds what any one outside source can take. Container
+      # peers each have their own address and are unaffected.
+      VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP: "${VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP:-8}"
+      # PB-27 no-progress budget, pinned at the shipped default. A peer
+      # that connects and never speaks now loses its slot after this
+      # many seconds instead of holding it for the process lifetime.
+      VELDRA_VERIFIER_IDLE_TIMEOUT_SECS: "${VELDRA_VERIFIER_IDLE_TIMEOUT_SECS:-60}"
     volumes:
       - ./config:/config:rw
       # Verdict log lives at /data/verdicts.log inside the container

@@ -35,3 +35,5 @@ Production configuration templates. Copy and customize before deploying.
 | `VELDRA_LOG_FORMAT` | pretty | json |
 | `VELDRA_AUTH_TRUST_PROXY` | 0 | 1 |
 | `VELDRA_VERIFIER_MAX_CONNECTIONS` | 256 in `docker-compose.yml` (benchmark stack) | 32 (shipped default) |
+| `VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP` | 256 in `docker-compose.yml` (100 conns from one host) | 8 (shipped default) |
+| `VELDRA_VERIFIER_IDLE_TIMEOUT_SECS` | 60 (shipped default) | 60 (shipped default) |

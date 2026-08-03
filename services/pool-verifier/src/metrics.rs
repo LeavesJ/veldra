@@ -71,12 +71,36 @@ pub(crate) struct VerifierMetrics {
     /// PB-26. Inbound NDJSON ingress connections refused because the
     /// concurrent connection cap (`VELDRA_VERIFIER_MAX_CONNECTIONS`)
     /// was already saturated. A healthy pool never ticks this: the
-    /// legitimate population is one persistent stream per gateway and
-    /// per template-manager. A nonzero rate means either the cap is
-    /// set below the deployment's real service count, or an
-    /// unauthenticated peer is holding slots, and both need an
-    /// operator.
+    /// legitimate population is one persistent stream per gateway, plus
+    /// one short-lived connection per template from each
+    /// template-manager (`template-manager/src/main.rs:1697` opens a
+    /// fresh `TcpStream` per template and drops it after the verdict).
+    /// A nonzero rate means either the cap is set below the
+    /// deployment's real service count, or an unauthenticated peer is
+    /// holding slots, and both need an operator.
     pub(crate) connections_refused_total: Counter,
+
+    /// PB-27. Ingress connections refused because the peer's source
+    /// address already held `VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP`
+    /// slots. Separate from `connections_refused_total` because the two
+    /// call for opposite responses: the global counter means "the cap
+    /// may be too low", this one means "one address is taking more than
+    /// its share" and raising the global cap would not help.
+    pub(crate) connections_refused_per_ip_total: Counter,
+
+    /// PB-27. Ingress connections ended by the no-progress deadline
+    /// (`VELDRA_VERIFIER_IDLE_TIMEOUT_SECS`) rather than by the peer
+    /// closing. A steady rate with no attacker present means the budget
+    /// is below the legitimate peer's heartbeat interval; a burst means
+    /// sockets are being parked deliberately.
+    pub(crate) connections_reaped_idle_total: Counter,
+
+    /// PB-27. Ingress slots currently held. Without it, "the cap is too
+    /// low", "slots are leaking" and "a squatter is present" are
+    /// indistinguishable, and all three are only visible after capacity
+    /// is already gone. Paired with the cap, this is the headroom an
+    /// operator alerts on. Not a counter, so no `_total` suffix.
+    pub(crate) connections_active: Gauge<i64, AtomicI64>,
 }
 
 impl VerifierMetrics {
@@ -91,6 +115,9 @@ impl VerifierMetrics {
             mempool_view_age_seconds: Gauge::default(),
             mempool_view_size: Gauge::default(),
             connections_refused_total: Counter::default(),
+            connections_refused_per_ip_total: Counter::default(),
+            connections_reaped_idle_total: Counter::default(),
+            connections_active: Gauge::default(),
         };
         registry.register(
             "verifier_verdicts",
@@ -143,6 +170,24 @@ impl VerifierMetrics {
              (VELDRA_VERIFIER_MAX_CONNECTIONS) was saturated",
             m.connections_refused_total.clone(),
         );
+        registry.register(
+            "verifier_connections_refused_per_ip",
+            "NDJSON ingress connections refused because the peer's source address already held \
+             VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP slots. Raising the global cap does not \
+             help this one",
+            m.connections_refused_per_ip_total.clone(),
+        );
+        registry.register(
+            "verifier_connections_reaped_idle",
+            "NDJSON ingress connections ended by the no-progress deadline \
+             (VELDRA_VERIFIER_IDLE_TIMEOUT_SECS) rather than by the peer closing",
+            m.connections_reaped_idle_total.clone(),
+        );
+        registry.register(
+            "verifier_connections_active",
+            "NDJSON ingress slots currently held, out of VELDRA_VERIFIER_MAX_CONNECTIONS",
+            m.connections_active.clone(),
+        );
         m
     }
 }
@@ -181,6 +226,8 @@ mod tests {
         m.shield_skipped_total.inc();
         m.phase2_degraded_total.inc();
         m.connections_refused_total.inc();
+        m.connections_refused_per_ip_total.inc();
+        m.connections_reaped_idle_total.inc();
         m.verdicts_total
             .get_or_create(&VerdictLabels {
                 accepted: "true".to_string(),
@@ -209,6 +256,8 @@ mod tests {
             "verifier_phase2_degraded_total",
             "verifier_phase2_checks_total",
             "verifier_connections_refused_total",
+            "verifier_connections_refused_per_ip_total",
+            "verifier_connections_reaped_idle_total",
         ] {
             assert!(body.contains(name), "missing exported counter `{name}`");
             let doubled = format!("{name}_total");
@@ -219,5 +268,7 @@ mod tests {
         assert!(body.contains("verifier_mempool_view_age_seconds"));
         assert!(body.contains("verifier_mempool_view_size"));
         assert!(!body.contains("verifier_mempool_view_size_total"));
+        assert!(body.contains("verifier_connections_active"));
+        assert!(!body.contains("verifier_connections_active_total"));
     }
 }

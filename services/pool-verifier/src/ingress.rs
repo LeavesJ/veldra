@@ -63,6 +63,30 @@ pub(crate) fn build_tcp_tls_acceptor() -> Result<Option<TlsAcceptor>, String> {
     let cert_path = cert_path.clone();
     let key_path = key_path.clone();
 
+    // PB-28. `rustls` 0.23 picks a process-level `CryptoProvider` from
+    // its enabled crate features, and this workspace enables both:
+    // `axum-server`'s `tls-rustls` pulls `aws-lc-rs` and `reqwest`'s
+    // `rustls-tls-webpki-roots` pulls `ring`. With two candidates the
+    // choice is ambiguous, so `ServerConfig::builder()` panics with
+    // "Could not automatically determine the process-level
+    // CryptoProvider from Rustls crate features" and the verifier dies
+    // during startup the moment TLS is configured. That is why no test
+    // ever saw it: none of them booted the ingress in TLS mode.
+    //
+    // `aws_lc_rs` is rustls' own default and the provider the HTTPS
+    // side of this same process (axum-server) already builds against,
+    // so pinning it keeps one provider in the binary rather than two
+    // behaviours. `install_default` returns `Err` only when a provider
+    // is already installed, which is exactly the state we want, so it
+    // is not a swallowed failure.
+    if tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_none()
+        && tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .is_err()
+    {
+        info!("rustls CryptoProvider was installed concurrently; using the installed one");
+    }
+
     // Load server certificate chain.
     let cert_pem = std::fs::read(&cert_path).map_err(|e| format!("read cert {cert_path}: {e}"))?;
     let certs: Vec<CertificateDer<'static>> =
@@ -130,13 +154,22 @@ pub(crate) fn generate_self_signed_cert() -> anyhow::Result<(Vec<u8>, Vec<u8>)> 
 /// used when `VELDRA_VERIFIER_MAX_CONNECTIONS` is unset.
 ///
 /// Sized for a production mainnet pool, not for a load generator. The
-/// ingress population is services, not miners: sv2-gateway holds one
-/// persistent stream and reconnects it (`verifier_stream.rs`), and
-/// template-manager does the same. A pool running a handful of each
-/// for HA sits in the single digits, so 32 is several times the real
-/// steady-state peak and still absorbs reconnect churn, where a
-/// half-open peer's permit has not been released yet, plus an
+/// ingress population is services, not miners, and the two services
+/// use it differently. sv2-gateway holds one persistent stream and
+/// reconnects it (`verifier_stream.rs`). template-manager does **not**:
+/// it opens a fresh `TcpStream` per template and drops it once the
+/// verdict comes back (`template-manager/src/main.rs:1697`, consumed
+/// by `send_and_receive` at `:1816`), so at `poll_secs = 5` it wants a
+/// free slot every few seconds and holds one for under its own 3 s
+/// verdict timeout. A pool running a handful of each for HA sits in
+/// the single digits at any instant, so 32 is several times the real
+/// steady-state peak and still absorbs reconnect churn plus an
 /// operator's diagnostic connection.
+///
+/// The per-template reconnect is why PB-27 matters as much as PB-26:
+/// squatting the cap does not merely degrade throughput, it starves
+/// the manager of the slot it needs on the next poll and verdicts stop
+/// entirely.
 ///
 /// The number is also a memory bound. Every live connection can hold
 /// a line buffer up to `MAX_INTERNAL_LINE_BYTES` (20 MiB since
@@ -147,6 +180,84 @@ pub(crate) fn generate_self_signed_cert() -> anyhow::Result<(Vec<u8>, Vec<u8>)> 
 /// their compose file rather than lowering the shipped default.
 pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
 
+/// Default per-source-address ceiling (PB-27), used when
+/// `VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP` is unset. `0` disables
+/// per-IP enforcement.
+///
+/// The PB-26 cap is global, so one address could take every slot: the
+/// reported probe locked out a legitimate peer with eight sockets from
+/// one source. A quarter of the shipped global cap forces an attacker
+/// onto at least four distinct addresses to saturate the ingress,
+/// while staying well clear of any legitimate single-host population.
+/// The largest realistic one is a NAT or L4 proxy fronting an HA pair:
+/// two persistent gateway streams plus two in-flight template-manager
+/// connections is four, and 8 is double that. Compose stacks put every
+/// service on its own container address, so in-cluster peers are one
+/// per IP and only host-published traffic collapses onto the bridge
+/// address, which is the attacker's path and the one this bounds.
+///
+/// `0` stays supported, matching `sv2-gateway`, `rg-feed-server` and
+/// `rg-demo-feed`, because a deployment whose every legitimate peer
+/// arrives through a single L4 proxy address has no per-IP signal at
+/// all and guessing a large number there is worse than an explicit off
+/// switch. `docker-compose.yml` raises it to 256 instead, because
+/// `scripts/benchmark-release.sh` scenario 6 opens 100 connections
+/// from one host.
+pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS_PER_IP: u32 = 8;
+
+/// Default no-progress budget for one ingress connection (PB-27), used
+/// when `VELDRA_VERIFIER_IDLE_TIMEOUT_SECS` is unset.
+///
+/// Measured since the last byte that actually moved, never from the
+/// connection's start; see `idle_stream`. 60 s is twelve times
+/// sv2-gateway's default `heartbeat_interval_ms` of 5 000
+/// (`sv2-gateway/src/config.rs:440`), so a scheduler stall, a policy
+/// reload or a slow verdict can never look like silence, and
+/// template-manager's per-template connections close long before it.
+/// Against a squatter it bounds a stolen slot to one minute instead of
+/// the process lifetime, which with the per-IP ceiling above is what
+/// turns "32 sockets and the pool is down" back into a cost the
+/// attacker has to keep paying.
+pub(crate) const DEFAULT_INGRESS_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Total budget for the TLS handshake, from accept to negotiated
+/// session.
+///
+/// PB-26 takes the ingress permit before the handshake on purpose, so a
+/// peer that opens TCP and never sends a `ClientHello` holds a slot
+/// without ever becoming a protocol peer. The idle budget already ends
+/// that peer, but idle semantics let a hostile peer dribble one byte
+/// per budget forever, and unlike a 20 MiB `raw_block_hex` line a TLS
+/// handshake has no legitimate slow case: it is one or two round trips.
+/// So this one is total elapsed time, not idleness.
+///
+/// Not configurable on purpose. Ten seconds is over an order of
+/// magnitude more than any real handshake needs on any link a pool
+/// operates over, and there is no deployment shape that wants it
+/// larger or smaller, so it is a constant rather than a knob nobody
+/// turns.
+const TLS_HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
+
+/// TCP keepalive idle period and probe interval for accepted ingress
+/// sockets.
+///
+/// The no-progress deadline is a userspace budget, so it is the thing
+/// that actually reclaims a squatted slot. Keepalive is the transport
+/// backstop underneath it: it is what still reclaims a socket whose
+/// peer host vanished without FIN when an operator has raised
+/// `VELDRA_VERIFIER_IDLE_TIMEOUT_SECS` for a link with legitimately
+/// long silences, and it makes the kernel surface `ETIMEDOUT` on a
+/// parked write so the log names a dead path rather than an idle peer.
+/// Before PB-27 nothing in `services/` set it at all, which is why a
+/// vanished gateway host burned a slot permanently and ingress capacity
+/// was monotonically non-increasing over process life.
+///
+/// 30 s before the first probe and 10 s between probes puts detection
+/// inside a couple of minutes on both Linux and macOS defaults, well
+/// under any plausible idle budget an operator would raise this above.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
 /// System error boundary: reason codes not produced by policy evaluation.
 ///
 /// `VerdictReason::PolicyLoadError`       — emitted when policy lock is poisoned
@@ -156,7 +267,7 @@ pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
 ///                                          degraded-mode tier selection.
 /// `VerdictReason::InternalError`         — emitted on unexpected handler failures
 ///                                          (e.g., serialize errors).
-// Eight parameters is over the clippy threshold. Splitting them into a
+// Ten parameters is over the clippy threshold. Splitting them into a
 // struct would only rename the same values at the one call site in
 // main.rs, so the seam is not earned.
 #[allow(clippy::too_many_arguments)]
@@ -169,6 +280,8 @@ pub(crate) async fn run_tcp_server(
     tls_acceptor: Option<TlsAcceptor>,
     metrics: Arc<crate::metrics::VerifierMetrics>,
     max_connections: u32,
+    max_connections_per_ip: u32,
+    idle_timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     let tls_mode = if tls_acceptor.is_some() {
@@ -176,10 +289,13 @@ pub(crate) async fn run_tcp_server(
     } else {
         "plaintext"
     };
+    let idle_timeout = Duration::from_secs(idle_timeout_secs);
     info!(
         addr = %addr,
         tls = tls_mode,
         max_connections,
+        max_connections_per_ip,
+        idle_timeout_secs,
         "TCP listening"
     );
     if tls_acceptor.is_none() && !addr.starts_with("127.0.0.1") && !addr.starts_with("[::1]") {
@@ -219,6 +335,16 @@ pub(crate) async fn run_tcp_server(
         usize::try_from(max_connections).unwrap_or(usize::MAX),
     ));
 
+    // PB-27. The cap above is global, so one source address could hold
+    // every slot; the reported probe did exactly that. The tracker is
+    // `reservegrid-common`'s, shared with `sv2-gateway`'s miner
+    // listener rather than copied here: it is the only one of the three
+    // per-IP shapes already in the tree whose map is bounded and whose
+    // decrement is an RAII `Drop`. It lives in `reservegrid-common`
+    // and not in `sv2-gateway` because the verifier must not depend on
+    // the service it verifies.
+    let per_ip = reservegrid_common::per_ip::PerIpConnectionTracker::new(max_connections_per_ip);
+
     loop {
         let (tcp_stream, peer) = listener.accept().await?;
 
@@ -233,52 +359,190 @@ pub(crate) async fn run_tcp_server(
             continue;
         };
 
-        let state_clone = app_state.clone();
-        let log = verdict_log.clone();
-        let url_clone = mempool_url.clone();
-        let id_ctr = log_id_counter.clone();
-        let acceptor = tls_acceptor.clone();
-        let conn_metrics = metrics.clone();
+        let Some(ip_permit) = per_ip.try_accept(peer.ip()) else {
+            metrics.connections_refused_per_ip_total.inc();
+            warn!(
+                peer = %peer,
+                max_connections_per_ip,
+                "ingress connection refused: per-IP connection limit reached"
+            );
+            drop(tcp_stream);
+            continue;
+        };
 
-        tokio::spawn(async move {
-            // Held for the connection's whole lifetime, including the
-            // TLS handshake. Dropping the task returns the slot.
-            let _permit = permit;
+        // PB-27. Failure is logged rather than fatal: the no-progress
+        // deadline below is the primary reclaim path and still applies,
+        // and refusing an otherwise healthy connection because a socket
+        // option did not take would be a worse outcome than running
+        // without the transport backstop.
+        if let Err(e) = enable_tcp_keepalive(&tcp_stream) {
+            warn!(peer = %peer, error = %e, "failed to enable TCP keepalive on ingress socket");
+        }
 
-            // Upgrade to TLS if configured, then split into reader/writer.
-            if let Some(acceptor) = acceptor {
-                match acceptor.accept(tcp_stream).await {
-                    Ok(tls_stream) => {
-                        let (reader, writer) = tokio::io::split(tls_stream);
-                        handle_tcp_connection(
-                            reader,
-                            writer,
-                            state_clone,
-                            log,
-                            url_clone,
-                            id_ctr,
-                            conn_metrics,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "TLS accept failed");
-                    }
-                }
-            } else {
-                let (reader, writer) = tcp_stream.into_split();
+        metrics.connections_active.inc();
+
+        tokio::spawn(serve_admitted_connection(
+            AdmittedSlot {
+                _permit: permit,
+                _ip_permit: ip_permit,
+                metrics: Arc::clone(&metrics),
+            },
+            tcp_stream,
+            peer,
+            tls_acceptor.clone(),
+            IdleBudget {
+                idle_timeout,
+                idle_timeout_secs,
+            },
+            ConnectionDeps {
+                app_state: app_state.clone(),
+                verdict_log: verdict_log.clone(),
+                mempool_url: mempool_url.clone(),
+                log_id_counter: log_id_counter.clone(),
+                metrics: Arc::clone(&metrics),
+            },
+        ));
+    }
+}
+
+/// Turn on TCP keepalive for one accepted ingress socket (PB-27).
+///
+/// `tokio::net::TcpStream` exposes `set_nodelay` and `set_linger` but no
+/// keepalive setter, so this goes through `socket2`, which tokio already
+/// depends on. Separate from the accept loop so a test can read the
+/// option back off a real socket rather than trusting the constants.
+fn enable_tcp_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+/// The five service-wide handles one connection needs to evaluate a
+/// template and record its verdict.
+///
+/// This exists because both branches of `serve_admitted_connection`, the
+/// TLS one and the plaintext one, hand the same five values to
+/// `handle_tcp_connection`, and the accept loop clones them once per
+/// connection. Without it the accept loop carries five `let x = y.clone()`
+/// lines and the task body threads five more parameters.
+struct ConnectionDeps {
+    app_state: AppState,
+    verdict_log: VerdictLog,
+    mempool_url: Option<String>,
+    log_id_counter: LogIdCounter,
+    metrics: Arc<crate::metrics::VerifierMetrics>,
+}
+
+/// The no-progress budget, and the same number in seconds for the log
+/// line that reports a reap. Two representations of one setting rather
+/// than a `Duration::as_secs()` call inside a warn field.
+struct IdleBudget {
+    idle_timeout: Duration,
+    idle_timeout_secs: u64,
+}
+
+/// Serve one admitted ingress connection, from permit to close (PB-26,
+/// PB-27).
+async fn serve_admitted_connection(
+    slot: AdmittedSlot,
+    tcp_stream: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+    acceptor: Option<TlsAcceptor>,
+    budget: IdleBudget,
+    deps: ConnectionDeps,
+) {
+    // The slot is held for the connection's whole lifetime, including
+    // the TLS handshake (PB-26's ordering, preserved). Releasing the
+    // permit, the per-IP count and the gauge together in one `Drop` is
+    // what keeps the gauge honest on the early returns inside
+    // `handle_tcp_connection` and on a panic in this task.
+    let _slot = slot;
+
+    let ConnectionDeps {
+        app_state,
+        verdict_log,
+        mempool_url,
+        log_id_counter,
+        metrics,
+    } = deps;
+
+    // PB-27. Wrapped before the TLS acceptor, so a peer that opens TCP
+    // and never sends a `ClientHello` is on the clock too.
+    let reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stream =
+        crate::idle_stream::IdleTimeout::new(tcp_stream, budget.idle_timeout, Arc::clone(&reaped));
+
+    // Upgrade to TLS if configured, then split into reader/writer.
+    if let Some(acceptor) = acceptor {
+        match timeout(TLS_HANDSHAKE_BUDGET, acceptor.accept(stream)).await {
+            Ok(Ok(tls_stream)) => {
+                let (reader, writer) = tokio::io::split(tls_stream);
                 handle_tcp_connection(
                     reader,
                     writer,
-                    state_clone,
-                    log,
-                    url_clone,
-                    id_ctr,
-                    conn_metrics,
+                    app_state,
+                    verdict_log,
+                    mempool_url,
+                    log_id_counter,
+                    Arc::clone(&metrics),
                 )
                 .await;
             }
-        });
+            Ok(Err(e)) => {
+                warn!(peer = %peer, error = %e, "TLS accept failed");
+            }
+            Err(_elapsed) => {
+                metrics.connections_reaped_idle_total.inc();
+                warn!(
+                    peer = %peer,
+                    budget_secs = TLS_HANDSHAKE_BUDGET.as_secs(),
+                    "ingress connection dropped: TLS handshake did not complete in time"
+                );
+                return;
+            }
+        }
+    } else {
+        let (reader, writer) = tokio::io::split(stream);
+        handle_tcp_connection(
+            reader,
+            writer,
+            app_state,
+            verdict_log,
+            mempool_url,
+            log_id_counter,
+            Arc::clone(&metrics),
+        )
+        .await;
+    }
+
+    if reaped.load(Ordering::Relaxed) {
+        metrics.connections_reaped_idle_total.inc();
+        warn!(
+            peer = %peer,
+            idle_timeout_secs = budget.idle_timeout_secs,
+            "ingress connection reaped: no progress within the idle budget"
+        );
+    }
+}
+
+/// The three things one admitted ingress connection holds.
+///
+/// Exists because they must be released together on every exit path,
+/// including the early `return`s inside `handle_tcp_connection` and a
+/// panic in the connection task. Dropping them at the end of the task
+/// body instead would leave the gauge reading high after either, which
+/// is precisely the "slots are leaking" reading the gauge was added to
+/// make legible.
+struct AdmittedSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _ip_permit: reservegrid_common::per_ip::PerIpPermit,
+    metrics: Arc<crate::metrics::VerifierMetrics>,
+}
+
+impl Drop for AdmittedSlot {
+    fn drop(&mut self) {
+        self.metrics.connections_active.dec();
     }
 }
 
@@ -897,7 +1161,10 @@ pub(crate) async fn api_key_middleware(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{BoundedLine, LOG_SAMPLE_BYTES, log_display, log_sample, read_bounded_line};
+    use super::{
+        BoundedLine, LOG_SAMPLE_BYTES, TCP_KEEPALIVE_IDLE, enable_tcp_keepalive, log_display,
+        log_sample, read_bounded_line,
+    };
     use rg_protocol::TemplatePropose;
     use rg_protocol::gateway::MAX_INTERNAL_LINE_BYTES;
     use tokio::io::BufReader;
@@ -1080,6 +1347,38 @@ mod tests {
         let out = log_display(&e);
         assert!(out.contains("truncated"));
         assert!(out.len() < LOG_SAMPLE_BYTES + 64);
+    }
+
+    /// PB-27. Before this, nothing in `services/` set `SO_KEEPALIVE`, so
+    /// a gateway host that vanished without FIN held its ingress slot
+    /// until the verifier restarted, and capacity was monotonically
+    /// non-increasing over process life.
+    ///
+    /// The observable is the kernel's own state on a real accepted
+    /// socket, read back through a separate `SockRef`, not a flag this
+    /// code set for itself.
+    #[tokio::test]
+    async fn accepted_sockets_get_tcp_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (accepted, _peer) = listener.accept().await.unwrap();
+
+        let before = socket2::SockRef::from(&accepted).keepalive().unwrap();
+        assert!(
+            !before,
+            "the OS default must be off, or this proves nothing"
+        );
+
+        enable_tcp_keepalive(&accepted).expect("enable keepalive");
+
+        let sock = socket2::SockRef::from(&accepted);
+        assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must be on");
+        assert_eq!(
+            sock.tcp_keepalive_time().unwrap(),
+            TCP_KEEPALIVE_IDLE,
+            "the idle period before the first probe must be the configured one"
+        );
     }
 
     #[tokio::test]

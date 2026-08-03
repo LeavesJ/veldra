@@ -96,6 +96,16 @@ services:
       # template-manager streams and must NOT copy this value: each
       # admitted connection can hold a 20 MiB line buffer.
       VELDRA_VERIFIER_MAX_CONNECTIONS: "${VELDRA_VERIFIER_MAX_CONNECTIONS:-256}"
+      # PB-27 per-IP ceiling, raised to match the global cap for the
+      # same reason: benchmark-release.sh scenario 6 opens its 100
+      # connections from one host, and through a published port every
+      # one of them reaches the container as the docker bridge address.
+      # A production pool leaves this at the shipped default of 8.
+      VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP: "${VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP:-256}"
+      # PB-27 no-progress budget, pinned at the shipped default. Measured
+      # since the last byte that moved, so rg-load-test's steady traffic
+      # never trips it.
+      VELDRA_VERIFIER_IDLE_TIMEOUT_SECS: "${VELDRA_VERIFIER_IDLE_TIMEOUT_SECS:-60}"
     volumes:
       - ./config:/config:rw
     ports:
