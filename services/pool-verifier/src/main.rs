@@ -139,15 +139,88 @@ fn init_tracing() -> LogReloadHandle {
 
 // ── Startup checks ──────────────────────────────────────────
 
-/// Require `VELDRA_API_SECRET` unless explicitly opted out via
+/// Shortest accepted `VELDRA_API_SECRET`.
+///
+/// The variable's own name in `deploy/env.prod.example` promises 32 hex
+/// characters and nothing enforced it, so 32 is the promise made good
+/// rather than a fresh guess. The length is counted in characters, NOT
+/// validated as hex: `ingress::api_key_middleware` compares the value
+/// as raw bytes with a constant-time `ct_eq` against the Bearer token
+/// and never decodes it, so constraining the alphabet would reject
+/// perfectly good base64 or passphrase secrets for no gain.
+const MIN_API_SECRET_LEN: usize = 32;
+
+/// Reason an API secret cannot be used, kept separate from the process
+/// exit so it is unit-testable without spawning a binary (PB-35).
+#[derive(Debug, PartialEq, Eq)]
+enum ApiSecretRejection {
+    Placeholder,
+    TooShort(usize),
+}
+
+/// Classify a configured `VELDRA_API_SECRET`.
+///
+/// PB-35: the previous check was `!s.is_empty()`, which accepted the
+/// shipped `TODO_SET_API_SECRET_MIN_32_HEX` from
+/// `deploy/env.prod.example`. An operator who filled in every other key
+/// authenticated every protected endpoint with a string published in
+/// this repository. Note the asymmetry that hid it: the ABSENT case was
+/// always handled loudly, and `VELDRA_API_SECRET_OPTIONAL=1` exists as
+/// a deliberate opt-out, so the design already treats "no secret" as a
+/// considered choice. A placeholder is neither considered nor absent.
+///
+/// Reuses `policy::is_placeholder_value` rather than inventing a second
+/// notion of "placeholder", so this and the PB-33 `rpc_url` gate agree.
+fn classify_api_secret(raw: &str) -> Result<(), ApiSecretRejection> {
+    if pool_verifier::policy::is_placeholder_value(raw) {
+        return Err(ApiSecretRejection::Placeholder);
+    }
+    let len = raw.trim().chars().count();
+    if len < MIN_API_SECRET_LEN {
+        return Err(ApiSecretRejection::TooShort(len));
+    }
+    Ok(())
+}
+
+/// Require a usable `VELDRA_API_SECRET` unless explicitly opted out via
 /// `VELDRA_API_SECRET_OPTIONAL=1`. Exits the process when the secret is
-/// missing and no opt-out is present.
+/// missing, placeholder shaped, or too short, and no opt-out is present.
 fn enforce_api_secret() {
-    let api_secret_set = env::var("VELDRA_API_SECRET")
-        .ok()
-        .is_some_and(|s| !s.is_empty());
+    let raw = env::var("VELDRA_API_SECRET").ok();
     let api_secret_optional = env::var("VELDRA_API_SECRET_OPTIONAL").as_deref() == Ok("1");
-    if !api_secret_set && !api_secret_optional {
+
+    // A present-but-unusable secret is rejected even under the opt-out.
+    // The opt-out means "run without authentication on purpose", not
+    // "accept whatever string is there", and silently ignoring a typo'd
+    // secret would leave the operator believing auth is on.
+    if let Some(value) = raw.as_deref().filter(|s| !s.is_empty()) {
+        match classify_api_secret(value) {
+            Ok(()) => return,
+            Err(ApiSecretRejection::Placeholder) => {
+                tracing::error!(
+                    "VELDRA_API_SECRET is still a placeholder. It is set, so authentication \
+                     would appear enabled while every protected endpoint accepts a value \
+                     published in this repository. Set it to a real secret of at least {} \
+                     characters, or set VELDRA_API_SECRET_OPTIONAL=1 to run without \
+                     authentication on purpose.",
+                    MIN_API_SECRET_LEN
+                );
+                std::process::exit(1);
+            }
+            Err(ApiSecretRejection::TooShort(len)) => {
+                tracing::error!(
+                    "VELDRA_API_SECRET is {} characters; the minimum is {}. Set a longer \
+                     secret, or set VELDRA_API_SECRET_OPTIONAL=1 to run without \
+                     authentication on purpose.",
+                    len,
+                    MIN_API_SECRET_LEN
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if !api_secret_optional {
         tracing::error!(
             "VELDRA_API_SECRET is not set. All protected HTTP endpoints would be open. \
              Set VELDRA_API_SECRET to a strong secret, or set VELDRA_API_SECRET_OPTIONAL=1 \
@@ -155,12 +228,11 @@ fn enforce_api_secret() {
         );
         std::process::exit(1);
     }
-    if !api_secret_set && api_secret_optional {
-        tracing::warn!(
-            "VELDRA_API_SECRET is not set but VELDRA_API_SECRET_OPTIONAL=1 is active. \
-             Protected endpoints are open without authentication."
-        );
-    }
+
+    tracing::warn!(
+        "VELDRA_API_SECRET is not set but VELDRA_API_SECRET_OPTIONAL=1 is active. \
+         Protected endpoints are open without authentication."
+    );
 }
 
 fn init_metrics() -> (
@@ -394,6 +466,107 @@ async fn main() -> anyhow::Result<()> {
 // INDEX_HTML JavaScript depends on. If a field is renamed or
 // removed in a struct, the dashboard will silently break; these
 // tests catch that at compile/test time.
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod api_secret_tests {
+    use super::*;
+
+    /// The exact string `deploy/env.prod.example` used to ship. Kept as
+    /// a literal so this test still means something if that file is
+    /// edited: the guard is pinned to the value that was actually
+    /// dangerous, not to whatever the file happens to say today.
+    const SHIPPED_PLACEHOLDER: &str = "TODO_SET_API_SECRET_MIN_32_HEX";
+
+    #[test]
+    fn the_shipped_placeholder_is_rejected() {
+        // Note it is 30 characters, so length alone would also have
+        // caught it. Assert the REASON is placeholder, otherwise this
+        // test would keep passing if the marker check were deleted.
+        assert_eq!(
+            classify_api_secret(SHIPPED_PLACEHOLDER),
+            Err(ApiSecretRejection::Placeholder)
+        );
+    }
+
+    #[test]
+    fn a_long_placeholder_is_still_rejected_on_shape_not_length() {
+        // Defeats the length floor on purpose: 40 characters, still a
+        // marker. This is the case a length-only fix would wave through.
+        let long_marker = "TODO_SET_ME_TO_A_REAL_SECRET_XXXXXXXXXXXX";
+        assert!(long_marker.chars().count() > MIN_API_SECRET_LEN);
+        assert_eq!(
+            classify_api_secret(long_marker),
+            Err(ApiSecretRejection::Placeholder)
+        );
+    }
+
+    #[test]
+    fn angle_bracket_fills_are_rejected() {
+        assert_eq!(
+            classify_api_secret("<your-api-secret-here-at-least-32-chars>"),
+            Err(ApiSecretRejection::Placeholder)
+        );
+    }
+
+    #[test]
+    fn a_short_but_real_secret_is_rejected_for_length() {
+        let short = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d"; // 31
+        assert_eq!(short.chars().count(), 31);
+        assert_eq!(
+            classify_api_secret(short),
+            Err(ApiSecretRejection::TooShort(31))
+        );
+    }
+
+    #[test]
+    fn a_real_secret_at_the_floor_is_accepted() {
+        let ok = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"; // exactly 32
+        assert_eq!(ok.chars().count(), MIN_API_SECRET_LEN);
+        assert_eq!(classify_api_secret(ok), Ok(()));
+    }
+
+    #[test]
+    fn a_non_hex_secret_is_accepted() {
+        // The value is compared as raw bytes by
+        // ingress::api_key_middleware and never decoded, so a base64 or
+        // passphrase secret must pass. Pinning this stops a future
+        // "MIN_32_HEX" reading of the name from adding an alphabet
+        // check that would lock out working deployments.
+        assert_eq!(
+            classify_api_secret("correct-horse-battery-staple-and-then-some"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn empty_and_whitespace_are_placeholders_not_short_secrets() {
+        assert_eq!(
+            classify_api_secret(""),
+            Err(ApiSecretRejection::Placeholder)
+        );
+        assert_eq!(
+            classify_api_secret("   "),
+            Err(ApiSecretRejection::Placeholder)
+        );
+    }
+
+    #[test]
+    fn the_example_file_ships_no_usable_looking_secret() {
+        // Guards the other half of the fix: even with the runtime check
+        // in place, the repo must not contain a string an operator
+        // could mistake for a real secret.
+        let example = include_str!("../../../deploy/env.prod.example");
+        for line in example.lines() {
+            if let Some(value) = line.strip_prefix("VELDRA_API_SECRET=") {
+                assert!(
+                    classify_api_secret(value).is_err(),
+                    "env.prod.example ships a VELDRA_API_SECRET that would be accepted: {value:?}"
+                );
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
