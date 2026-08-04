@@ -21,13 +21,22 @@ pub(crate) struct PolicyReloadLabels {
 }
 
 /// Label set for v2.0 Invariant Shield Phase 2 Class M check
-/// outcome counters. `result` ∈ {agreed, rejected, skipped, stale,
-/// unprimed} (PB-13 added `unprimed`; PB-18 keys every label off the
-/// evaluation path's `Phase2Attribution`, so templates where Class M
-/// never ran increment nothing).
+/// outcome counters. `result` ∈ {agreed, rejected, recovered, skipped,
+/// stale, unprimed} (PB-13 added `unprimed`; PB-18 keys every label off
+/// the evaluation path's `Phase2Attribution`, so templates where Class
+/// M never ran increment nothing; PB-40 added `recovered` for a
+/// first-pass rejection that the second-chance lookup withdrew, which
+/// is neither an agreement nor a rejection).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub(crate) struct Phase2CheckLabels {
     pub(crate) result: String,
+}
+
+/// Label set for the PB-40 second-chance lookup. `outcome` ∈
+/// {`withdrawn`, `upheld`, `lookup_failed`}.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub(crate) struct SecondChanceLabels {
+    pub(crate) outcome: String,
 }
 
 /// Prometheus metric families for the pool-verifier.
@@ -56,6 +65,14 @@ pub(crate) struct VerifierMetrics {
     /// to track agreed/rejected/skipped/stale rates over time
     /// without scraping verdict event logs.
     pub(crate) phase2_checks_total: Family<Phase2CheckLabels, Counter>,
+
+    /// PB-40: what the second-chance lookup did to each Class M
+    /// rejection. This is the soak's primary instrument. `withdrawn`
+    /// counts false positives caught in the act; `upheld` counts the
+    /// only rejections that can support a detection claim;
+    /// `lookup_failed` counts rejections that stand UNADJUDICATED and
+    /// must not be tallied as either.
+    pub(crate) phase2_second_chance_total: Family<SecondChanceLabels, Counter>,
 
     /// Age of the verifier's most recently served mempool view in
     /// seconds. Tracks the D3 fail-stale state machine: above
@@ -153,6 +170,7 @@ impl VerifierMetrics {
             shield_skipped_total: Counter::default(),
             phase2_degraded_total: Counter::default(),
             phase2_checks_total: Family::default(),
+            phase2_second_chance_total: Family::default(),
             mempool_view_age_seconds: Gauge::default(),
             mempool_view_size: Gauge::default(),
             mempool_empty_responses: Gauge::default(),
@@ -194,8 +212,23 @@ impl VerifierMetrics {
         );
         registry.register(
             "verifier_phase2_checks",
-            "Phase 2 Class M check outcomes by result label",
+            "Phase 2 Class M check outcomes by result label. result=recovered means the \
+             first-pass check rejected the template against a stale mempool view and the \
+             PB-40 second-chance lookup found bitcoind holding the transactions, so no \
+             rejection was emitted",
             m.phase2_checks_total.clone(),
+        );
+        registry.register(
+            "verifier_phase2_second_chance",
+            "PB-40 second-chance lookups performed when the Phase 2 Class M check rejected a \
+             template, by outcome. withdrawn = bitcoind held enough of the unknown \
+             transactions to bring the recomputed ratio back within tolerance, so the \
+             rejection was a false positive from mempool view staleness. upheld = bitcoind \
+             knew neither the mempool nor recent blocks held them, the only outcome that can \
+             support a detection claim. lookup_failed = bitcoind could not be asked and the \
+             rejection stands UNADJUDICATED; it is not evidence either way and must be \
+             excluded from any false-positive tally rather than counted as a true positive",
+            m.phase2_second_chance_total.clone(),
         );
         registry.register(
             "verifier_mempool_view_age_seconds",

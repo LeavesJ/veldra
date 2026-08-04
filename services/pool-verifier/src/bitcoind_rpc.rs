@@ -52,23 +52,25 @@ impl BitcoindClient {
         }
     }
 
-    /// Fetch the current mempool as a list of transaction ids in
-    /// internal byte order.
+    /// Issue one JSON-RPC call and return its `result`.
     ///
-    /// Calls `getrawmempool verbose=false` per Bitcoin Core's
-    /// JSON-RPC contract. The response is an array of hex-encoded
-    /// txids in display order (which is internal byte order
-    /// reversed); we reverse each to internal byte order so it
-    /// matches `bitcoin::Transaction::compute_txid().to_byte_array()`
-    /// from the facade.
-    pub async fn get_raw_mempool(&self) -> Result<Vec<[u8; 32]>, RpcError> {
+    /// Extracted on the third caller (`getrawmempool`,
+    /// `getbestblockhash`, `getblock`), per the rule of three: the
+    /// error precedence is the part worth having once rather than
+    /// three times, because a `200 OK` carrying an `error` object is a
+    /// failure and reading `result` first would miss it.
+    async fn call<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<R, RpcError> {
         let req = JsonRpcRequest {
             jsonrpc: "1.0",
             id: "rg-pool-verifier",
-            method: "getrawmempool",
-            params: [false],
+            method,
+            params,
         };
-        let resp: JsonRpcResponse<Vec<String>> = self
+        let resp: JsonRpcResponse<R> = self
             .http
             .post(&self.url)
             .basic_auth(&self.user, Some(&self.pass))
@@ -84,17 +86,83 @@ impl BitcoindClient {
                 message: err.message,
             });
         }
-        let hex_txids = resp.result.ok_or(RpcError::MissingResult)?;
-        let mut out = Vec::with_capacity(hex_txids.len());
-        for hex_str in hex_txids {
-            let mut bytes = parse_txid_hex(&hex_str)?;
-            // Bitcoin Core returns txids in display order (RPC big
-            // endian). Internal byte order is the reverse.
-            bytes.reverse();
-            out.push(bytes);
-        }
-        Ok(out)
+        resp.result.ok_or(RpcError::MissingResult)
     }
+
+    /// Fetch the current mempool as a list of transaction ids in
+    /// internal byte order.
+    ///
+    /// Calls `getrawmempool verbose=false` per Bitcoin Core's
+    /// JSON-RPC contract. The response is an array of hex-encoded
+    /// txids in display order (which is internal byte order
+    /// reversed); we reverse each to internal byte order so it
+    /// matches `bitcoin::Transaction::compute_txid().to_byte_array()`
+    /// from the facade.
+    pub async fn get_raw_mempool(&self) -> Result<Vec<[u8; 32]>, RpcError> {
+        let hex_txids: Vec<String> = self.call("getrawmempool", [false]).await?;
+        txids_to_internal_order(hex_txids)
+    }
+
+    /// Hash of the current chain tip, as the display-order hex string
+    /// Bitcoin Core returns.
+    ///
+    /// Left as a string on purpose: it is only ever handed straight
+    /// back to [`BitcoindClient::get_block_txids`], so decoding it to
+    /// bytes and re-encoding would add a conversion with no consumer.
+    pub async fn get_best_block_hash(&self) -> Result<String, RpcError> {
+        self.call("getbestblockhash", [(); 0]).await
+    }
+
+    /// Fetch one block's transaction ids, height, and parent hash via
+    /// `getblock <hash> 1`.
+    ///
+    /// Verbosity 1 returns txids only, not full transactions: for a
+    /// mainnet block that is roughly 200 KB against tens of megabytes
+    /// at verbosity 2, and set membership is all the PB-40
+    /// second-chance lookup asks of it.
+    ///
+    /// Txids come back in internal byte order to match
+    /// `rg_consensus::template_txids`; the block and parent hashes
+    /// stay in display order because they are only fed back into RPC.
+    pub async fn get_block_txids(&self, block_hash: &str) -> Result<BlockTxids, RpcError> {
+        let raw: GetBlockVerbosity1 = self.call("getblock", (block_hash, 1u8)).await?;
+        Ok(BlockTxids {
+            height: raw.height,
+            txids: txids_to_internal_order(raw.tx)?,
+            previous_block_hash: raw.previousblockhash,
+        })
+    }
+}
+
+/// One block, reduced to what the Class M second-chance lookup reads.
+#[derive(Debug, Clone)]
+pub struct BlockTxids {
+    pub height: u32,
+    /// Internal byte order, matching `rg_consensus::template_txids`.
+    pub txids: Vec<[u8; 32]>,
+    /// `None` at the genesis block, which ends any walk back.
+    pub previous_block_hash: Option<String>,
+}
+
+/// Bitcoin Core returns txids in display order (RPC big endian).
+/// Internal byte order is the reverse.
+fn txids_to_internal_order(hex_txids: Vec<String>) -> Result<Vec<[u8; 32]>, RpcError> {
+    let mut out = Vec::with_capacity(hex_txids.len());
+    for hex_str in hex_txids {
+        let mut bytes = parse_txid_hex(&hex_str)?;
+        bytes.reverse();
+        out.push(bytes);
+    }
+    Ok(out)
+}
+
+/// The `getblock` verbosity-1 fields this crate uses. Bitcoin Core
+/// returns many more; serde ignores them.
+#[derive(Deserialize)]
+struct GetBlockVerbosity1 {
+    height: u32,
+    tx: Vec<String>,
+    previousblockhash: Option<String>,
 }
 
 fn parse_txid_hex(hex_str: &str) -> Result<[u8; 32], RpcError> {

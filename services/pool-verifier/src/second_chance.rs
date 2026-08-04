@@ -1,0 +1,614 @@
+//! PB-40: second-chance lookup at Class M rejection time.
+//!
+//! The Class M check compares a template's txids against a
+//! `getrawmempool` snapshot up to `poll_interval_secs` old, while
+//! `getblocktemplate` preferentially selects freshly-arrived high-fee
+//! transactions. Those arrivals score "unknown to verifier view" and
+//! past `tolerance_pct` the template is rejected. On the Setup B node
+//! that produced 68 rejections in 7.5 hours, and a live query caught
+//! one mid-flight: 10 of 10 sampled txids were IN bitcoind's mempool
+//! seconds after the rejection fired.
+//!
+//! This module asks bitcoind directly, at the moment of rejection,
+//! whether it knows each transaction the stale view did not. It closes
+//! two defects with one mechanism:
+//!
+//! 1. **The false positive.** A transaction bitcoind holds is not
+//!    unknown, so the unknown count is recomputed against the answer
+//!    and the rejection is withdrawn when the recomputed ratio is
+//!    within tolerance.
+//! 2. **The unadjudicable evidence.** The answer is recorded on the
+//!    verdict. It cannot be recovered afterwards: the same txids
+//!    sampled from a 35-minute-old rejection came back 9 of 9 ABSENT,
+//!    because they are the churny tail that gets RBF-replaced or
+//!    evicted from a 93k mempool within minutes. A T+7 review of
+//!    week-old records would find them absent and score every
+//!    rejection a TRUE positive, which is the wrong answer with a
+//!    checkmark on it.
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+use thiserror::Error;
+use tracing::warn;
+
+use crate::bitcoind_rpc::{BitcoindClient, RpcError};
+
+/// Wall-clock budget for the whole second-chance lookup, mempool
+/// fetch and block walk together.
+///
+/// Derived from the caller's own deadline, not picked for feel. The
+/// template-manager abandons a verdict after 4 seconds
+/// (`services/template-manager/src/main.rs:1679`
+/// `verdict_timeout = Duration::from_secs(4)`), and the bitcoind
+/// client's per-request timeout is 5 seconds
+/// (`main.rs::build_phase2_mempool_view`), so an unbounded lookup
+/// could outlive the verdict it is trying to correct and convert a
+/// fast false rejection into a timeout, which is strictly worse: the
+/// operator loses the verdict entirely instead of getting a wrong one
+/// they can see. Two seconds leaves the rest of the template handling
+/// half the window. On the Setup B node `getrawmempool` against a 94k
+/// mempool over loopback returns in well under that.
+pub const SECOND_CHANCE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Most blocks walked back from the tip when looking for template
+/// transactions that were mined between template construction and this
+/// check.
+///
+/// The walk's real bound is `template.block_height`: a template
+/// building block N was assembled from a mempool that by construction
+/// excluded everything already mined at heights below N, so only
+/// blocks at height >= N can hold one of its transactions. This cap is
+/// the backstop for a template so old that the honest walk would be
+/// long, and reaching it is recorded on the verdict rather than
+/// silently truncating the search.
+pub const MAX_RECENT_BLOCKS_SCANNED: u32 = 6;
+
+/// Cap on still-absent txids recorded in the durable evidence.
+///
+/// The evidence exists to make a rejection adjudicable by hand at T+7.
+/// A reviewer needs enough identities to spot-check, not all of them,
+/// and the verdict line has a wire budget shared with the rest of the
+/// record.
+pub const ABSENT_SAMPLE_CAP: usize = 32;
+
+/// What bitcoind said about the transactions the served view did not
+/// contain, gathered at rejection time.
+///
+/// Deliberately a plain data record separated from the RPC calls that
+/// fill it, so the adjudication arithmetic is testable without a node.
+#[derive(Debug, Clone, Default)]
+pub struct BitcoindAnswer {
+    /// `getrawmempool` taken now, not the polled view.
+    pub fresh_mempool: HashSet<[u8; 32]>,
+    /// Txids of every block mined at or above the template's own
+    /// height, i.e. mined since the template was built.
+    pub recent_block_txids: HashSet<[u8; 32]>,
+    /// Blocks actually walked. Zero is the normal answer: it means the
+    /// tip had not advanced past the template's parent.
+    pub blocks_scanned: u32,
+    /// `true` when the walk stopped at [`MAX_RECENT_BLOCKS_SCANNED`]
+    /// rather than at the template's height, so a reader can tell a
+    /// complete search from a truncated one.
+    pub block_walk_truncated: bool,
+}
+
+/// Where one formerly-unknown transaction actually lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxAdjudication {
+    /// bitcoind holds it in the mempool right now. The served view was
+    /// simply older than the transaction.
+    InMempool,
+    /// Absent from the mempool because it was mined into a block at or
+    /// above the template's height, i.e. after the template was built.
+    Mined,
+    /// bitcoind knows it in neither place.
+    Absent,
+}
+
+/// The recomputed Class M position after bitcoind answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adjudication {
+    /// Non-coinbase transactions in the template.
+    pub total: u32,
+    /// Transactions the served view did not contain.
+    pub unknown_before: u32,
+    /// Of those, held in bitcoind's mempool at rejection time.
+    pub in_mempool: u32,
+    /// Of those, mined since the template was built.
+    pub mined: u32,
+    /// Of those, bitcoind knows nothing about.
+    pub still_absent: u32,
+    /// Identities of the still-absent, bounded by
+    /// [`ABSENT_SAMPLE_CAP`]. Internal byte order.
+    pub still_absent_sample: Vec<[u8; 32]>,
+    pub blocks_scanned: u32,
+    pub block_walk_truncated: bool,
+}
+
+/// Why a second-chance lookup produced no answer.
+///
+/// Two variants because they call for different operator action: an
+/// [`SecondChanceError::Rpc`] means bitcoind is broken or
+/// misconfigured, a [`SecondChanceError::Deadline`] means it is slow
+/// enough to threaten the upstream verdict budget. Both uphold the
+/// rejection; only one of them is fixed by tuning.
+#[derive(Debug, Error)]
+pub enum SecondChanceError {
+    #[error("second-chance lookup failed: {0}")]
+    Rpc(#[from] RpcError),
+
+    #[error("second-chance lookup exceeded its {SECOND_CHANCE_DEADLINE:?} deadline")]
+    Deadline,
+}
+
+impl SecondChanceError {
+    /// Stable label for the `verifier_phase2_second_chance_total`
+    /// metric and the durable verdict record.
+    #[must_use]
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            SecondChanceError::Rpc(_) => "rpc_error",
+            SecondChanceError::Deadline => "deadline",
+        }
+    }
+}
+
+/// What the second-chance lookup did to a Class M rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecondChanceOutcome {
+    /// bitcoind knew enough of the unknown transactions to bring the
+    /// recomputed unknown ratio back within tolerance. The rejection
+    /// is withdrawn and the template accepted.
+    Withdrawn(Adjudication),
+    /// bitcoind answered and the rejection still stands on the
+    /// recomputed count.
+    Upheld(Adjudication),
+    /// bitcoind could not be asked. The rejection stands
+    /// **unadjudicated**: this is not the same as `Upheld`, and a
+    /// reviewer must not read it as one.
+    ///
+    /// Carries the first-pass counts so the durable record is complete
+    /// whichever way the lookup went. Leaving them for the caller to
+    /// fill in afterwards would be a contract nothing enforces, and a
+    /// record showing `unknown_before: 0` beside a rejection is worse
+    /// than no record.
+    LookupFailed {
+        total: u32,
+        unknown_before: u32,
+        reason: String,
+        kind: String,
+    },
+}
+
+impl SecondChanceOutcome {
+    /// Stable label for `verifier_phase2_second_chance_total`.
+    #[must_use]
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            SecondChanceOutcome::Withdrawn(_) => "withdrawn",
+            SecondChanceOutcome::Upheld(_) => "upheld",
+            SecondChanceOutcome::LookupFailed { .. } => "lookup_failed",
+        }
+    }
+}
+
+/// Whether an unknown count crosses the configured tolerance.
+///
+/// This exists because the first Class M pass
+/// ([`crate::mempool_view::evaluate`]) and the second-chance recompute
+/// ([`Adjudication::still_exceeds`]) are the two halves of one
+/// decision: a template that rejects under one rule and recovers under
+/// a differently-rounded copy of it would be a defect no test asserting
+/// either half alone could see. Both call this.
+#[must_use]
+pub fn exceeds_tolerance(unknown_count: u32, total: u32, tolerance_pct: f64) -> bool {
+    if total == 0 {
+        return false;
+    }
+    let ratio_pct = (f64::from(unknown_count) / f64::from(total)) * 100.0;
+    ratio_pct > tolerance_pct
+}
+
+impl Adjudication {
+    /// Whether the rejection still stands once the transactions
+    /// bitcoind knows have been removed from the unknown count.
+    #[must_use]
+    pub fn still_exceeds(&self, tolerance_pct: f64) -> bool {
+        exceeds_tolerance(self.still_absent, self.total, tolerance_pct)
+    }
+}
+
+/// Score each unknown transaction against what bitcoind said.
+///
+/// Pure: takes the gathered answer rather than making the calls, so
+/// every branch is reachable in a unit test without a node.
+#[must_use]
+pub fn adjudicate(total: u32, unknown: &[[u8; 32]], answer: &BitcoindAnswer) -> Adjudication {
+    let mut in_mempool = 0u32;
+    let mut mined = 0u32;
+    let mut still_absent = 0u32;
+    let mut still_absent_sample = Vec::new();
+
+    for txid in unknown {
+        match classify(txid, answer) {
+            TxAdjudication::InMempool => in_mempool = in_mempool.saturating_add(1),
+            TxAdjudication::Mined => mined = mined.saturating_add(1),
+            TxAdjudication::Absent => {
+                still_absent = still_absent.saturating_add(1);
+                if still_absent_sample.len() < ABSENT_SAMPLE_CAP {
+                    still_absent_sample.push(*txid);
+                }
+            }
+        }
+    }
+
+    Adjudication {
+        total,
+        unknown_before: u32::try_from(unknown.len()).unwrap_or(u32::MAX),
+        in_mempool,
+        mined,
+        still_absent,
+        still_absent_sample,
+        blocks_scanned: answer.blocks_scanned,
+        block_walk_truncated: answer.block_walk_truncated,
+    }
+}
+
+/// Mempool membership is checked first: a transaction in the mempool
+/// right now is the common case this whole mechanism exists for, and a
+/// transaction cannot be in the mempool and mined at the same time.
+fn classify(txid: &[u8; 32], answer: &BitcoindAnswer) -> TxAdjudication {
+    if answer.fresh_mempool.contains(txid) {
+        TxAdjudication::InMempool
+    } else if answer.recent_block_txids.contains(txid) {
+        TxAdjudication::Mined
+    } else {
+        TxAdjudication::Absent
+    }
+}
+
+/// The second-chance answer as it is written to the durable verdict
+/// log, and the whole reason this mechanism records anything.
+///
+/// PB-40's dangerous half: the answer is unrecoverable after the
+/// fact. Sampled txids from a 35-minute-old rejection came back 9 of 9
+/// ABSENT from bitcoind, not because they were ever invalid but
+/// because they are the churny tail that gets RBF-replaced or evicted
+/// from a 93k mempool within minutes. A T+7 reviewer re-querying
+/// week-old records would find them absent and score every rejection a
+/// TRUE positive. This record is what that reviewer must read instead.
+///
+/// Distinct from [`Adjudication`] on purpose: txids are emitted in
+/// DISPLAY order (byte-reversed from the internal order the shield
+/// works in), because the reviewer's next step is pasting them into
+/// `bitcoin-cli` or a block explorer, both of which speak display
+/// order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MempoolAdjudicationRecord {
+    /// `withdrawn`, `upheld`, or `lookup_failed`.
+    pub outcome: String,
+    /// Non-coinbase transactions in the template.
+    pub total: u32,
+    /// Unknown to the polled view, before bitcoind was asked.
+    pub unknown_before: u32,
+    /// Held in bitcoind's mempool at rejection time. A non-zero value
+    /// here is the PB-40 defect being caught in the act.
+    pub in_mempool: u32,
+    /// Mined into a block at or above the template's height.
+    pub mined: u32,
+    /// Unknown to bitcoind in both places. This is the only count that
+    /// can support a true-positive claim.
+    pub still_absent: u32,
+    pub blocks_scanned: u32,
+    /// `true` when the block walk hit [`MAX_RECENT_BLOCKS_SCANNED`],
+    /// so `mined` may undercount.
+    pub block_walk_truncated: bool,
+    /// Still-absent txids in DISPLAY order, capped at
+    /// [`ABSENT_SAMPLE_CAP`].
+    pub still_absent_sample: Vec<String>,
+    /// Present only for `lookup_failed`: why bitcoind was not asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_error: Option<String>,
+    /// Present only for `lookup_failed`: `rpc_error` or `deadline`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_error_kind: Option<String>,
+}
+
+impl From<&SecondChanceOutcome> for MempoolAdjudicationRecord {
+    fn from(outcome: &SecondChanceOutcome) -> Self {
+        let label = outcome.as_label().to_string();
+        match outcome {
+            SecondChanceOutcome::Withdrawn(adj) | SecondChanceOutcome::Upheld(adj) => Self {
+                outcome: label,
+                total: adj.total,
+                unknown_before: adj.unknown_before,
+                in_mempool: adj.in_mempool,
+                mined: adj.mined,
+                still_absent: adj.still_absent,
+                blocks_scanned: adj.blocks_scanned,
+                block_walk_truncated: adj.block_walk_truncated,
+                still_absent_sample: adj
+                    .still_absent_sample
+                    .iter()
+                    .map(|t| {
+                        let mut display = *t;
+                        display.reverse();
+                        hex::encode(display)
+                    })
+                    .collect(),
+                lookup_error: None,
+                lookup_error_kind: None,
+            },
+            SecondChanceOutcome::LookupFailed {
+                total,
+                unknown_before,
+                reason,
+                kind,
+            } => Self {
+                outcome: label,
+                // The first-pass counts are real and are recorded. The
+                // three adjudication counts below stay zero because
+                // nothing was adjudicated, which `outcome` states
+                // outright so they cannot be read as "bitcoind knew
+                // none of them".
+                total: *total,
+                unknown_before: *unknown_before,
+                in_mempool: 0,
+                mined: 0,
+                still_absent: 0,
+                blocks_scanned: 0,
+                block_walk_truncated: false,
+                still_absent_sample: Vec::new(),
+                lookup_error: Some(reason.clone()),
+                lookup_error_kind: Some(kind.clone()),
+            },
+        }
+    }
+}
+
+/// Asks bitcoind, at rejection time, about transactions the polled
+/// view did not contain.
+///
+/// Holds its own [`BitcoindClient`] rather than borrowing the polling
+/// task's: the task moves its client into a `tokio::spawn` that runs
+/// for the process lifetime, and the client is a cheap `reqwest`
+/// handle clone over a shared connection pool.
+#[derive(Debug, Clone)]
+pub struct SecondChance {
+    client: BitcoindClient,
+}
+
+impl SecondChance {
+    #[must_use]
+    pub fn new(client: BitcoindClient) -> Self {
+        Self { client }
+    }
+
+    /// Gather bitcoind's answer for a template building block
+    /// `template_height`, within [`SECOND_CHANCE_DEADLINE`].
+    ///
+    /// The deadline is enforced here rather than at the call site so
+    /// no future caller can forget it and put the upstream verdict
+    /// budget at risk.
+    ///
+    /// # Errors
+    ///
+    /// [`SecondChanceError::Rpc`] when bitcoind answered badly,
+    /// [`SecondChanceError::Deadline`] when it did not answer in time.
+    /// Either way the caller must let the original rejection stand: a
+    /// lookup that could not run is not evidence of absence, and this
+    /// module exists because that exact distinction was lost once
+    /// already, when silently failing `bitcoin-cli` calls read as
+    /// "transaction genuinely absent" for two rounds of investigation.
+    pub async fn ask(&self, template_height: u32) -> Result<BitcoindAnswer, SecondChanceError> {
+        tokio::time::timeout(SECOND_CHANCE_DEADLINE, self.gather(template_height))
+            .await
+            .map_err(|_| SecondChanceError::Deadline)?
+            .map_err(SecondChanceError::Rpc)
+    }
+
+    async fn gather(&self, template_height: u32) -> Result<BitcoindAnswer, RpcError> {
+        let fresh_mempool: HashSet<[u8; 32]> =
+            self.client.get_raw_mempool().await?.into_iter().collect();
+
+        let (recent_block_txids, blocks_scanned, block_walk_truncated) =
+            self.recent_blocks(template_height).await;
+
+        Ok(BitcoindAnswer {
+            fresh_mempool,
+            recent_block_txids,
+            blocks_scanned,
+            block_walk_truncated,
+        })
+    }
+
+    /// Walk back from the tip collecting txids of every block at or
+    /// above `template_height`.
+    ///
+    /// A template building block N was assembled from a mempool that
+    /// excluded everything mined below N, so a block below N cannot
+    /// hold one of its transactions and the walk stops there. Normally
+    /// the tip is at N-1 and this scans nothing.
+    ///
+    /// A block-walk failure is degraded rather than fatal: the mempool
+    /// half of the answer is the load-bearing one and is already in
+    /// hand. The shortfall surfaces as `blocks_scanned` lower than the
+    /// height gap on the recorded verdict.
+    async fn recent_blocks(&self, template_height: u32) -> (HashSet<[u8; 32]>, u32, bool) {
+        let mut collected = HashSet::new();
+        let mut scanned = 0u32;
+
+        let mut hash = match self.client.get_best_block_hash().await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "second chance: getbestblockhash failed; mined-case coverage lost for this verdict");
+                return (collected, 0, false);
+            }
+        };
+
+        loop {
+            if scanned >= MAX_RECENT_BLOCKS_SCANNED {
+                return (collected, scanned, true);
+            }
+            let block = match self.client.get_block_txids(&hash).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, block_hash = %hash, "second chance: getblock failed; mined-case coverage partial for this verdict");
+                    return (collected, scanned, false);
+                }
+            };
+            if block.height < template_height {
+                // The tip has not advanced past the template's parent,
+                // so nothing has been mined since it was built.
+                return (collected, scanned, false);
+            }
+            collected.extend(block.txids);
+            scanned = scanned.saturating_add(1);
+            match block.previous_block_hash {
+                Some(prev) => hash = prev,
+                None => return (collected, scanned, false),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn txid(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    fn answer(mempool: &[u8], blocks: &[u8]) -> BitcoindAnswer {
+        BitcoindAnswer {
+            fresh_mempool: mempool.iter().copied().map(txid).collect(),
+            recent_block_txids: blocks.iter().copied().map(txid).collect(),
+            blocks_scanned: u32::from(!blocks.is_empty()),
+            block_walk_truncated: false,
+        }
+    }
+
+    /// The live Setup B case, reproduced: `log_id=2952` rejected with
+    /// 187 of 2738 unknown (6.83%, over the 4.0 threshold), and 10 of
+    /// 10 sampled txids were in bitcoind's mempool seconds later. With
+    /// every unknown held by the node the recomputed count is zero and
+    /// the rejection must be withdrawn.
+    #[test]
+    fn unknowns_held_by_bitcoind_withdraw_the_rejection() {
+        let unknown: Vec<[u8; 32]> = (1u8..=187).map(txid).collect();
+        let mempool: Vec<u8> = (1u8..=187).collect();
+        let adj = adjudicate(2738, &unknown, &answer(&mempool, &[]));
+
+        assert_eq!(adj.unknown_before, 187);
+        assert_eq!(adj.in_mempool, 187);
+        assert_eq!(adj.still_absent, 0);
+        assert!(
+            !adj.still_exceeds(4.0),
+            "every unknown was in bitcoind's mempool; the rejection must not stand"
+        );
+    }
+
+    /// The mined case named in PB-40: a transaction selected into the
+    /// template and mined before the check is known, not absent.
+    #[test]
+    fn unknowns_mined_since_the_template_withdraw_the_rejection() {
+        let unknown: Vec<[u8; 32]> = (1u8..=50).map(txid).collect();
+        let blocks: Vec<u8> = (1u8..=50).collect();
+        let adj = adjudicate(100, &unknown, &answer(&[], &blocks));
+
+        assert_eq!(adj.mined, 50);
+        assert_eq!(adj.in_mempool, 0);
+        assert_eq!(adj.still_absent, 0);
+        assert!(
+            !adj.still_exceeds(4.0),
+            "a template tx mined between construction and the check is known"
+        );
+    }
+
+    /// The mechanism must not become a blanket amnesty. Transactions
+    /// bitcoind genuinely does not know still count, and still reject.
+    #[test]
+    fn genuinely_absent_unknowns_keep_the_rejection() {
+        let unknown: Vec<[u8; 32]> = (1u8..=20).map(txid).collect();
+        // Only 5 of the 20 are accounted for.
+        let adj = adjudicate(100, &unknown, &answer(&[1, 2, 3], &[4, 5]));
+
+        assert_eq!(adj.in_mempool, 3);
+        assert_eq!(adj.mined, 2);
+        assert_eq!(adj.still_absent, 15);
+        assert!(
+            adj.still_exceeds(4.0),
+            "15 of 100 unknown is 15%, still over the 4% tolerance"
+        );
+    }
+
+    /// Partial recovery across the threshold is the interesting edge:
+    /// enough unknowns are explained to bring the ratio back under
+    /// tolerance, and the template is accepted on the recomputed count.
+    #[test]
+    fn partial_recovery_below_tolerance_withdraws_the_rejection() {
+        let unknown: Vec<[u8; 32]> = (1u8..=10).map(txid).collect();
+        // 7 explained, 3 still absent: 3 of 100 is 3%, under 4%.
+        let adj = adjudicate(100, &unknown, &answer(&[1, 2, 3, 4], &[5, 6, 7]));
+
+        assert_eq!(adj.still_absent, 3);
+        assert!(!adj.still_exceeds(4.0));
+    }
+
+    /// The first pass and the recompute must agree on the threshold
+    /// rule, including at the boundary where `>` and `>=` differ.
+    /// Exactly 4 of 100 is 4.0%, which is NOT over a 4.0 tolerance.
+    #[test]
+    fn threshold_rule_matches_the_first_pass_at_the_boundary() {
+        assert!(
+            !exceeds_tolerance(4, 100, 4.0),
+            "exactly at tolerance is not over it"
+        );
+        assert!(exceeds_tolerance(5, 100, 4.0));
+        assert!(
+            !exceeds_tolerance(0, 0, 4.0),
+            "an empty template cannot exceed a ratio"
+        );
+    }
+
+    /// A reviewer at T+7 needs the identities, but bounded.
+    #[test]
+    fn absent_sample_is_capped_and_holds_only_the_absent() {
+        let unknown: Vec<[u8; 32]> = (1u8..=100).map(txid).collect();
+        let mempool: Vec<u8> = (1u8..=10).collect();
+        let adj = adjudicate(200, &unknown, &answer(&mempool, &[]));
+
+        assert_eq!(adj.still_absent, 90);
+        assert_eq!(adj.still_absent_sample.len(), ABSENT_SAMPLE_CAP);
+        for t in &adj.still_absent_sample {
+            assert!(
+                !adj_contains(&mempool, t),
+                "an explained txid must never appear in the absent sample"
+            );
+        }
+    }
+
+    fn adj_contains(mempool: &[u8], t: &[u8; 32]) -> bool {
+        mempool.iter().copied().map(txid).any(|m| m == *t)
+    }
+
+    /// A transaction cannot be in the mempool and mined at once; if
+    /// both sets carry it the mempool answer wins and it is counted
+    /// once, never twice.
+    #[test]
+    fn a_txid_in_both_sets_is_counted_once() {
+        let unknown = [txid(1)];
+        let adj = adjudicate(10, &unknown, &answer(&[1], &[1]));
+
+        assert_eq!(adj.in_mempool, 1);
+        assert_eq!(adj.mined, 0);
+        assert_eq!(adj.still_absent, 0);
+        assert_eq!(
+            adj.in_mempool + adj.mined + adj.still_absent,
+            adj.unknown_before
+        );
+    }
+}

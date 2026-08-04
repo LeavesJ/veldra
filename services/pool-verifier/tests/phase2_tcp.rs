@@ -101,6 +101,23 @@ struct MockState {
     /// the verifier's mempool view from `Fresh` to `Degraded`
     /// without tearing down the axum task.
     always_fail: Arc<AtomicBool>,
+    /// PB-40: the chain tip served to `getbestblockhash` / `getblock`.
+    /// `None` makes both RPCs error, which is the state every test
+    /// written before PB-40 runs in and which the second-chance block
+    /// walk must tolerate.
+    tip_block: Arc<std::sync::RwLock<Option<MockBlock>>>,
+}
+
+/// One block for the `getblock` mock. Always a chain of length one:
+/// `previousblockhash` is null so the verifier's walk terminates
+/// after it, which is the shape of the case being modelled (a single
+/// block arriving between template construction and the check).
+#[derive(Clone)]
+struct MockBlock {
+    hash: String,
+    height: u32,
+    /// Display-order hex, as Bitcoin Core emits in `getblock` verbosity 1.
+    display_hex_txids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +142,45 @@ async fn rpc_handler(
             Json(json!({
                 "result": null,
                 "error": {"code": -32603, "message": "mock-induced failure"},
+                "id": req.id,
+            })),
+        );
+    }
+
+    // PB-40 second-chance RPCs. A test that never seeds `tip_block`
+    // gets the same error Bitcoin Core would give for an unknown
+    // block, which is the path the block walk must survive.
+    if req.method == "getbestblockhash" || req.method == "getblock" {
+        let tip = state.tip_block.read().expect("mock lock").clone();
+        let Some(tip) = tip else {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "result": null,
+                    "error": {"code": -5, "message": "Block not found"},
+                    "id": req.id,
+                })),
+            );
+        };
+        if req.method == "getbestblockhash" {
+            return (
+                StatusCode::OK,
+                Json(json!({"result": tip.hash, "error": null, "id": req.id})),
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "result": {
+                    "hash": tip.hash,
+                    "height": tip.height,
+                    "tx": tip.display_hex_txids,
+                    // Null terminates the verifier's walk after this
+                    // block, modelling a single block arriving between
+                    // template construction and the Class M check.
+                    "previousblockhash": Value::Null,
+                },
+                "error": null,
                 "id": req.id,
             })),
         );
@@ -184,17 +240,28 @@ async fn spawn_mock(state: MockState) -> SocketAddr {
 #[derive(Clone, Copy)]
 struct PolicyOverrides {
     max_stale_secs: u64,
+    /// PB-40 tests set this very high so the view is polled exactly
+    /// once at boot and then frozen. That is what makes the
+    /// stale-view false positive reproducible instead of a race
+    /// against the next poll: the served view is pinned to the
+    /// mempool as it was at T0 while the mock's mempool moves on,
+    /// which is precisely the temporal skew the defect is made of.
+    poll_interval_secs: u64,
 }
 
 impl Default for PolicyOverrides {
     fn default() -> Self {
-        Self { max_stale_secs: 60 }
+        Self {
+            max_stale_secs: 60,
+            poll_interval_secs: 1,
+        }
     }
 }
 
 fn write_policy_toml(scratch: &Path, mock_addr: SocketAddr, overrides: PolicyOverrides) -> PathBuf {
     let policy_path = scratch.join("policy.toml");
     let max_stale_secs = overrides.max_stale_secs;
+    let poll_interval_secs = overrides.poll_interval_secs;
     let toml = format!(
         r#"[policy]
 protocol_version = 2
@@ -220,7 +287,7 @@ warn_coinbase_sigops_max = 400
 [policy.mempool]
 enforce = true
 tolerance_pct = 4.0
-poll_interval_secs = 1
+poll_interval_secs = {poll_interval_secs}
 max_stale_secs = {max_stale_secs}
 per_tx_detail = false
 rpc_url = "http://{mock_addr}/"
@@ -359,6 +426,7 @@ fn make_mock_state(display_hex: Vec<String>) -> MockState {
         request_count: Arc::new(AtomicU64::new(0)),
         fail_next: Arc::new(AtomicBool::new(false)),
         always_fail: Arc::new(AtomicBool::new(false)),
+        tip_block: Arc::new(std::sync::RwLock::new(None)),
     }
 }
 
@@ -520,6 +588,20 @@ async fn phase2_tcp_fabrication_path_emits_tolerance_exceeded() {
     let booted = boot_verifier_with_mock(decoy_display_hex_txids(8)).await;
 
     let verdict = round_trip_template(booted.verifier_port, template).await;
+
+    // PB-40: the second chance must not become a blanket amnesty.
+    // bitcoind is reachable and genuinely does not have this
+    // transaction, so the rejection is adjudicated and UPHELD, which
+    // is the only outcome that can support a detection claim.
+    let metrics = fetch_metrics_text(booted.http_port).await;
+    let upheld = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"upheld\"}",
+    );
+    let withdrawn = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"withdrawn\"}",
+    );
     drop(booted);
 
     assert!(!verdict.accepted, "expected reject, got accept");
@@ -533,6 +615,15 @@ async fn phase2_tcp_fabrication_path_emits_tolerance_exceeded() {
     assert!(
         detail.contains("mempool tolerance exceeded"),
         "detail must mention tolerance: {detail}"
+    );
+    assert_eq!(
+        upheld, 1,
+        "a genuinely absent transaction must be adjudicated and upheld\n\
+         --- metrics ---\n{metrics}"
+    );
+    assert_eq!(
+        withdrawn, 0,
+        "nothing was recovered here\n--- metrics ---\n{metrics}"
     );
 }
 
@@ -589,7 +680,10 @@ async fn phase2_tcp_kill_the_mock_drives_view_to_degraded() {
     let (template, display_hex) = regtest_segwit_template_and_display_hex();
     // 3-second fail-stale window so the view crosses Degraded
     // (2 * max_stale_secs = 6s) within the test budget.
-    let overrides = PolicyOverrides { max_stale_secs: 3 };
+    let overrides = PolicyOverrides {
+        max_stale_secs: 3,
+        ..PolicyOverrides::default()
+    };
     let booted = boot_verifier_with_mock_overrides(display_hex, overrides).await;
 
     // Sanity: under Fresh, the template accepts.
@@ -671,6 +765,208 @@ async fn phase2_tcp_empty_mempool_response_is_refused_not_served() {
         "an unprimed view must stay observable per template, got {unprimed}\n\
          --- metrics ---\n{metrics}"
     );
+}
+
+// ── PB-40: second-chance lookup at Class M rejection time ────────
+
+/// Boot with the view pinned: one poll at startup, then never again,
+/// so the served mempool view is frozen at T0 while the mock's
+/// mempool moves on. That is the temporal skew the PB-40 defect is
+/// made of, made deterministic instead of a race against the next
+/// poll.
+async fn boot_with_frozen_view(display_hex_txids: Vec<String>) -> Booted {
+    boot_verifier_with_mock_overrides(
+        display_hex_txids,
+        PolicyOverrides {
+            max_stale_secs: 3_600,
+            poll_interval_secs: 3_600,
+        },
+    )
+    .await
+}
+
+/// THE PB-40 CASE, at the wire.
+///
+/// Reproduces what was caught live on the Setup B node: `log_id=2952`
+/// rejected with 187 of 2738 transactions "unknown to verifier view",
+/// and 10 of 10 sampled txids were IN bitcoind's mempool when queried
+/// seconds later. The verifier's view was stale; bitcoind was not.
+///
+/// Here the view is primed without the template's transaction, then
+/// bitcoind's mempool gains it, then the template arrives. The first
+/// pass rejects at 1/1 unknown, over the 4% tolerance. The template
+/// must nonetheless be ACCEPTED, because the second-chance lookup
+/// asks bitcoind and bitcoind has it.
+///
+/// Without the second-chance mechanism this verdict is a rejection,
+/// which `phase2_tcp_fabrication_path_emits_tolerance_exceeded` pins
+/// for the genuinely-absent case.
+#[tokio::test]
+#[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
+async fn phase2_tcp_second_chance_withdraws_a_stale_view_false_positive() {
+    let (template, display_hex) = regtest_segwit_template_and_display_hex();
+    let booted = boot_with_frozen_view(decoy_display_hex_txids(8)).await;
+
+    // The transaction arrives in bitcoind's mempool after the
+    // verifier's view was taken. The view is frozen and still does
+    // not carry it.
+    {
+        let mut g = booted
+            .mock
+            .display_hex_txids
+            .write()
+            .expect("mock write lock");
+        g.extend(display_hex);
+    }
+
+    let verdict = round_trip_template(booted.verifier_port, template).await;
+
+    let metrics = fetch_metrics_text(booted.http_port).await;
+    let withdrawn = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"withdrawn\"}",
+    );
+    let recovered = parse_counter(
+        &metrics,
+        "verifier_phase2_checks_total{result=\"recovered\"}",
+    );
+    let rejected = parse_counter(
+        &metrics,
+        "verifier_phase2_checks_total{result=\"rejected\"}",
+    );
+    drop(booted);
+
+    assert!(
+        verdict.accepted,
+        "a template whose transactions bitcoind holds must not be rejected for a stale \
+         view; reason={:?} detail={:?}",
+        verdict.reason_code, verdict.reason_detail
+    );
+    assert_eq!(
+        verdict.reason_code, None,
+        "a withdrawn rejection must not leave a reason_code on an accepted verdict"
+    );
+    assert_eq!(
+        withdrawn, 1,
+        "expected exactly one withdrawn second chance\n--- metrics ---\n{metrics}"
+    );
+    assert_eq!(
+        recovered, 1,
+        "a withdrawn rejection must be observable as result=recovered, not folded into \
+         agreed\n--- metrics ---\n{metrics}"
+    );
+    assert_eq!(
+        rejected, 0,
+        "no rejection was emitted, so result=rejected must not have incremented\n\
+         --- metrics ---\n{metrics}"
+    );
+}
+
+/// The mined case PB-40 names explicitly: a transaction selected into
+/// the template and mined before the check is KNOWN, not absent.
+///
+/// bitcoind's mempool no longer holds it, because it is in the block
+/// that just arrived. A second chance that only asked `getrawmempool`
+/// would score it absent and uphold a false rejection, and this is the
+/// worst shape of the defect: the whole template's transaction set
+/// leaves the mempool at once, so the unknown ratio goes to 100%.
+#[tokio::test]
+#[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
+async fn phase2_tcp_second_chance_counts_a_mined_tx_as_known() {
+    let (template, display_hex) = regtest_segwit_template_and_display_hex();
+    let booted = boot_with_frozen_view(decoy_display_hex_txids(8)).await;
+
+    // The mempool never carries the transaction. The block that
+    // arrived after the template was built does. `block_height` on
+    // the fixture template is 102, so a tip at 102 is a block mined
+    // since it was assembled.
+    {
+        let mut g = booted.mock.tip_block.write().expect("mock write lock");
+        *g = Some(MockBlock {
+            hash: "f".repeat(64),
+            height: 102,
+            display_hex_txids: display_hex,
+        });
+    }
+
+    let verdict = round_trip_template(booted.verifier_port, template).await;
+
+    let metrics = fetch_metrics_text(booted.http_port).await;
+    let withdrawn = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"withdrawn\"}",
+    );
+    drop(booted);
+
+    assert!(
+        verdict.accepted,
+        "a template transaction mined between construction and the check is known to \
+         bitcoind, not absent; reason={:?} detail={:?}",
+        verdict.reason_code, verdict.reason_detail
+    );
+    assert_eq!(
+        withdrawn, 1,
+        "the mined transaction must be what withdrew the rejection\n--- metrics ---\n{metrics}"
+    );
+}
+
+/// A lookup that could not run is NOT evidence of absence.
+///
+/// When bitcoind cannot be reached at rejection time the rejection
+/// stands, but it must be recorded as `lookup_failed` rather than
+/// `upheld`, because the two mean opposite things to a soak review:
+/// `upheld` is a candidate detection, `lookup_failed` is a verdict
+/// nobody adjudicated. Silently treating one as the other is the
+/// mistake that made 68 rejections unadjudicable in the first place,
+/// and it is also how a failing `bitcoin-cli` read as "genuinely
+/// absent" for two full rounds of the investigation.
+#[tokio::test]
+#[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
+async fn phase2_tcp_second_chance_failure_upholds_the_rejection_unadjudicated() {
+    let (template, _display_hex) = regtest_segwit_template_and_display_hex();
+    let booted = boot_with_frozen_view(decoy_display_hex_txids(8)).await;
+
+    // bitcoind goes away after the view was primed. The view stays
+    // Fresh (nothing re-polls it), so Class M still runs and still
+    // rejects; only the adjudication is impossible.
+    booted.mock.always_fail.store(true, Ordering::SeqCst);
+
+    let verdict = round_trip_template(booted.verifier_port, template).await;
+
+    let metrics = fetch_metrics_text(booted.http_port).await;
+    let failed = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"lookup_failed\"}",
+    );
+    let upheld = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"upheld\"}",
+    );
+    let withdrawn = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"withdrawn\"}",
+    );
+    drop(booted);
+
+    assert!(
+        !verdict.accepted,
+        "an unreachable bitcoind must not turn a Class M rejection into an acceptance"
+    );
+    assert_eq!(
+        verdict.reason_code,
+        Some(VerdictReason::V2InvariantMempoolToleranceExceeded),
+        "the original reason code must survive an unadjudicated rejection"
+    );
+    assert_eq!(
+        failed, 1,
+        "expected one lookup_failed\n--- metrics ---\n{metrics}"
+    );
+    assert_eq!(
+        upheld, 0,
+        "a lookup that never ran must NOT be recorded as upheld: upheld is a detection \
+         claim and this is not one\n--- metrics ---\n{metrics}"
+    );
+    assert_eq!(withdrawn, 0, "--- metrics ---\n{metrics}");
 }
 
 // Compile-time assertions that the test crate sees the symbols it

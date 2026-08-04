@@ -4,6 +4,7 @@ use tracing::{error, warn};
 
 use pool_verifier::mempool_view::MempoolView;
 use pool_verifier::policy::PolicyConfig;
+use pool_verifier::second_chance::SecondChance;
 
 #[derive(Debug, Clone)]
 pub struct PolicyHolder {
@@ -24,6 +25,15 @@ pub struct AppState {
     /// wrapper over that same inner function, called only from
     /// `tests/phase2_eval.rs`.
     pub mempool_view: Option<std::sync::Arc<MempoolView>>,
+
+    /// PB-40 second-chance lookup. Wired together with
+    /// `mempool_view` and `None` in exactly the same cases, but kept
+    /// as its own field rather than folded into the view because the
+    /// two ask bitcoind different questions: the view polls
+    /// `getrawmempool` on a cadence, this asks about specific
+    /// transactions plus recent blocks at the moment a template is
+    /// about to be rejected.
+    pub second_chance: Option<std::sync::Arc<SecondChance>>,
 }
 
 fn enforce_protocol(cfg: &PolicyConfig) -> anyhow::Result<()> {

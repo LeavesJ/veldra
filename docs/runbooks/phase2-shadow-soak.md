@@ -16,7 +16,11 @@
 
 ## Acceptance Criterion (ADR-003 #6)
 
-Zero false positives at the `tolerance_pct = 4.0` default across one full week of shadow-mode operation against an operator bitcoind. A false positive is any verdict where the shield emits `v2_invariant_mempool_tolerance_exceeded` against a template that downstream evidence shows was real. Downstream evidence includes the template being mined into the Bitcoin blockchain by the same pool, or the gateway accepting it under shadow-mode reporting.
+Zero false positives at the `tolerance_pct = 4.0` default across one full week of shadow-mode operation against an operator bitcoind. A false positive is any verdict where the shield emits `v2_invariant_mempool_tolerance_exceeded` against a template that downstream evidence shows was real.
+
+**The evidence is captured at rejection time, not reconstructed afterwards (PB-40).** When the Class M check would reject, the verifier asks bitcoind directly about the specific unknown transactions and writes the answer to the verdict's `mempool_adjudication` field. Read that field. The intuitive procedure of re-querying the txids later is not merely weaker, it is **wrong in the dangerous direction**: the mempool tail churns within minutes, so week-old records return "absent" for transactions that were present all along, and the review concludes every rejection was a true positive. See the T+7 Wrap-Up and the PB-40 amendment in `docs/ADR-003-mempool-ground-truth.md`.
+
+**What this criterion does and does not establish.** On a deployment where the template source and the verifier read the same bitcoind, which is Setup B, Class M is structurally incapable of a true positive. `FP_total == 0` is therefore exactly the right bar for that topology, but it validates *"the check does not cry wolf"*, NOT *"the check catches attacks"*. Detection evidence requires an independent bitcoind.
 
 If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak before any v2.0 launch announcement names Phase 2 as live.
 
@@ -86,10 +90,14 @@ Three checks at days 1, 3, 5 plus the wrap-up at day 7. Each spot check follows 
    scripts/phase2-spot-check.sh | tee -a docs/DEVLOG.md.spotchecks
    ```
    The script reads `./data/phase2-baseline.json`, fetches current values from `/metrics`, prints the five counter deltas plus the two live gauges, and dumps every Class M `v2_invariant_mempool_tolerance_exceeded` rejection from `./data/verdicts.log` (last 50 by default; bump with `--max-rejections N`). Output is human readable; pipe to a file so the DEVLOG entry inherits the same shape across all four spot checks. The script also flags a `delta_degraded > 0` warning so an operator-environment fault during the soak is impossible to miss.
-2. For each rejection in the script's output, cross-reference against the pool's block-found feed for the same block height. Three outcomes:
-   - **The pool mined the block** at that height with the same coinbase: false positive confirmed. Log to DEVLOG as a counted FP.
-   - **A different pool mined the block:** ambiguous; the rejected template may have been a stale work order that the pool itself would have abandoned. Mark as ambiguous in DEVLOG, do not count as FP.
-   - **No block at that height yet:** likely a stale template that timed out before the pool reissued. Mark as ambiguous, do not count as FP.
+2. For each rejection, read the `mempool_adjudication` object on its verdict record in `./data/verdicts.log`. **This is the authoritative evidence and it is the only evidence that survives.** Do not re-query the txids with `bitcoin-cli`; see the warning below. Three outcomes, keyed off `outcome`:
+   - **`upheld`:** bitcoind was asked at rejection time and held the transactions in neither its mempool nor any block at or above the template's height. This is a genuine candidate detection. Cross-reference against the pool's block-found feed for corroboration and log to DEVLOG with the `still_absent` count and `still_absent_sample`.
+   - **`lookup_failed`:** bitcoind could not be asked, so this rejection is **UNADJUDICATED**. It is not a false positive and it is not a detection. Count it separately, investigate the `lookup_error` field, and treat a nonzero total as a soak-validity problem (see T+7 step 4), never as a pass.
+   - **`withdrawn` never appears here.** A rejection the second-chance lookup overturned is not emitted as a rejection at all; it lands as an accepted verdict with the adjudication attached, and it is counted by `verifier_phase2_second_chance_total{outcome="withdrawn"}`. A nonzero withdrawn count is the mempool-view staleness of PB-40 being caught in the act. It is expected and healthy, not a failure.
+
+   > **Do NOT adjudicate a rejection by re-querying its txids afterwards.** PB-40 measured this directly: txids sampled from a rejection 35 minutes old came back 9 of 9 ABSENT from bitcoind, not because they were ever invalid but because they are the churny tail that gets RBF-replaced or evicted from a 93k mempool within minutes. A T+7 review that re-queries week-old records will find every transaction absent and conclude every rejection was a true positive. **The obvious procedure returns a confidently incorrect answer**, which is why the bitcoind answer is captured at rejection time and written to the verdict record instead.
+
+   > If `data/verdicts.log` is stale or missing while rejections are climbing, the durability write is failing and the soak has no evidence. The verifier logs `verdict durability write FAILED` on every such attempt; on the Setup B node the file was root-owned and every append failed silently for weeks. Check ownership against the verifier's uid before trusting any wrap-up.
 3. If the script reported a `delta_degraded > 0` warning, the bitcoind RPC went away at some point during the window. Check verifier logs for `mempool refresh failed` or `mempool refresh timed out`. Investigate the bitcoind side; this is operator-environment noise, not a Phase 2 bug. Resolve before continuing the soak; if the degraded counter grows beyond a few percent of the polling cadence, the soak window is invalid and resets to T+0 once bitcoind is healthy.
 4. Watch `verifier_mempool_view_age_seconds` in the script's output. Should stay well under `max_stale_secs = 60` outside of degraded windows. Sustained values above 30 indicate bitcoind RPC latency growing; investigate.
 5. Note the script output plus the FP count plus any anomalies in DEVLOG before the next spot check.
@@ -97,17 +105,20 @@ Three checks at days 1, 3, 5 plus the wrap-up at day 7. Each spot check follows 
 ## T+7 Wrap-Up
 
 1. Final counter snapshot. Run `scripts/phase2-spot-check.sh | tee -a docs/DEVLOG.md.spotchecks` one more time at T+7. The deltas at this run cover the full soak window.
-2. Total false-positive count `FP_total` is the sum of confirmed FPs across all four spot checks. (Ambiguous rejections do NOT count.)
+2. `FP_total` is `delta_rejected` where the verdict's `mempool_adjudication.outcome` is `upheld`, corroborated against the block-found feed. It is read from the durable verdict records and the counters, NOT hand-counted from a fresh `bitcoin-cli` sweep.
 3. Compute the false-positive rate against total Class M checks:
    ```
-   total_classM_checks = delta_agreed + delta_rejected + delta_stale + delta_skipped
+   total_classM_checks = delta_agreed + delta_recovered + delta_rejected + delta_stale + delta_skipped
    fp_rate = FP_total / total_classM_checks
    ```
+   `delta_recovered` is `verifier_phase2_checks_total{result="recovered"}`: first-pass tolerance breaches that bitcoind overturned. They are Class M checks that ran, so they belong in the denominator, and they emitted no rejection, so they never belong in `FP_total`.
 4. Apply the acceptance criterion:
-   - `FP_total == 0` AND `delta_degraded` was zero or rapidly resolved each time: **PASS**. Phase 2 is launch-ready at the 4% default. Document in DEVLOG plus open a TESTLOG CL entry that closes the soak.
+   - `FP_total == 0` AND `delta_degraded` was zero or rapidly resolved each time AND `verifier_phase2_second_chance_total{outcome="lookup_failed"} == 0`: **PASS**. Phase 2 is launch-ready at the 4% default. Document in DEVLOG plus open a TESTLOG CL entry that closes the soak.
    - `FP_total > 0`: **FAIL**. Do not announce Phase 2 as live. Proceed to "If Fail" below.
+   - `lookup_failed > 0`: **INVALID SOAK for those verdicts.** A rejection nobody could adjudicate is not evidence in either direction, so it can neither pass nor fail the gate. Fix the bitcoind reachability cause and re-run the window. Recording these as passes is the exact failure mode this soak exists to avoid.
    - Bitcoind degradation longer than a few hours total during the week: **INVALID SOAK**. Reset to T+0 once the operator-environment fault is fixed.
-5. On PASS, update `docs/PRODUCTION_BLOCKERS.md` PB-9 status to mark Phase 2 #6 as resolved with the soak result line. Update `docs/ADR-003-mempool-ground-truth.md` action item #6 from `[ ]` to `[x]` with the result and pointer at the DEVLOG entry.
+5. **State the scope of what passed.** On a single-bitcoind deployment such as Setup B, the template-manager and the verifier read the same node, so Class M is structurally incapable of a true positive and this soak validates *"the check does not cry wolf"*, NOT *"the check catches attacks"*. Write that sentence into the DEVLOG entry verbatim. A clean soak on this topology is not detection evidence and must never be cited as such. See the PB-40 amendment in `docs/ADR-003-mempool-ground-truth.md`.
+6. On PASS, update `docs/PRODUCTION_BLOCKERS.md` PB-9 status to mark Phase 2 #6 as resolved with the soak result line. Update `docs/ADR-003-mempool-ground-truth.md` action item #6 from `[ ]` to `[x]` with the result and pointer at the DEVLOG entry.
 
 ## If Fail (FP_total > 0)
 

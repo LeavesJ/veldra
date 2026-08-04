@@ -264,13 +264,19 @@ pub enum MempoolCheckOutcome {
     /// at least 100% minus tolerance) was present in the view.
     Agreed { unknown_count: u32, total: u32 },
     /// Aggregate unknown ratio crossed the configured tolerance
-    /// threshold. Detail surfaces representative txids; full per-tx
-    /// emission is the caller's responsibility under per-tx detail
-    /// mode.
+    /// threshold.
     ToleranceExceeded {
-        unknown_count: u32,
+        /// EVERY template txid absent from the served view, in
+        /// template order, not a sample.
+        ///
+        /// Full because two callers need all of them: the PB-40
+        /// second-chance lookup adjudicates each one against bitcoind
+        /// before the rejection is allowed to stand, and per-tx detail
+        /// mode emits each one. Bounding for the wire happens at
+        /// format time in `policy::format_mempool_tolerance_detail_bounded`,
+        /// which is the only place that knows the budget.
+        unknown: Vec<[u8; 32]>,
         total: u32,
-        sample_unknown: Vec<[u8; 32]>,
     },
     /// View was Stale at the moment of check. Caller may treat this
     /// as advisory (not a hard reject); the shield short-circuit
@@ -281,9 +287,11 @@ pub enum MempoolCheckOutcome {
     Skipped,
 }
 
-/// Cap on the number of representative unknown txids surfaced when
-/// the aggregate threshold is exceeded. Bounded so the verdict
-/// detail string stays under typical export field budgets.
+/// Cap on the number of representative unknown txids surfaced in the
+/// aggregate-mode rejection detail. Bounded so the verdict detail
+/// string stays under typical export field budgets. Applied by
+/// `policy::check_invariant_shield_inner` at format time, not by
+/// [`evaluate`], which returns the full unknown set.
 pub const SAMPLE_UNKNOWN_CAP: usize = 10;
 
 /// Run the Class M check against a template's transaction set.
@@ -326,15 +334,11 @@ pub fn evaluate(
     }
     let unknown_count = u32::try_from(unknown.len()).unwrap_or(u32::MAX);
 
-    let ratio_pct = (f64::from(unknown_count) / f64::from(total)) * 100.0;
-    if ratio_pct > tolerance_pct {
-        let mut sample = unknown;
-        sample.truncate(SAMPLE_UNKNOWN_CAP);
-        return MempoolCheckOutcome::ToleranceExceeded {
-            unknown_count,
-            total,
-            sample_unknown: sample,
-        };
+    // The threshold rule lives in one place so the PB-40
+    // second-chance recompute cannot round differently from this
+    // first pass; see `second_chance::exceeds_tolerance`.
+    if crate::second_chance::exceeds_tolerance(unknown_count, total, tolerance_pct) {
+        return MempoolCheckOutcome::ToleranceExceeded { unknown, total };
     }
 
     match snapshot.state {
@@ -428,29 +432,33 @@ mod tests {
         }
         let outcome = evaluate(&snap, &template, 4.0);
         match outcome {
-            MempoolCheckOutcome::ToleranceExceeded {
-                unknown_count,
-                total,
-                sample_unknown,
-            } => {
-                assert_eq!(unknown_count, 5);
+            MempoolCheckOutcome::ToleranceExceeded { unknown, total } => {
+                assert_eq!(unknown.len(), 5);
                 assert_eq!(total, 100);
-                assert_eq!(sample_unknown.len(), 5);
             }
             other => panic!("expected ToleranceExceeded, got {other:?}"),
         }
     }
 
+    /// `evaluate` hands back every unknown txid, not a sample. The
+    /// PB-40 second-chance lookup has to ask bitcoind about all of
+    /// them: adjudicating only the first ten would leave the rest
+    /// counted as unknown and the false-positive rejection standing.
+    /// `SAMPLE_UNKNOWN_CAP` bounds the detail string, not this set.
     #[test]
-    fn sample_capped_at_ten_when_many_unknown() {
+    fn every_unknown_is_returned_not_a_sample() {
         let mempool: Vec<[u8; 32]> = vec![txid(0)];
-        // 50 unknown txids in template, sample capped at 10
         let template: Vec<[u8; 32]> = (1u8..=50).map(txid).collect();
         let snap = snapshot_with(MempoolState::Fresh, mempool);
         let outcome = evaluate(&snap, &template, 4.0);
         match outcome {
-            MempoolCheckOutcome::ToleranceExceeded { sample_unknown, .. } => {
-                assert_eq!(sample_unknown.len(), SAMPLE_UNKNOWN_CAP);
+            MempoolCheckOutcome::ToleranceExceeded { unknown, total } => {
+                assert_eq!(total, 50);
+                assert_eq!(
+                    unknown.len(),
+                    50,
+                    "all 50 unknown txids must survive to the caller, not {SAMPLE_UNKNOWN_CAP}"
+                );
             }
             other => panic!("expected ToleranceExceeded, got {other:?}"),
         }

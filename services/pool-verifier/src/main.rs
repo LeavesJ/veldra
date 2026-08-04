@@ -267,9 +267,20 @@ fn init_metrics() -> (
 /// work is worse than a missing key, because a missing key fails
 /// loudly at boot. An operator who wants Phase 1 says so with
 /// `enforce = false`.
+///
+/// Returns the polling view and the PB-40 second-chance lookup
+/// together, so they are wired both-or-neither by construction: a
+/// verifier that enforces Class M without the ability to adjudicate a
+/// rejection is exactly the configuration that produced 68
+/// unadjudicable rejections on the Setup B node.
 fn build_phase2_mempool_view(
     cfg: &pool_verifier::policy::PolicyConfig,
-) -> anyhow::Result<Option<Arc<pool_verifier::mempool_view::MempoolView>>> {
+) -> anyhow::Result<
+    Option<(
+        Arc<pool_verifier::mempool_view::MempoolView>,
+        Arc<pool_verifier::second_chance::SecondChance>,
+    )>,
+> {
     let mp = &cfg.mempool;
     if !mp.enforce {
         return Ok(None);
@@ -293,6 +304,13 @@ fn build_phase2_mempool_view(
     let view = Arc::new(pool_verifier::mempool_view::MempoolView::new(
         mp.max_stale_secs,
     ));
+    // The lookup gets its own clone because the polling task moves
+    // its copy into a `tokio::spawn` for the process lifetime. A
+    // `BitcoindClient` clone shares the underlying reqwest connection
+    // pool, so this is a handle, not a second pool.
+    let second_chance = Arc::new(pool_verifier::second_chance::SecondChance::new(
+        client.clone(),
+    ));
     let handle = Arc::clone(&view).spawn_polling_task(
         client,
         std::time::Duration::from_secs(mp.poll_interval_secs),
@@ -305,9 +323,12 @@ fn build_phase2_mempool_view(
         max_stale_secs = mp.max_stale_secs,
         tolerance_pct = mp.tolerance_pct,
         per_tx_detail = mp.per_tx_detail,
-        "Phase 2 Class M check enabled; mempool view polling task spawned"
+        second_chance_deadline_secs =
+            pool_verifier::second_chance::SECOND_CHANCE_DEADLINE.as_secs(),
+        "Phase 2 Class M check enabled; mempool view polling task spawned, and Class M \
+         rejections will be put to bitcoind before they stand (PB-40)"
     );
-    Ok(Some(view))
+    Ok(Some((view, second_chance)))
 }
 
 // ── Main ─────────────────────────────────────────────────────
@@ -381,11 +402,18 @@ async fn main() -> anyhow::Result<()> {
     // existing deployments run Phase 1 only without operator action.
     // With `enforce = true` and unusable credentials this is fatal:
     // startup fails rather than serving a verifier that checks nothing.
-    let mempool_view = build_phase2_mempool_view(&policy_holder.config)?;
+    // Both or neither: destructured here rather than built as two
+    // independent Options so no future edit can leave Class M
+    // enforcing with no way to adjudicate what it rejects.
+    let (mempool_view, second_chance) = match build_phase2_mempool_view(&policy_holder.config)? {
+        Some((view, lookup)) => (Some(view), Some(lookup)),
+        None => (None, None),
+    };
 
     let app_state = AppState {
         policy: Arc::new(RwLock::new(policy_holder)),
         mempool_view,
+        second_chance,
     };
 
     let (verdict_log, log_id_counter) = load_verdict_log();
@@ -577,6 +605,26 @@ mod dashboard_tests {
 
     // ── helpers ──
 
+    /// A PB-40 adjudication as the second-chance lookup records one:
+    /// the polled view called 30 of 500 unknown, bitcoind held 28 of
+    /// them and had mined one, leaving a single genuinely absent
+    /// transaction.
+    fn sample_adjudication() -> pool_verifier::second_chance::MempoolAdjudicationRecord {
+        pool_verifier::second_chance::MempoolAdjudicationRecord {
+            outcome: "withdrawn".to_string(),
+            total: 500,
+            unknown_before: 30,
+            in_mempool: 28,
+            mined: 1,
+            still_absent: 1,
+            blocks_scanned: 1,
+            block_walk_truncated: false,
+            still_absent_sample: vec!["ab".repeat(32)],
+            lookup_error: None,
+            lookup_error_kind: None,
+        }
+    }
+
     fn sample_verdict(accepted: bool) -> verdicts::LoggedVerdict {
         verdicts::LoggedVerdict {
             log_id: 1,
@@ -610,6 +658,7 @@ mod dashboard_tests {
             coinbase_sigops: Some(4),
             created_at_unix_ms: Some(1_700_000_000_000),
             safety_warnings: vec![],
+            mempool_adjudication: None,
         }
     }
 
@@ -785,7 +834,7 @@ mod dashboard_tests {
 
     #[test]
     fn csv_header_covers_logged_verdict_fields() {
-        let csv_header = "log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,tier_source,min_avg_fee_used,avg_fee_sats_per_tx,reason_code,reason_detail,reason,timestamp,template_weight,total_sigops,coinbase_sigops,created_at_unix_ms,safety_warnings";
+        let csv_header = "log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,tier_source,min_avg_fee_used,avg_fee_sats_per_tx,reason_code,reason_detail,reason,timestamp,template_weight,total_sigops,coinbase_sigops,created_at_unix_ms,safety_warnings,second_chance,second_chance_still_absent";
 
         // Verify the header is present in the source (get_verdicts_csv).
         // This catches accidental edits to the CSV column order.
@@ -793,11 +842,45 @@ mod dashboard_tests {
         let json = serde_json::to_value(&v).unwrap();
         let json_keys: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
 
-        // Every CSV column must correspond to a LoggedVerdict field.
+        // PB-40 added two columns that are not top-level fields: they
+        // are flattened out of the nested `mempool_adjudication`
+        // record, because CSV has no nesting. They are enumerated
+        // here rather than exempted by a pattern, so a future derived
+        // column still has to be declared, and each names the subfield
+        // it flattens.
+        let derived: [(&str, &str); 2] = [
+            ("second_chance", "outcome"),
+            ("second_chance_still_absent", "still_absent"),
+        ];
+
+        // Every CSV column either is a LoggedVerdict field or is a
+        // declared projection of `mempool_adjudication`.
         for col in csv_header.split(',') {
+            if derived.iter().any(|(name, _)| *name == col) {
+                continue;
+            }
             assert!(
                 json_keys.contains(&col.to_string()),
-                "CSV column '{col}' does not match any LoggedVerdict field"
+                "CSV column '{col}' is neither a LoggedVerdict field nor a declared \
+                 projection of mempool_adjudication"
+            );
+        }
+
+        // And each declared projection must still resolve, so renaming
+        // a field inside the record breaks this test rather than
+        // silently emptying a column in the soak's evidence export.
+        let adjudicated = verdicts::LoggedVerdict {
+            mempool_adjudication: Some(sample_adjudication()),
+            ..sample_verdict(false)
+        };
+        let adj_json = serde_json::to_value(&adjudicated).unwrap();
+        let record = adj_json
+            .get("mempool_adjudication")
+            .expect("a rejected verdict with an adjudication must serialize the record");
+        for (col, subfield) in derived {
+            assert!(
+                record.get(subfield).is_some(),
+                "CSV column '{col}' reads mempool_adjudication.{subfield}, which no longer exists"
             );
         }
     }
@@ -929,9 +1012,11 @@ mod dashboard_tests {
             "coinbase_sigops",
             "created_at_unix_ms",
             "safety_warnings",
+            "second_chance",
+            "second_chance_still_absent",
         ];
 
-        let csv_header = "log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,tier_source,min_avg_fee_used,avg_fee_sats_per_tx,reason_code,reason_detail,reason,timestamp,template_weight,total_sigops,coinbase_sigops,created_at_unix_ms,safety_warnings";
+        let csv_header = "log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,tier_source,min_avg_fee_used,avg_fee_sats_per_tx,reason_code,reason_detail,reason,timestamp,template_weight,total_sigops,coinbase_sigops,created_at_unix_ms,safety_warnings,second_chance,second_chance_still_absent";
         let actual: Vec<&str> = csv_header.split(',').collect();
 
         assert_eq!(
@@ -950,10 +1035,12 @@ mod dashboard_tests {
     }
 
     #[test]
-    fn csv_column_count_equals_19() {
+    fn csv_column_count_equals_21() {
         // Canary test: adding or removing a column is a breaking schema change.
-        let csv_header = "log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,tier_source,min_avg_fee_used,avg_fee_sats_per_tx,reason_code,reason_detail,reason,timestamp,template_weight,total_sigops,coinbase_sigops,created_at_unix_ms,safety_warnings";
-        assert_eq!(csv_header.split(',').count(), 19);
+        // 19 until PB-40 added `second_chance` and
+        // `second_chance_still_absent`.
+        let csv_header = "log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,tier_source,min_avg_fee_used,avg_fee_sats_per_tx,reason_code,reason_detail,reason,timestamp,template_weight,total_sigops,coinbase_sigops,created_at_unix_ms,safety_warnings,second_chance,second_chance_still_absent";
+        assert_eq!(csv_header.split(',').count(), 21);
     }
 
     // ── CL-19: Prometheus metric label coverage ──
@@ -1038,9 +1125,13 @@ mod dashboard_tests {
             .map(|t| t.to_string())
             .unwrap_or_default();
         let sw = v.safety_warnings.join(";");
+        let (sc, sc_absent) = v.mempool_adjudication.as_ref().map_or_else(
+            || (String::new(), String::new()),
+            |a| (a.outcome.clone(), a.still_absent.to_string()),
+        );
         let _ = writeln!(
             line,
-            "{},{},{},{},{},{},{},{},{},{},\"{}\",\"{}\",\"{}\",{},{},{},{},{},\"{}\"",
+            "{},{},{},{},{},{},{},{},{},{},\"{}\",\"{}\",\"{}\",{},{},{},{},{},\"{}\",{},{}",
             v.log_id,
             v.template_id,
             v.height,
@@ -1060,6 +1151,8 @@ mod dashboard_tests {
             cs,
             ca,
             sw,
+            sc,
+            sc_absent,
         );
 
         // Parse the line back and check column 10 (reason_code).
@@ -1081,7 +1174,7 @@ mod dashboard_tests {
         }
         cols.push(current);
 
-        assert_eq!(cols.len(), 19, "CSV must have exactly 19 columns");
+        assert_eq!(cols.len(), 21, "CSV must have exactly 21 columns");
         assert_eq!(
             cols[10], "fee_below_tier_floor",
             "column 10 (reason_code) must carry the canonical reason string"

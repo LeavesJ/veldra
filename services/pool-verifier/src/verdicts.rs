@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use pool_verifier::second_chance::MempoolAdjudicationRecord;
 use reservegrid_common::DeployMode;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -47,6 +48,18 @@ pub(crate) struct LoggedVerdict {
     pub(crate) created_at_unix_ms: Option<u64>,
     #[serde(default)]
     pub(crate) safety_warnings: Vec<String>,
+
+    /// PB-40: what bitcoind said about the transactions the polled
+    /// mempool view did not contain, captured at rejection time.
+    ///
+    /// `None` for every template Class M did not reject, which is
+    /// almost all of them. Present, it is the ONLY adjudicable record
+    /// of the rejection: re-querying these txids days later reports
+    /// them absent whether or not they were ever real, because the
+    /// mempool tail churns within minutes. Absent this field a T+7
+    /// review scores every rejection a true positive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mempool_adjudication: Option<MempoolAdjudicationRecord>,
 }
 
 /// Statistics response for the API.
@@ -186,8 +199,25 @@ pub(crate) fn append_verdict_to_disk(v: &LoggedVerdict) {
         Ok::<(), anyhow::Error>(())
     })();
 
-    if res.is_err() {
-        LOG_WRITE_ERRORS.fetch_add(1, Ordering::Relaxed);
+    if let Err(e) = res {
+        let errors = LOG_WRITE_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+        // PB-40: this used to bump the counter and return. On the
+        // Setup B node `data/verdicts.log` was root-owned, so every
+        // append failed, silently, for weeks: the file sat stale from
+        // 2026-06-08 while the process reported healthy and the
+        // operator had no way to know the durable verdict record had
+        // stopped. Invariant 3 forbids a durability write that
+        // swallows its error, and this is the log the PB-40 evidence
+        // is written to, so the failure has to be loud where it
+        // happens.
+        warn!(
+            error = %e,
+            path = VERDICT_LOG_PATH,
+            log_write_errors = errors,
+            log_id = v.log_id,
+            "verdict durability write FAILED; this verdict is not on disk. Check that the \
+             path exists and is writable by the verifier's uid"
+        );
     }
 }
 
