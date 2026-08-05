@@ -619,6 +619,8 @@ mod dashboard_tests {
             still_absent: 1,
             blocks_scanned: 1,
             block_walk_truncated: false,
+            tip_height: Some(900_001),
+            block_walk_shortfall: None,
             still_absent_sample: vec!["ab".repeat(32)],
             lookup_error: None,
             lookup_error_kind: None,

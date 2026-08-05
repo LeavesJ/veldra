@@ -21,7 +21,7 @@ use crate::verdicts::{
     current_timestamp, current_timestamp_ms,
 };
 use pool_verifier::policy::Phase2Attribution;
-use pool_verifier::second_chance::{self, SecondChance, SecondChanceOutcome};
+use pool_verifier::second_chance::{self, SecondChance, SecondChanceError, SecondChanceOutcome};
 use rg_protocol::gateway::{InternalMessage, MAX_INTERNAL_LINE_BYTES, msg_types};
 use rg_protocol::{
     PROTOCOL_VERSION, PolicyContext, TemplatePropose, TemplateVerdict, VerdictReason,
@@ -57,11 +57,43 @@ async fn run_second_chance(
     match lookup.ask(template_height).await {
         Ok(answer) => {
             let adjudication = second_chance::adjudicate(total, unknown, &answer);
-            if adjudication.still_exceeds(tolerance_pct) {
-                Some(SecondChanceOutcome::Upheld(adjudication))
-            } else {
-                Some(SecondChanceOutcome::Withdrawn(adjudication))
+            if !adjudication.still_exceeds(tolerance_pct) {
+                // WITHDRAWN is safe under partial coverage. The walk can
+                // only ever ADD transactions to the known set, so a
+                // fuller answer could not have pushed the recomputed
+                // count back over tolerance. Nothing is asserted here
+                // that a complete walk would contradict.
+                return Some(SecondChanceOutcome::Withdrawn(adjudication));
             }
+            // UPHELD is not safe under partial coverage. It asserts
+            // bitcoind held the transactions in neither its mempool nor
+            // any recent block, and the runbook reads it as a genuine
+            // detection candidate. A walk that errored or truncated
+            // never established the second half of that claim, so
+            // absence from it is not evidence and the verdict is
+            // reported unadjudicated instead. It still upholds the
+            // rejection; only the evidence label changes, which is the
+            // whole point.
+            if let Some(shortfall) = answer.block_walk_shortfall.as_ref() {
+                warn!(
+                    height = template_height,
+                    unknown_before,
+                    total,
+                    still_absent = adjudication.still_absent,
+                    blocks_scanned = adjudication.blocks_scanned,
+                    tip_height = adjudication.tip_height,
+                    shortfall = %shortfall,
+                    "PB-40 second chance could not rule out the mined case; the Class M rejection \
+                     stands UNADJUDICATED rather than as a confirmed detection"
+                );
+                return Some(SecondChanceOutcome::LookupFailed {
+                    total,
+                    unknown_before,
+                    reason: SecondChanceError::BlockWalkIncomplete(shortfall.clone()).to_string(),
+                    kind: "block_walk_incomplete".to_string(),
+                });
+            }
+            Some(SecondChanceOutcome::Upheld(adjudication))
         }
         Err(e) => {
             warn!(

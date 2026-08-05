@@ -72,6 +72,101 @@ pub const MAX_RECENT_BLOCKS_SCANNED: u32 = 6;
 /// record.
 pub const ABSENT_SAMPLE_CAP: usize = 32;
 
+/// How much of the block walk actually happened.
+///
+/// Exists because the three shapes used to be indistinguishable in the
+/// durable record: an errored walk and a healthy walk with nothing to
+/// scan both produced `blocks_scanned: 0, block_walk_truncated: false`,
+/// so a verdict could be labelled `upheld` (which the runbook defines
+/// as a genuine detection candidate) on a mined-case check that never
+/// ran. Coverage is now a value the adjudication has to look at, not a
+/// pair of numbers a reader has to infer from.
+#[derive(Debug, Clone)]
+pub enum WalkCoverage {
+    /// Every block at or above the template's height was walked, so
+    /// `mined` is exact and absence from it is real evidence.
+    Complete {
+        txids: HashSet<[u8; 32]>,
+        blocks_scanned: u32,
+        tip_height: Option<u32>,
+    },
+    /// The walk stopped at [`MAX_RECENT_BLOCKS_SCANNED`] with blocks
+    /// still owed, so `mined` is a floor rather than a count.
+    Truncated {
+        txids: HashSet<[u8; 32]>,
+        blocks_scanned: u32,
+        tip_height: Option<u32>,
+    },
+    /// An RPC failed part way. Whatever was collected is real, but
+    /// absence from it proves nothing.
+    Failed {
+        txids: HashSet<[u8; 32]>,
+        blocks_scanned: u32,
+        tip_height: Option<u32>,
+        error: String,
+    },
+}
+
+impl WalkCoverage {
+    /// Whether absence from the collected set is trustworthy evidence.
+    /// Only a complete walk can support "this transaction was not
+    /// mined", which is half of what an `upheld` verdict asserts.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        matches!(self, WalkCoverage::Complete { .. })
+    }
+
+    /// Operator-facing reason the walk fell short, `None` when it did not.
+    #[must_use]
+    pub fn shortfall(&self) -> Option<String> {
+        match self {
+            WalkCoverage::Complete { .. } => None,
+            WalkCoverage::Truncated { blocks_scanned, .. } => Some(format!(
+                "block walk hit the {MAX_RECENT_BLOCKS_SCANNED}-block cap after {blocks_scanned} \
+                 blocks with more still owed; the mined count is a floor"
+            )),
+            WalkCoverage::Failed { error, .. } => Some(format!("block walk failed after {error}")),
+        }
+    }
+
+    #[cfg(test)]
+    fn blocks_scanned_for_test(&self) -> u32 {
+        match self {
+            WalkCoverage::Complete { blocks_scanned, .. }
+            | WalkCoverage::Truncated { blocks_scanned, .. }
+            | WalkCoverage::Failed { blocks_scanned, .. } => *blocks_scanned,
+        }
+    }
+
+    /// Decompose into the fields `BitcoindAnswer` carries. The bool is
+    /// the legacy `block_walk_truncated` flag, kept because the durable
+    /// record and the soak scripts already read it; `shortfall()` is
+    /// the value that actually distinguishes a failed walk from a
+    /// complete one, since Complete and Failed both report `false`
+    /// here.
+    fn parts(self) -> (HashSet<[u8; 32]>, u32, Option<u32>, bool) {
+        let truncated = matches!(self, WalkCoverage::Truncated { .. });
+        match self {
+            WalkCoverage::Complete {
+                txids,
+                blocks_scanned,
+                tip_height,
+            }
+            | WalkCoverage::Truncated {
+                txids,
+                blocks_scanned,
+                tip_height,
+            }
+            | WalkCoverage::Failed {
+                txids,
+                blocks_scanned,
+                tip_height,
+                ..
+            } => (txids, blocks_scanned, tip_height, truncated),
+        }
+    }
+}
+
 /// What bitcoind said about the transactions the served view did not
 /// contain, gathered at rejection time.
 ///
@@ -91,6 +186,17 @@ pub struct BitcoindAnswer {
     /// rather than at the template's height, so a reader can tell a
     /// complete search from a truncated one.
     pub block_walk_truncated: bool,
+    /// Chain tip height at lookup time, `None` when the walk could not
+    /// reach bitcoind at all. Recorded so a reader can compute the gap
+    /// the walk was supposed to cover and check `blocks_scanned`
+    /// against it, which was impossible while the record carried no
+    /// tip.
+    pub tip_height: Option<u32>,
+    /// Why the block walk fell short, `None` when it did not. When this
+    /// is `Some`, absence from `recent_block_txids` is NOT evidence the
+    /// transaction was unmined, and the adjudication must not be
+    /// reported as a completed one.
+    pub block_walk_shortfall: Option<String>,
 }
 
 /// Where one formerly-unknown transaction actually lives.
@@ -124,6 +230,13 @@ pub struct Adjudication {
     pub still_absent_sample: Vec<[u8; 32]>,
     pub blocks_scanned: u32,
     pub block_walk_truncated: bool,
+    /// Chain tip at lookup time, so a reader can check `blocks_scanned`
+    /// against the gap the walk owed.
+    pub tip_height: Option<u32>,
+    /// Why the block walk fell short, `None` when it did not. `Some`
+    /// means `mined` is a floor and `still_absent` may include
+    /// transactions that were in fact mined, so absence is not evidence.
+    pub block_walk_shortfall: Option<String>,
 }
 
 /// Why a second-chance lookup produced no answer.
@@ -140,6 +253,20 @@ pub enum SecondChanceError {
 
     #[error("second-chance lookup exceeded its {SECOND_CHANCE_DEADLINE:?} deadline")]
     Deadline,
+
+    #[error(
+        "getrawmempool succeeded but returned an empty set, which cannot establish that any \
+         transaction is absent"
+    )]
+    EmptyMempool,
+
+    /// The mempool half succeeded and the block walk did not, and the
+    /// mempool half alone did not explain enough transactions to
+    /// withdraw the rejection. Absence from an incomplete walk is not
+    /// evidence a transaction was unmined, so the verdict is reported
+    /// unadjudicated rather than as a confirmed detection.
+    #[error("block walk incomplete, so the mined case could not be ruled out: {0}")]
+    BlockWalkIncomplete(String),
 }
 
 impl SecondChanceError {
@@ -150,6 +277,8 @@ impl SecondChanceError {
         match self {
             SecondChanceError::Rpc(_) => "rpc_error",
             SecondChanceError::Deadline => "deadline",
+            SecondChanceError::EmptyMempool => "empty_mempool",
+            SecondChanceError::BlockWalkIncomplete(_) => "block_walk_incomplete",
         }
     }
 }
@@ -252,6 +381,8 @@ pub fn adjudicate(total: u32, unknown: &[[u8; 32]], answer: &BitcoindAnswer) -> 
         still_absent_sample,
         blocks_scanned: answer.blocks_scanned,
         block_walk_truncated: answer.block_walk_truncated,
+        tip_height: answer.tip_height,
+        block_walk_shortfall: answer.block_walk_shortfall.clone(),
     }
 }
 
@@ -304,6 +435,17 @@ pub struct MempoolAdjudicationRecord {
     /// `true` when the block walk hit [`MAX_RECENT_BLOCKS_SCANNED`],
     /// so `mined` may undercount.
     pub block_walk_truncated: bool,
+    /// Chain tip height at lookup time. Present so a reader can compute
+    /// the gap the walk owed (`tip_height - template height + 1`) and
+    /// check it against `blocks_scanned`, which was impossible while the
+    /// record carried no tip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_height: Option<u32>,
+    /// Why the block walk fell short. When present, `mined` is a FLOOR
+    /// and `still_absent` may include mined transactions, so this record
+    /// cannot support a detection claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_walk_shortfall: Option<String>,
     /// Still-absent txids in DISPLAY order, capped at
     /// [`ABSENT_SAMPLE_CAP`].
     pub still_absent_sample: Vec<String>,
@@ -328,6 +470,8 @@ impl From<&SecondChanceOutcome> for MempoolAdjudicationRecord {
                 still_absent: adj.still_absent,
                 blocks_scanned: adj.blocks_scanned,
                 block_walk_truncated: adj.block_walk_truncated,
+                tip_height: adj.tip_height,
+                block_walk_shortfall: adj.block_walk_shortfall.clone(),
                 still_absent_sample: adj
                     .still_absent_sample
                     .iter()
@@ -359,6 +503,8 @@ impl From<&SecondChanceOutcome> for MempoolAdjudicationRecord {
                 still_absent: 0,
                 blocks_scanned: 0,
                 block_walk_truncated: false,
+                tip_height: None,
+                block_walk_shortfall: None,
                 still_absent_sample: Vec::new(),
                 lookup_error: Some(reason.clone()),
                 lookup_error_kind: Some(kind.clone()),
@@ -405,21 +551,45 @@ impl SecondChance {
         tokio::time::timeout(SECOND_CHANCE_DEADLINE, self.gather(template_height))
             .await
             .map_err(|_| SecondChanceError::Deadline)?
-            .map_err(SecondChanceError::Rpc)
     }
 
-    async fn gather(&self, template_height: u32) -> Result<BitcoindAnswer, RpcError> {
+    async fn gather(&self, template_height: u32) -> Result<BitcoindAnswer, SecondChanceError> {
         let fresh_mempool: HashSet<[u8; 32]> =
             self.client.get_raw_mempool().await?.into_iter().collect();
 
-        let (recent_block_txids, blocks_scanned, block_walk_truncated) =
-            self.recent_blocks(template_height).await;
+        // The same floor the view install path applies
+        // (`mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE`), for the same
+        // reason and on the same evidence grounds. A successful but
+        // empty `getrawmempool` carries exactly the information content
+        // of an RPC error: it cannot tell us that any transaction is
+        // absent. Scoring every unknown "absent" against it would
+        // uphold the rejection and record it as an adjudicated
+        // detection candidate. Refusing it here means the caller emits
+        // `lookup_failed` instead, which upholds the rejection just the
+        // same but says truthfully that nobody adjudicated it.
+        if fresh_mempool.len() < crate::mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE {
+            warn!(
+                size = fresh_mempool.len(),
+                min = crate::mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE,
+                "second chance: getrawmempool succeeded but returned an empty set; refusing to \
+                 adjudicate against it. Every unknown transaction would score absent and the \
+                 rejection would be recorded as a confirmed detection"
+            );
+            return Err(SecondChanceError::EmptyMempool);
+        }
+
+        let coverage = self.recent_blocks(template_height).await;
+        let block_walk_shortfall = coverage.shortfall();
+        let (recent_block_txids, blocks_scanned, tip_height, block_walk_truncated) =
+            coverage.parts();
 
         Ok(BitcoindAnswer {
             fresh_mempool,
             recent_block_txids,
             blocks_scanned,
             block_walk_truncated,
+            tip_height,
+            block_walk_shortfall,
         })
     }
 
@@ -435,40 +605,85 @@ impl SecondChance {
     /// half of the answer is the load-bearing one and is already in
     /// hand. The shortfall surfaces as `blocks_scanned` lower than the
     /// height gap on the recorded verdict.
-    async fn recent_blocks(&self, template_height: u32) -> (HashSet<[u8; 32]>, u32, bool) {
+    async fn recent_blocks(&self, template_height: u32) -> WalkCoverage {
         let mut collected = HashSet::new();
         let mut scanned = 0u32;
 
         let mut hash = match self.client.get_best_block_hash().await {
             Ok(h) => h,
             Err(e) => {
-                warn!(error = %e, "second chance: getbestblockhash failed; mined-case coverage lost for this verdict");
-                return (collected, 0, false);
+                warn!(error = %e, "second chance: getbestblockhash failed; the mined case cannot be ruled out for this verdict");
+                return WalkCoverage::Failed {
+                    txids: collected,
+                    blocks_scanned: 0,
+                    tip_height: None,
+                    error: e.to_string(),
+                };
             }
         };
 
+        let mut tip_height = None;
         loop {
-            if scanned >= MAX_RECENT_BLOCKS_SCANNED {
-                return (collected, scanned, true);
-            }
             let block = match self.client.get_block_txids(&hash).await {
                 Ok(b) => b,
                 Err(e) => {
-                    warn!(error = %e, block_hash = %hash, "second chance: getblock failed; mined-case coverage partial for this verdict");
-                    return (collected, scanned, false);
+                    warn!(error = %e, block_hash = %hash, "second chance: getblock failed; the mined case cannot be ruled out for this verdict");
+                    return WalkCoverage::Failed {
+                        txids: collected,
+                        blocks_scanned: scanned,
+                        tip_height,
+                        error: e.to_string(),
+                    };
                 }
             };
+            if tip_height.is_none() {
+                tip_height = Some(block.height);
+            }
             if block.height < template_height {
                 // The tip has not advanced past the template's parent,
-                // so nothing has been mined since it was built.
-                return (collected, scanned, false);
+                // so nothing has been mined since the template was
+                // built. This is the steady state and it is COMPLETE
+                // coverage, not a shortfall.
+                return WalkCoverage::Complete {
+                    txids: collected,
+                    blocks_scanned: scanned,
+                    tip_height,
+                };
             }
             collected.extend(block.txids);
             scanned = scanned.saturating_add(1);
-            match block.previous_block_hash {
-                Some(prev) => hash = prev,
-                None => return (collected, scanned, false),
+
+            // Heights decrease by exactly one per step, so once this
+            // block IS the template's height there is provably nothing
+            // below it left to want. Deciding that here, before the cap,
+            // is what stops the cap reporting a truncation that lost
+            // nothing: the old order tripped `truncated` at a tip gap of
+            // 5, where the sixth block was the last one needed and the
+            // walk was in fact complete.
+            if block.height == template_height {
+                return WalkCoverage::Complete {
+                    txids: collected,
+                    blocks_scanned: scanned,
+                    tip_height,
+                };
             }
+            let Some(prev) = block.previous_block_hash else {
+                // Genesis. Nothing below it exists, so the walk covered
+                // everything there was.
+                return WalkCoverage::Complete {
+                    txids: collected,
+                    blocks_scanned: scanned,
+                    tip_height,
+                };
+            };
+            if scanned >= MAX_RECENT_BLOCKS_SCANNED {
+                return WalkCoverage::Truncated {
+                    txids: collected,
+                    blocks_scanned: scanned,
+                    tip_height,
+                };
+            }
+            hash = prev;
         }
     }
 }
@@ -488,6 +703,8 @@ mod tests {
             recent_block_txids: blocks.iter().copied().map(txid).collect(),
             blocks_scanned: u32::from(!blocks.is_empty()),
             block_walk_truncated: false,
+            tip_height: None,
+            block_walk_shortfall: None,
         }
     }
 
@@ -593,6 +810,48 @@ mod tests {
 
     fn adj_contains(mempool: &[u8], t: &[u8; 32]) -> bool {
         mempool.iter().copied().map(txid).any(|m| m == *t)
+    }
+
+    /// Only a complete walk can support "this was not mined". The
+    /// three shapes used to be indistinguishable in the record, so a
+    /// verdict could claim a completed adjudication on a check that
+    /// errored.
+    #[test]
+    fn only_a_complete_walk_is_evidence_of_absence() {
+        let complete = WalkCoverage::Complete {
+            txids: HashSet::new(),
+            blocks_scanned: 0,
+            tip_height: Some(101),
+        };
+        let truncated = WalkCoverage::Truncated {
+            txids: HashSet::new(),
+            blocks_scanned: MAX_RECENT_BLOCKS_SCANNED,
+            tip_height: Some(200),
+        };
+        let failed = WalkCoverage::Failed {
+            txids: HashSet::new(),
+            blocks_scanned: 0,
+            tip_height: None,
+            error: "getbestblockhash: work queue depth exceeded".to_string(),
+        };
+
+        assert!(complete.is_complete());
+        assert!(!truncated.is_complete());
+        assert!(!failed.is_complete());
+
+        // The shortfall is what the durable record carries, and it is
+        // what makes a failed walk distinguishable from a healthy one
+        // that had nothing to scan. Both report blocks_scanned == 0.
+        assert_eq!(complete.shortfall(), None);
+        assert!(truncated.shortfall().is_some());
+        assert!(failed.shortfall().is_some());
+        assert_eq!(complete.blocks_scanned_for_test(), 0);
+        assert_eq!(failed.blocks_scanned_for_test(), 0);
+        assert_ne!(
+            complete.shortfall(),
+            failed.shortfall(),
+            "a healthy zero-block walk and a failed one must not look the same"
+        );
     }
 
     /// A transaction cannot be in the mempool and mined at once; if

@@ -205,15 +205,34 @@ echo "The mempool tail churns within minutes, so a later query reports transacti
 echo "absent whether or not they were ever real, and the review then scores every"
 echo "rejection a true positive. That is the wrong answer, confidently."
 echo
-echo "  sc=upheld        => bitcoind knew none of them: genuine detection candidate."
-echo "                      corroborate against the pool block-found feed at this height."
-echo "  sc=lookup_failed => bitcoind could not be asked: UNADJUDICATED, count separately."
+echo "  sc=upheld        => bitcoind knew none of them AND the block walk completed:"
+echo "                      genuine detection candidate. Corroborate against the pool"
+echo "                      block-found feed at this height."
+echo "  sc=lookup_failed => the lookup could not be completed: UNADJUDICATED, count"
+echo "                      separately, never as a detection. sc_error says which:"
+echo "                      rpc_error / deadline / empty_mempool / block_walk_incomplete."
 echo "  sc missing       => verdict predates PB-40; it cannot be adjudicated at all."
+echo "  sc_walk_shortfall non-null => the mined case was not fully ruled out; sc_mined"
+echo "                      is a FLOOR, not a count. Check sc_blocks_scanned against"
+echo "                      (sc_tip_height - height + 1), the number of blocks owed."
 echo
 
 if [[ ! -f "$VERDICT_LOG" ]]; then
-  echo "  (verdict log not found at $VERDICT_LOG; check the runbook's verdict log path)"
-  exit 0
+  # Non-zero on purpose. Rejections are climbing and the durable record
+  # that is supposed to adjudicate them does not exist, so this run
+  # produced NO evidence. Exiting 0 here would let a soak with zero
+  # adjudicable records read as a clean spot check, which is the exact
+  # false-pass shape PB-40 exists to prevent. The usual cause is
+  # VELDRA_MODE=shadow, which does not persist verdicts at all
+  # (DeployMode::persist_verdicts is Observe|Inline), or a verdict log
+  # the verifier's uid cannot write.
+  echo
+  echo "ERROR: $DELTA_REJECTED Class M rejection(s) in this window and NO verdict log at"
+  echo "  $VERDICT_LOG. This spot check produced no adjudicable evidence."
+  echo "  Check VELDRA_MODE (shadow does NOT persist verdicts; use observe) and that the"
+  echo "  log path is writable by the verifier's uid. The verifier logs"
+  echo "  'verdict durability write FAILED' on every failed append."
+  exit 1
 fi
 
 jq -c \
@@ -228,6 +247,9 @@ jq -c \
        sc_in_mempool:     (.mempool_adjudication.in_mempool // null),
        sc_mined:          (.mempool_adjudication.mined // null),
        sc_still_absent:   (.mempool_adjudication.still_absent // null),
+       sc_blocks_scanned: (.mempool_adjudication.blocks_scanned // null),
+       sc_tip_height:     (.mempool_adjudication.tip_height // null),
+       sc_walk_shortfall: (.mempool_adjudication.block_walk_shortfall // null),
        sc_error:          (.mempool_adjudication.lookup_error // null),
        detail:    .reason_detail
      }' \

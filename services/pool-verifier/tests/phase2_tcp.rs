@@ -587,6 +587,23 @@ async fn phase2_tcp_fabrication_path_emits_tolerance_exceeded() {
     // non-coinbase tx: 1/1 unknown, above the 4% tolerance.
     let booted = boot_verifier_with_mock(decoy_display_hex_txids(8)).await;
 
+    // Seed a healthy tip so the block walk COMPLETES. Without this the
+    // block RPCs error, coverage is Failed, and the verdict is
+    // correctly reported `lookup_failed` rather than `upheld`. This
+    // test asserts `upheld`, which is a claim that bitcoind held the
+    // transactions in neither its mempool nor any recent block, so it
+    // has to be a lookup that actually looked. The tip sits at 101
+    // against a template building 102, so the walk terminates having
+    // established there is nothing mined since the template was built.
+    {
+        let mut g = booted.mock.tip_block.write().expect("mock write lock");
+        *g = Some(MockBlock {
+            hash: "a".repeat(64),
+            height: 101,
+            display_hex_txids: vec![],
+        });
+    }
+
     let verdict = round_trip_template(booted.verifier_port, template).await;
 
     // PB-40: the second chance must not become a blanket amnesty.
@@ -967,6 +984,102 @@ async fn phase2_tcp_second_chance_failure_upholds_the_rejection_unadjudicated() 
          claim and this is not one\n--- metrics ---\n{metrics}"
     );
     assert_eq!(withdrawn, 0, "--- metrics ---\n{metrics}");
+}
+
+/// A block walk that could not run must NOT be labelled `upheld`.
+///
+/// `upheld` asserts bitcoind held the transactions in neither its
+/// mempool nor any block at or above the template's height, and the
+/// soak runbook reads it as a genuine detection candidate. Before this
+/// was fixed, an errored `getbestblockhash` produced
+/// `blocks_scanned: 0, block_walk_truncated: false` — byte-identical to
+/// a healthy walk with nothing to scan — and the verdict claimed a
+/// completed adjudication the lookup never performed. The rejection
+/// still stands either way; what must not stand is the evidence label.
+#[tokio::test]
+#[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
+async fn phase2_tcp_failed_block_walk_is_unadjudicated_not_upheld() {
+    let (template, _display_hex) = regtest_segwit_template_and_display_hex();
+    // tip_block left unseeded, so getbestblockhash errors: the walk
+    // cannot rule out the mined case.
+    let booted = boot_with_frozen_view(decoy_display_hex_txids(8)).await;
+
+    let verdict = round_trip_template(booted.verifier_port, template).await;
+
+    let metrics = fetch_metrics_text(booted.http_port).await;
+    let upheld = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"upheld\"}",
+    );
+    let failed = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"lookup_failed\"}",
+    );
+    drop(booted);
+
+    assert!(
+        !verdict.accepted,
+        "an unadjudicated rejection must still be a rejection"
+    );
+    assert_eq!(
+        upheld, 0,
+        "a walk that never ran cannot support a detection claim\n--- metrics ---\n{metrics}"
+    );
+    assert_eq!(
+        failed, 1,
+        "expected the rejection to be recorded unadjudicated\n--- metrics ---\n{metrics}"
+    );
+}
+
+/// An empty-but-successful `getrawmempool` at second-chance time is not
+/// an answer.
+///
+/// It carries exactly the information content of an RPC error: it
+/// cannot establish that any transaction is absent. Scoring every
+/// unknown "absent" against it would uphold the rejection AND record it
+/// as an adjudicated detection. The view install path already refuses
+/// an empty set for the same reason
+/// (`mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE`); the lookup now
+/// refuses it too.
+#[tokio::test]
+#[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
+async fn phase2_tcp_empty_fresh_mempool_is_unadjudicated_not_upheld() {
+    let (template, _display_hex) = regtest_segwit_template_and_display_hex();
+    let booted = boot_with_frozen_view(decoy_display_hex_txids(8)).await;
+
+    // The view is already primed and frozen. bitcoind now answers
+    // 200 OK [] to the second chance.
+    {
+        let mut g = booted
+            .mock
+            .display_hex_txids
+            .write()
+            .expect("mock write lock");
+        g.clear();
+    }
+
+    let verdict = round_trip_template(booted.verifier_port, template).await;
+
+    let metrics = fetch_metrics_text(booted.http_port).await;
+    let upheld = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"upheld\"}",
+    );
+    let failed = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"lookup_failed\"}",
+    );
+    drop(booted);
+
+    assert!(!verdict.accepted, "the rejection still stands");
+    assert_eq!(
+        upheld, 0,
+        "an empty mempool cannot establish that anything is absent\n--- metrics ---\n{metrics}"
+    );
+    assert_eq!(
+        failed, 1,
+        "expected lookup_failed for the empty answer\n--- metrics ---\n{metrics}"
+    );
 }
 
 // Compile-time assertions that the test crate sees the symbols it
