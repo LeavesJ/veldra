@@ -174,8 +174,18 @@ impl WalkCoverage {
 /// fill it, so the adjudication arithmetic is testable without a node.
 #[derive(Debug, Clone, Default)]
 pub struct BitcoindAnswer {
-    /// `getrawmempool` taken now, not the polled view.
-    pub fresh_mempool: HashSet<[u8; 32]>,
+    /// Unknown transactions bitcoind CONFIRMED it holds right now.
+    ///
+    /// Named for what it is. It was `fresh_mempool` when it held a
+    /// whole-mempool snapshot; it is now the probed subset that came
+    /// back present, and calling it "the mempool" would invite a reader
+    /// to treat absence from it as absence from the mempool. Absence
+    /// from this set means only "not confirmed present".
+    pub present_in_mempool: HashSet<[u8; 32]>,
+    /// Unknown transactions whose probe returned no usable answer.
+    /// Proves nothing in either direction; kept separate from the
+    /// proven-absent count so the two can never be conflated.
+    pub unadjudicated: HashSet<[u8; 32]>,
     /// Txids of every block mined at or above the template's own
     /// height, i.e. mined since the template was built.
     pub recent_block_txids: HashSet<[u8; 32]>,
@@ -208,6 +218,10 @@ pub enum TxAdjudication {
     /// Absent from the mempool because it was mined into a block at or
     /// above the template's height, i.e. after the template was built.
     Mined,
+    /// bitcoind was asked and did not give a usable answer. Distinct
+    /// from `Absent`, which is a positive statement that it does not
+    /// hold the transaction.
+    Unadjudicated,
     /// bitcoind knows it in neither place.
     Absent,
 }
@@ -223,8 +237,15 @@ pub struct Adjudication {
     pub in_mempool: u32,
     /// Of those, mined since the template was built.
     pub mined: u32,
-    /// Of those, bitcoind knows nothing about.
+    /// Of those, bitcoind answered that it holds them in neither place.
+    /// PROVEN absent. Narrowed from "not found" by the targeted-probe
+    /// change: the unproven cases now live in `unadjudicated`, because
+    /// the old breadth is what let an unestablished count read as
+    /// evidence for a detection.
     pub still_absent: u32,
+    /// Of those, nobody established anything about. Disjoint from
+    /// `still_absent`.
+    pub unadjudicated: u32,
     /// Identities of the still-absent, bounded by
     /// [`ABSENT_SAMPLE_CAP`]. Internal byte order.
     pub still_absent_sample: Vec<[u8; 32]>,
@@ -340,11 +361,22 @@ pub fn exceeds_tolerance(unknown_count: u32, total: u32, tolerance_pct: f64) -> 
 }
 
 impl Adjudication {
+    /// Unknown transactions not proven known to bitcoind: proven absent
+    /// plus unestablished. This is what the tolerance decision uses.
+    ///
+    /// Counting the unestablished ones here is the pessimistic reading
+    /// and it is the safe one: it can only hold a rejection, never
+    /// manufacture a recovery.
+    #[must_use]
+    pub fn not_proven_known(&self) -> u32 {
+        self.still_absent.saturating_add(self.unadjudicated)
+    }
+
     /// Whether the rejection still stands once the transactions
-    /// bitcoind knows have been removed from the unknown count.
+    /// bitcoind proved it knows have been removed from the count.
     #[must_use]
     pub fn still_exceeds(&self, tolerance_pct: f64) -> bool {
-        exceeds_tolerance(self.still_absent, self.total, tolerance_pct)
+        exceeds_tolerance(self.not_proven_known(), self.total, tolerance_pct)
     }
 }
 
@@ -356,6 +388,7 @@ impl Adjudication {
 pub fn adjudicate(total: u32, unknown: &[[u8; 32]], answer: &BitcoindAnswer) -> Adjudication {
     let mut in_mempool = 0u32;
     let mut mined = 0u32;
+    let mut unadjudicated = 0u32;
     let mut still_absent = 0u32;
     let mut still_absent_sample = Vec::new();
 
@@ -363,6 +396,7 @@ pub fn adjudicate(total: u32, unknown: &[[u8; 32]], answer: &BitcoindAnswer) -> 
         match classify(txid, answer) {
             TxAdjudication::InMempool => in_mempool = in_mempool.saturating_add(1),
             TxAdjudication::Mined => mined = mined.saturating_add(1),
+            TxAdjudication::Unadjudicated => unadjudicated = unadjudicated.saturating_add(1),
             TxAdjudication::Absent => {
                 still_absent = still_absent.saturating_add(1);
                 if still_absent_sample.len() < ABSENT_SAMPLE_CAP {
@@ -378,6 +412,7 @@ pub fn adjudicate(total: u32, unknown: &[[u8; 32]], answer: &BitcoindAnswer) -> 
         in_mempool,
         mined,
         still_absent,
+        unadjudicated,
         still_absent_sample,
         blocks_scanned: answer.blocks_scanned,
         block_walk_truncated: answer.block_walk_truncated,
@@ -390,10 +425,12 @@ pub fn adjudicate(total: u32, unknown: &[[u8; 32]], answer: &BitcoindAnswer) -> 
 /// right now is the common case this whole mechanism exists for, and a
 /// transaction cannot be in the mempool and mined at the same time.
 fn classify(txid: &[u8; 32], answer: &BitcoindAnswer) -> TxAdjudication {
-    if answer.fresh_mempool.contains(txid) {
+    if answer.present_in_mempool.contains(txid) {
         TxAdjudication::InMempool
     } else if answer.recent_block_txids.contains(txid) {
         TxAdjudication::Mined
+    } else if answer.unadjudicated.contains(txid) {
+        TxAdjudication::Unadjudicated
     } else {
         TxAdjudication::Absent
     }
@@ -431,6 +468,11 @@ pub struct MempoolAdjudicationRecord {
     /// Unknown to bitcoind in both places. This is the only count that
     /// can support a true-positive claim.
     pub still_absent: u32,
+    /// Unknowns nobody established anything about. Disjoint from
+    /// `still_absent`. Non-zero means this record cannot support a
+    /// detection claim regardless of what `still_absent` says.
+    #[serde(default)]
+    pub unadjudicated: u32,
     pub blocks_scanned: u32,
     /// `true` when the block walk hit [`MAX_RECENT_BLOCKS_SCANNED`],
     /// so `mined` may undercount.
@@ -468,6 +510,7 @@ impl From<&SecondChanceOutcome> for MempoolAdjudicationRecord {
                 in_mempool: adj.in_mempool,
                 mined: adj.mined,
                 still_absent: adj.still_absent,
+                unadjudicated: adj.unadjudicated,
                 blocks_scanned: adj.blocks_scanned,
                 block_walk_truncated: adj.block_walk_truncated,
                 tip_height: adj.tip_height,
@@ -501,6 +544,7 @@ impl From<&SecondChanceOutcome> for MempoolAdjudicationRecord {
                 in_mempool: 0,
                 mined: 0,
                 still_absent: 0,
+                unadjudicated: 0,
                 blocks_scanned: 0,
                 block_walk_truncated: false,
                 tip_height: None,
@@ -554,7 +598,7 @@ impl SecondChance {
     }
 
     async fn gather(&self, template_height: u32) -> Result<BitcoindAnswer, SecondChanceError> {
-        let fresh_mempool: HashSet<[u8; 32]> =
+        let present_in_mempool: HashSet<[u8; 32]> =
             self.client.get_raw_mempool().await?.into_iter().collect();
 
         // The same floor the view install path applies
@@ -567,9 +611,9 @@ impl SecondChance {
         // detection candidate. Refusing it here means the caller emits
         // `lookup_failed` instead, which upholds the rejection just the
         // same but says truthfully that nobody adjudicated it.
-        if fresh_mempool.len() < crate::mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE {
+        if present_in_mempool.len() < crate::mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE {
             warn!(
-                size = fresh_mempool.len(),
+                size = present_in_mempool.len(),
                 min = crate::mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE,
                 "second chance: getrawmempool succeeded but returned an empty set; refusing to \
                  adjudicate against it. Every unknown transaction would score absent and the \
@@ -584,7 +628,10 @@ impl SecondChance {
             coverage.parts();
 
         Ok(BitcoindAnswer {
-            fresh_mempool,
+            present_in_mempool,
+            // Task 4 replaces the whole-mempool fetch with targeted
+            // probes, which is what can actually produce this.
+            unadjudicated: HashSet::new(),
             recent_block_txids,
             blocks_scanned,
             block_walk_truncated,
@@ -699,7 +746,8 @@ mod tests {
 
     fn answer(mempool: &[u8], blocks: &[u8]) -> BitcoindAnswer {
         BitcoindAnswer {
-            fresh_mempool: mempool.iter().copied().map(txid).collect(),
+            present_in_mempool: mempool.iter().copied().map(txid).collect(),
+            unadjudicated: HashSet::new(),
             recent_block_txids: blocks.iter().copied().map(txid).collect(),
             blocks_scanned: u32::from(!blocks.is_empty()),
             block_walk_truncated: false,
@@ -869,5 +917,74 @@ mod tests {
             adj.in_mempool + adj.mined + adj.still_absent,
             adj.unknown_before
         );
+    }
+
+    /// The four counts are DISJOINT and must sum to the input. Without
+    /// this, a reviewer or a dashboard can double-count `unadjudicated`
+    /// inside `still_absent` and read an unestablished count as
+    /// evidence.
+    #[test]
+    fn the_four_counts_are_disjoint_and_sum_to_the_unknown_set() {
+        let unknown: Vec<[u8; 32]> = (1u8..=20).map(txid).collect();
+        let mut a = answer(&[1, 2, 3], &[4, 5]);
+        a.unadjudicated = [6u8, 7].iter().copied().map(txid).collect();
+        let adj = adjudicate(100, &unknown, &a);
+
+        assert_eq!(adj.in_mempool, 3);
+        assert_eq!(adj.mined, 2);
+        assert_eq!(adj.unadjudicated, 2);
+        assert_eq!(adj.still_absent, 13, "proven absent only");
+        assert_eq!(
+            adj.in_mempool + adj.mined + adj.unadjudicated + adj.still_absent,
+            adj.unknown_before
+        );
+    }
+
+    /// `not_proven_known` is what the decision uses: proven absent plus
+    /// the ones nobody established. `still_absent` alone would treat an
+    /// unestablished transaction as known, which is the optimistic
+    /// direction and the wrong one.
+    #[test]
+    fn unadjudicated_counts_against_recovery_not_for_it() {
+        let unknown: Vec<[u8; 32]> = (1u8..=10).map(txid).collect();
+        // 7 proven present, 3 unadjudicated, 0 proven absent.
+        let mut a = answer(&[1, 2, 3, 4, 5, 6, 7], &[]);
+        a.unadjudicated = [8u8, 9, 10].iter().copied().map(txid).collect();
+        let adj = adjudicate(100, &unknown, &a);
+
+        assert_eq!(adj.still_absent, 0);
+        assert_eq!(adj.unadjudicated, 3);
+        assert_eq!(adj.not_proven_known(), 3);
+        assert!(
+            !adj.still_exceeds(4.0),
+            "3 of 100 is under the 4% tolerance even counting the unproven pessimistically"
+        );
+
+        // Now push the unproven count over the line: 5 of 100 is 5%.
+        let unknown: Vec<[u8; 32]> = (1u8..=10).map(txid).collect();
+        let mut a = answer(&[1, 2, 3, 4, 5], &[]);
+        a.unadjudicated = [6u8, 7, 8, 9, 10].iter().copied().map(txid).collect();
+        let adj = adjudicate(100, &unknown, &a);
+        assert_eq!(adj.still_absent, 0, "none were PROVEN absent");
+        assert!(
+            adj.still_exceeds(4.0),
+            "five unestablished transactions must not be read as recovered"
+        );
+    }
+
+    /// Precedence: present beats mined beats unadjudicated beats absent,
+    /// and a txid in several sets is counted exactly once.
+    #[test]
+    fn classification_precedence_counts_each_txid_once() {
+        let unknown = [txid(1)];
+        let mut a = answer(&[1], &[1]);
+        a.unadjudicated = [txid(1)].into_iter().collect();
+        let adj = adjudicate(10, &unknown, &a);
+
+        assert_eq!(adj.in_mempool, 1);
+        assert_eq!(adj.mined, 0);
+        assert_eq!(adj.unadjudicated, 0);
+        assert_eq!(adj.still_absent, 0);
+        assert_eq!(adj.unknown_before, 1);
     }
 }

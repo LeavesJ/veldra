@@ -617,6 +617,7 @@ mod dashboard_tests {
             in_mempool: 28,
             mined: 1,
             still_absent: 1,
+            unadjudicated: 0,
             blocks_scanned: 1,
             block_walk_truncated: false,
             tip_height: Some(900_001),
