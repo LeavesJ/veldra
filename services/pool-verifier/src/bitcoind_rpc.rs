@@ -89,6 +89,51 @@ impl BitcoindClient {
         resp.result.ok_or(RpcError::MissingResult)
     }
 
+    /// Issue one JSON-RPC batch and return per-item outcomes,
+    /// index-aligned to `params_per_item`.
+    ///
+    /// The returned Vec is always the same length as the input. An item
+    /// whose reply could not be attributed comes back as
+    /// [`BatchItem::NoResponse`] rather than shifting its neighbours.
+    ///
+    /// # Errors
+    ///
+    /// Transport-level failure only: a non-2xx status, a body that is
+    /// not a JSON array, or a network error. Per-item failures are
+    /// carried in the returned Vec, not in this Result.
+    pub async fn call_batch<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params_per_item: &[P],
+    ) -> Result<Vec<BatchItem<R>>, RpcError> {
+        if params_per_item.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reqs: Vec<BatchRequest<'_, &P>> = params_per_item
+            .iter()
+            .enumerate()
+            .map(|(i, p)| BatchRequest {
+                jsonrpc: "1.0",
+                id: u32::try_from(i).unwrap_or(u32::MAX),
+                method,
+                params: p,
+            })
+            .collect();
+
+        let responses: Vec<BatchResponse<R>> = self
+            .http
+            .post(&self.url)
+            .basic_auth(&self.user, Some(&self.pass))
+            .json(&reqs)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(resolve_batch(responses, params_per_item.len()))
+    }
+
     /// Fetch the current mempool as a list of transaction ids in
     /// internal byte order.
     ///
@@ -198,6 +243,91 @@ struct JsonRpcError {
     message: String,
 }
 
+/// One request in a JSON-RPC batch. Distinct from [`JsonRpcRequest`]
+/// because a batch needs a per-item numeric `id` to correlate replies,
+/// where the single-call path uses one fixed string id it never reads
+/// back.
+#[derive(Serialize)]
+struct BatchRequest<'a, T> {
+    jsonrpc: &'a str,
+    id: u32,
+    method: &'a str,
+    params: T,
+}
+
+/// One reply in a JSON-RPC batch. `id` is `Option` because a malformed
+/// or error-shaped reply may omit it, and an unattributable reply must
+/// not be silently assigned to whichever request happens to sit at the
+/// same index.
+#[derive(Deserialize)]
+struct BatchResponse<T> {
+    #[serde(default)]
+    id: Option<u32>,
+    result: Option<T>,
+    error: Option<JsonRpcError>,
+}
+
+/// One resolved batch item, index-aligned to the request that produced it.
+#[derive(Debug)]
+pub enum BatchItem<R> {
+    Ok(R),
+    Failed {
+        code: i64,
+        message: String,
+    },
+    /// No reply could be attributed to this request: the id was absent,
+    /// duplicated, or out of range. NOT an answer, and callers must not
+    /// treat it as a negative one.
+    NoResponse,
+}
+
+/// Correlate batch replies to requests by `id`, never by position.
+///
+/// Separated from the HTTP call so every branch is reachable in a unit
+/// test without a server. Returns exactly `request_count` items.
+fn resolve_batch<R>(responses: Vec<BatchResponse<R>>, request_count: usize) -> Vec<BatchItem<R>> {
+    let mut slots: Vec<Option<BatchItem<R>>> = (0..request_count).map(|_| None).collect();
+    let mut duplicated = vec![false; request_count];
+
+    for resp in responses {
+        let Some(id) = resp.id else { continue };
+        let Ok(idx) = usize::try_from(id) else {
+            continue;
+        };
+        if idx >= request_count {
+            continue;
+        }
+        if slots[idx].is_some() {
+            // Two replies claim one request and there is no way to tell
+            // which is real, so neither is used.
+            duplicated[idx] = true;
+            continue;
+        }
+        // Error first, matching the single-call path: a 200 OK carrying
+        // an error object is a failure.
+        slots[idx] = Some(match (resp.error, resp.result) {
+            (Some(e), _) => BatchItem::Failed {
+                code: e.code,
+                message: e.message,
+            },
+            (None, Some(r)) => BatchItem::Ok(r),
+            (None, None) => BatchItem::NoResponse,
+        });
+    }
+
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            if duplicated[i] {
+                BatchItem::NoResponse
+            } else {
+                slot.unwrap_or(BatchItem::NoResponse)
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -242,5 +372,72 @@ mod tests {
         s.push('b');
         assert_eq!(s.len(), 64, "test string must be 64 bytes");
         assert!(parse_txid_hex(&s).is_err());
+    }
+
+    /// Responses are resolved by `id`, never by position. JSON-RPC
+    /// permits a server to reorder a batch reply, and a position-zip
+    /// would misattribute every verdict in the chunk while staying
+    /// invisible to any mock that replies in order.
+    #[test]
+    fn batch_resolves_by_id_under_reordering() {
+        let raw = r#"[
+            {"id":2,"result":"c","error":null},
+            {"id":0,"result":"a","error":null},
+            {"id":1,"result":"b","error":null}
+        ]"#;
+        let parsed: Vec<BatchResponse<String>> = serde_json::from_str(raw).unwrap();
+        let out = resolve_batch::<String>(parsed, 3);
+        assert!(matches!(&out[0], BatchItem::Ok(s) if s == "a"));
+        assert!(matches!(&out[1], BatchItem::Ok(s) if s == "b"));
+        assert!(matches!(&out[2], BatchItem::Ok(s) if s == "c"));
+    }
+
+    #[test]
+    fn batch_marks_a_missing_id_as_no_response() {
+        let raw = r#"[{"id":0,"result":"a","error":null}]"#;
+        let parsed: Vec<BatchResponse<String>> = serde_json::from_str(raw).unwrap();
+        let out = resolve_batch::<String>(parsed, 2);
+        assert_eq!(out.len(), 2, "the result must stay aligned to the request");
+        assert!(matches!(out[1], BatchItem::NoResponse));
+    }
+
+    /// A duplicated id is ambiguous: two answers claim one request and
+    /// there is no way to tell which is real. Ambiguous must not become
+    /// a confident answer.
+    #[test]
+    fn batch_marks_a_duplicated_id_as_no_response() {
+        let raw = r#"[
+            {"id":0,"result":"a","error":null},
+            {"id":0,"result":"b","error":null}
+        ]"#;
+        let parsed: Vec<BatchResponse<String>> = serde_json::from_str(raw).unwrap();
+        let out = resolve_batch::<String>(parsed, 1);
+        assert!(matches!(out[0], BatchItem::NoResponse));
+    }
+
+    /// Error precedence matches the single-call path: a 200 OK carrying
+    /// an error object is a failure, and reading `result` first would
+    /// miss it.
+    #[test]
+    fn batch_prefers_the_error_object_over_a_result() {
+        let raw = r#"[{"id":0,"result":null,"error":{"code":-5,"message":"nope"}}]"#;
+        let parsed: Vec<BatchResponse<String>> = serde_json::from_str(raw).unwrap();
+        let out = resolve_batch::<String>(parsed, 1);
+        match &out[0] {
+            BatchItem::Failed { code, message } => {
+                assert_eq!(*code, -5);
+                assert_eq!(message, "nope");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// An id outside the request range cannot be attributed to anything.
+    #[test]
+    fn batch_ignores_an_out_of_range_id() {
+        let raw = r#"[{"id":99,"result":"x","error":null}]"#;
+        let parsed: Vec<BatchResponse<String>> = serde_json::from_str(raw).unwrap();
+        let out = resolve_batch::<String>(parsed, 1);
+        assert!(matches!(out[0], BatchItem::NoResponse));
     }
 }
