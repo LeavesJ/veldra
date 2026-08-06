@@ -134,6 +134,43 @@ impl BitcoindClient {
         Ok(resolve_batch(responses, params_per_item.len()))
     }
 
+    /// Mempool size, for the degenerate-node guard.
+    ///
+    /// # Errors
+    ///
+    /// Any transport or RPC failure.
+    pub async fn get_mempool_info(&self) -> Result<MempoolInfo, RpcError> {
+        self.call("getmempoolinfo", [(); 0]).await
+    }
+
+    /// Ask bitcoind about specific transactions in ONE batch.
+    ///
+    /// The returned Vec is index-aligned to `txids`. Cost is
+    /// proportional to `txids.len()` and independent of mempool size,
+    /// which is the entire point: the whole-mempool fetch this replaces
+    /// took 858 ms at 94k transactions and blew its 2s budget at 500k.
+    ///
+    /// Txids are sent in DISPLAY order, which is what Bitcoin Core's
+    /// RPC speaks; callers hold them in internal byte order.
+    ///
+    /// # Errors
+    ///
+    /// Transport-level failure only. Per-txid outcomes, including "not
+    /// in mempool", are values in the returned Vec.
+    pub async fn probe_mempool(&self, txids: &[[u8; 32]]) -> Result<Vec<MempoolProbe>, RpcError> {
+        let params: Vec<[String; 1]> = txids
+            .iter()
+            .map(|t| {
+                let mut display = *t;
+                display.reverse();
+                [hex::encode(display)]
+            })
+            .collect();
+        let items: Vec<BatchItem<serde_json::Value>> =
+            self.call_batch("getmempoolentry", &params).await?;
+        Ok(items.into_iter().map(probe_from_item).collect())
+    }
+
     /// Fetch the current mempool as a list of transaction ids in
     /// internal byte order.
     ///
@@ -279,6 +316,63 @@ pub enum BatchItem<R> {
     /// duplicated, or out of range. NOT an answer, and callers must not
     /// treat it as a negative one.
     NoResponse,
+}
+
+/// Bitcoin Core's error code for `getmempoolentry` on a transaction the
+/// mempool does not hold (`RPC_INVALID_ADDRESS_OR_KEY`, "Transaction
+/// not in mempool").
+///
+/// This is the ONLY code treated as a proven absence. Matching on the
+/// code alone rather than the message keeps it stable across Core
+/// versions; scoping the meaning to `getmempoolentry` is what makes the
+/// code unambiguous, since -5 means other things for other methods.
+///
+/// NOT VERIFIED against a live bitcoind from the development
+/// environment. The design is deliberately fail-safe about that: if the
+/// code is wrong, every probe resolves Unadjudicated and the caller
+/// emits `lookup_failed`, which is loud. It cannot resolve to "absent",
+/// which would fabricate a detection. Verify on the node at rollout.
+pub const MEMPOOL_MISSING_ENTRY_CODE: i64 = -5;
+
+/// The `getmempoolinfo` fields this crate reads. Core returns many
+/// more; serde ignores them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MempoolInfo {
+    /// Transactions currently in the mempool.
+    pub size: usize,
+}
+
+/// What bitcoind said about one specific transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MempoolProbe {
+    /// bitcoind returned an entry: it holds this transaction now.
+    Present,
+    /// bitcoind answered that it does not hold it. A real negative, and
+    /// better evidence than absence from a snapshot, because it is a
+    /// direct per-transaction statement rather than an inference.
+    Absent,
+    /// No usable answer. Proves nothing in either direction.
+    Unadjudicated { reason: String },
+}
+
+/// Map one batch item to a probe verdict.
+///
+/// Separated from the RPC call so the error-code policy, which is the
+/// part that decides whether an unproven thing can read as proven, is
+/// unit-testable without a server.
+fn probe_from_item<R>(item: BatchItem<R>) -> MempoolProbe {
+    match item {
+        BatchItem::Ok(_) => MempoolProbe::Present,
+        BatchItem::Failed { code, .. } if code == MEMPOOL_MISSING_ENTRY_CODE => {
+            MempoolProbe::Absent
+        }
+        BatchItem::Failed { code, message } => MempoolProbe::Unadjudicated {
+            reason: format!("getmempoolentry returned code {code}: {message}"),
+        },
+        BatchItem::NoResponse => MempoolProbe::Unadjudicated {
+            reason: "no batch reply could be attributed to this request id".to_string(),
+        },
+    }
 }
 
 /// Correlate batch replies to requests by `id`, never by position.
@@ -439,5 +533,49 @@ mod tests {
         let parsed: Vec<BatchResponse<String>> = serde_json::from_str(raw).unwrap();
         let out = resolve_batch::<String>(parsed, 1);
         assert!(matches!(out[0], BatchItem::NoResponse));
+    }
+
+    /// Only the documented missing-entry code counts as a proven
+    /// absence. Every other error is unadjudicated.
+    ///
+    /// This is fail-safe against our own uncertainty: the -5 code is
+    /// believed correct but has NOT been verified against a real
+    /// bitcoind. If it is wrong, every probe becomes Unadjudicated,
+    /// which forces `lookup_failed` (loud). It can never degrade into
+    /// "all absent", which would fabricate detections.
+    #[test]
+    fn only_the_missing_entry_code_means_absent() {
+        assert!(matches!(
+            probe_from_item(BatchItem::<serde_json::Value>::Failed {
+                code: MEMPOOL_MISSING_ENTRY_CODE,
+                message: "Transaction not in mempool".to_string(),
+            }),
+            MempoolProbe::Absent
+        ));
+        assert!(matches!(
+            probe_from_item(BatchItem::<serde_json::Value>::Failed {
+                code: -32603,
+                message: "Work queue depth exceeded".to_string(),
+            }),
+            MempoolProbe::Unadjudicated { .. }
+        ));
+        assert!(matches!(
+            probe_from_item(BatchItem::<serde_json::Value>::NoResponse),
+            MempoolProbe::Unadjudicated { .. }
+        ));
+        assert!(matches!(
+            probe_from_item(BatchItem::Ok(serde_json::json!({"vsize": 141}))),
+            MempoolProbe::Present
+        ));
+    }
+
+    /// getmempoolinfo carries many fields; we read one and must ignore
+    /// the rest rather than failing to deserialize.
+    #[test]
+    fn mempool_info_reads_size_and_ignores_the_rest() {
+        let raw = r#"{"loaded":true,"size":94211,"bytes":41000000,"usage":210000000,
+                      "maxmempool":300000000,"mempoolminfee":0.00001000}"#;
+        let info: MempoolInfo = serde_json::from_str(raw).unwrap();
+        assert_eq!(info.size, 94_211);
     }
 }
