@@ -158,14 +158,7 @@ impl BitcoindClient {
     /// Transport-level failure only. Per-txid outcomes, including "not
     /// in mempool", are values in the returned Vec.
     pub async fn probe_mempool(&self, txids: &[[u8; 32]]) -> Result<Vec<MempoolProbe>, RpcError> {
-        let params: Vec<[String; 1]> = txids
-            .iter()
-            .map(|t| {
-                let mut display = *t;
-                display.reverse();
-                [hex::encode(display)]
-            })
-            .collect();
+        let params = probe_params(txids);
         let items: Vec<BatchItem<serde_json::Value>> =
             self.call_batch("getmempoolentry", &params).await?;
         Ok(items.into_iter().map(probe_from_item).collect())
@@ -355,6 +348,25 @@ pub enum MempoolProbe {
     Unadjudicated { reason: String },
 }
 
+/// Build the `getmempoolentry` batch params for a set of txids.
+///
+/// Each txid is converted from internal byte order, which callers hold,
+/// to DISPLAY order, which is what Bitcoin Core's RPC speaks. Separated
+/// from [`BitcoindClient::probe_mempool`] so the byte order conversion
+/// is directly testable without a server: a wrong reversal here turns
+/// every live probe into a lookup against a hash Core has never seen,
+/// which resolves to Absent and fabricates a detection.
+fn probe_params(txids: &[[u8; 32]]) -> Vec<[String; 1]> {
+    txids
+        .iter()
+        .map(|t| {
+            let mut display = *t;
+            display.reverse();
+            [hex::encode(display)]
+        })
+        .collect()
+}
+
 /// Map one batch item to a probe verdict.
 ///
 /// Separated from the RPC call so the error-code policy, which is the
@@ -439,6 +451,26 @@ mod tests {
         // Internal byte order of genesis coinbase txid begins 0x3b 0xa3 ...
         assert_eq!(internal[0], 0x3b);
         assert_eq!(internal[1], 0xa3);
+    }
+
+    /// `probe_params` must send the exact display-order hex string Core
+    /// expects, not merely something different from the input. Uses the
+    /// same genesis coinbase txid as
+    /// `parse_txid_hex_round_trips_a_known_value` so both tests agree on
+    /// one ground truth: internal byte order begins 0x3b 0xa3, display
+    /// order is the value below. A mutation that drops `.reverse()`, or
+    /// reverses the wrong array, would send `internal`'s hex back out
+    /// unchanged or double-reversed, and this assertion catches either.
+    #[test]
+    fn probe_params_sends_the_known_value_in_display_order() {
+        let display = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+        let mut internal = parse_txid_hex(display).unwrap();
+        internal.reverse();
+        assert_eq!(internal[0], 0x3b);
+        assert_eq!(internal[1], 0xa3);
+
+        let params = probe_params(&[internal]);
+        assert_eq!(params, vec![[display.to_string()]]);
     }
 
     #[test]
