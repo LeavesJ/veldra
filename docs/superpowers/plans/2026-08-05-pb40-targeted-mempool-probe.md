@@ -56,7 +56,7 @@ Chunking lives in `second_chance`, not `bitcoind_rpc`: the chunk loop is where t
 - Consumes: existing private `JsonRpcError`, `BitcoindClient` fields `http`, `url`, `user`, `pass`.
 - Produces:
   - `pub enum BatchItem<R> { Ok(R), Failed { code: i64, message: String }, NoResponse }`
-  - `pub async fn BitcoindClient::call_batch<P: Serialize, R: DeserializeOwned>(&self, method: &str, params_per_item: &[P]) -> Result<Vec<BatchItem<R>>, RpcError>` — returned Vec is always the same length as `params_per_item` and index-aligned to it.
+  - `pub async fn BitcoindClient::call_batch<P: Serialize, R: DeserializeOwned>(&self, method: &str, params_per_item: &[P]) -> Result<Vec<BatchItem<R>>, RpcError>`. The returned Vec is always the same length as `params_per_item` and index-aligned to it.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -329,7 +329,7 @@ git commit -m "feat(pool-verifier): JSON-RPC batch transport correlated by id (P
   - `pub struct MempoolInfo { pub size: usize }`
   - `pub enum MempoolProbe { Present, Absent, Unadjudicated { reason: String } }`
   - `pub async fn BitcoindClient::get_mempool_info(&self) -> Result<MempoolInfo, RpcError>`
-  - `pub async fn BitcoindClient::probe_mempool(&self, txids: &[[u8; 32]]) -> Result<Vec<MempoolProbe>, RpcError>` — one batch, Vec index-aligned to `txids`.
+  - `pub async fn BitcoindClient::probe_mempool(&self, txids: &[[u8; 32]]) -> Result<Vec<MempoolProbe>, RpcError>` (one batch, Vec index-aligned to `txids`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -811,6 +811,34 @@ git commit -m "feat(pool-verifier): add an Unadjudicated state to the adjudicati
 
 The mock in `services/pool-verifier/tests/pb40_walk_coverage.rs` answers only three methods and `ask` gains a parameter, so this file must move with the change or nothing compiles.
 
+First add ONE shared helper near the top of the file, just below `display_hex`. Every mock in this file answers batches the same way, and the repo doctrine's rule of three says extract on the third rather than paste a fourth:
+
+```rust
+/// Reply to a JSON-RPC batch, echoing each request's `id`.
+///
+/// `present` decides whether each probed transaction reports as held.
+/// `error_code` is the code used when it does not: `-5` is Core's
+/// "not in mempool", anything else drives the unadjudicated path.
+fn batch_reply(items: &[Value], present: bool, error_code: i64) -> Json<Value> {
+    let replies: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let id = item.get("id").cloned().unwrap_or(Value::Null);
+            if present {
+                json!({"id": id, "result": {"vsize": 141}, "error": Value::Null})
+            } else {
+                json!({
+                    "id": id,
+                    "result": Value::Null,
+                    "error": {"code": error_code, "message": "Transaction not in mempool"},
+                })
+            }
+        })
+        .collect();
+    Json(Value::Array(replies))
+}
+```
+
 In the `rpc` handler's `match method`, replace the `"getrawmempool"` arm with these two arms:
 
 ```rust
@@ -826,17 +854,7 @@ and add, before the final `_ =>` arm, nothing else. Batch requests do not reach 
     // A JSON-RPC batch arrives as an ARRAY. This chain never holds the
     // template's transactions, so every probe answers "not in mempool".
     if let Some(items) = req.as_array() {
-        let replies: Vec<Value> = items
-            .iter()
-            .map(|item| {
-                json!({
-                    "id": item.get("id").cloned().unwrap_or(Value::Null),
-                    "result": Value::Null,
-                    "error": {"code": -5, "message": "Transaction not in mempool"},
-                })
-            })
-            .collect();
-        return Json(Value::Array(replies));
+        return batch_reply(items, false, -5);
     }
 ```
 
@@ -844,17 +862,7 @@ Do the same batch branch at the top of `mempool_only`, but replying with the wor
 
 ```rust
     if let Some(items) = req.as_array() {
-        let replies: Vec<Value> = items
-            .iter()
-            .map(|item| {
-                json!({
-                    "id": item.get("id").cloned().unwrap_or(Value::Null),
-                    "result": Value::Null,
-                    "error": {"code": -5, "message": "Transaction not in mempool"},
-                })
-            })
-            .collect();
-        return Json(Value::Array(replies));
+        return batch_reply(items, false, -5);
     }
 ```
 
@@ -919,17 +927,7 @@ async fn the_block_walk_runs_first_and_shrinks_the_probe_set() {
                 async move {
                     if let Some(items) = req.as_array() {
                         counter.fetch_add(items.len(), Ordering::SeqCst);
-                        let replies: Vec<Value> = items
-                            .iter()
-                            .map(|item| {
-                                json!({
-                                    "id": item.get("id").cloned().unwrap_or(Value::Null),
-                                    "result": Value::Null,
-                                    "error": {"code": -5, "message": "Transaction not in mempool"},
-                                })
-                            })
-                            .collect();
-                        return Json(Value::Array(replies));
+                        return batch_reply(items, false, -5);
                     }
                     match req.get("method").and_then(Value::as_str).unwrap_or("") {
                         "getmempoolinfo" => {
@@ -998,17 +996,7 @@ async fn an_empty_mempool_is_refused_before_any_probe_is_issued() {
 async fn an_unusable_probe_answer_is_unadjudicated_not_absent() {
     async fn work_queue_exceeded(Json(req): Json<Value>) -> Json<Value> {
         if let Some(items) = req.as_array() {
-            let replies: Vec<Value> = items
-                .iter()
-                .map(|item| {
-                    json!({
-                        "id": item.get("id").cloned().unwrap_or(Value::Null),
-                        "result": Value::Null,
-                        "error": {"code": -32603, "message": "Work queue depth exceeded"},
-                    })
-                })
-                .collect();
-            return Json(Value::Array(replies));
+            return batch_reply(items, false, -32603);
         }
         match req.get("method").and_then(Value::as_str).unwrap_or("") {
             "getmempoolinfo" => Json(json!({"result": {"size": 94_211}, "error": null, "id": 1})),
@@ -1063,17 +1051,7 @@ async fn chunk_boundaries_probe_every_txid_exactly_once() {
                             "a chunk must never exceed the cap"
                         );
                         counter.fetch_add(items.len(), Ordering::SeqCst);
-                        let replies: Vec<Value> = items
-                            .iter()
-                            .map(|item| {
-                                json!({
-                                    "id": item.get("id").cloned().unwrap_or(Value::Null),
-                                    "result": {"vsize": 141},
-                                    "error": Value::Null,
-                                })
-                            })
-                            .collect();
-                        return Json(Value::Array(replies));
+                        return batch_reply(items, true, -5);
                     }
                     match req.get("method").and_then(Value::as_str).unwrap_or("") {
                         "getmempoolinfo" => {
@@ -1803,13 +1781,13 @@ rm services/pool-verifier/tests/zz_latency_probe.rs
 In `docs/runbooks/phase2-shadow-soak.md`, find the `lookup_failed` bullet list of four kinds and add a fifth entry after `block_walk_incomplete`:
 
 ```markdown
-     - `mempool_probe_incomplete` — bitcoind was reachable but one or more transactions got no usable answer from `getmempoolentry`, so absence could not be established for all of them. Read `lookup_error` for the count.
+     - `mempool_probe_incomplete`: bitcoind was reachable but one or more transactions got no usable answer from `getmempoolentry`, so absence could not be established for all of them. Read `lookup_error` for the count.
 ```
 
 In the same list, replace the `deadline` entry with:
 
 ```markdown
-     - `deadline` — bitcoind was too slow for the 2s budget. The lookup's cost is proportional to the number of unknown transactions, not to mempool size, so a run of these means either a very large unknown set or a slow node, NOT congestion.
+     - `deadline`: bitcoind was too slow for the 2s budget. The lookup's cost is proportional to the number of unknown transactions, not to mempool size, so a run of these means either a very large unknown set or a slow node, NOT congestion.
 ```
 
 - [ ] **Step 5: Confirm ADR-003 did not go stale**
@@ -1827,7 +1805,7 @@ Expected: it says the verifier "asks bitcoind directly about the specific unknow
 Prepend to `/Users/a14808/ReserveGrid-OS/docs/DEVLOG.md`, immediately after the line `Newest entries at top.` and its following `---`:
 
 ```markdown
-## 2026-08-05 — PB-40: the second-chance lookup now costs O(unknowns)
+## 2026-08-05 - PB-40: the second-chance lookup now costs O(unknowns)
 
 T2. `services/pool-verifier/src/{bitcoind_rpc.rs,second_chance.rs,ingress.rs}`,
 `services/pool-verifier/tests/{pb40_walk_coverage.rs,phase2_tcp.rs}`,
