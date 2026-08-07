@@ -43,25 +43,68 @@ fn display_hex(txid: [u8; 32]) -> String {
     hex::encode(d)
 }
 
+/// Build one JSON-RPC batch reply entry for a single probed item.
+///
+/// `present` decides whether it reports as held. `error_code` is the
+/// code used when it does not: `-5` is Core's "not in mempool",
+/// anything else drives the unadjudicated path. Shared by [`batch_reply`]
+/// (one answer for every item) and [`keyed_batch_reply`] (the answer
+/// depends on which item it is), so the reply shape exists once.
+fn reply_for(id: &Value, present: bool, error_code: i64) -> Value {
+    if present {
+        json!({"id": id, "result": {"vsize": 141}, "error": Value::Null})
+    } else {
+        json!({
+            "id": id,
+            "result": Value::Null,
+            "error": {"code": error_code, "message": "Transaction not in mempool"},
+        })
+    }
+}
+
 /// Reply to a JSON-RPC batch, echoing each request's `id`.
 ///
-/// `present` decides whether each probed transaction reports as held.
-/// `error_code` is the code used when it does not: `-5` is Core's
-/// "not in mempool", anything else drives the unadjudicated path.
+/// `present` decides whether every probed transaction reports as held,
+/// uniformly. `error_code` is the code used when it does not.
 fn batch_reply(items: &[Value], present: bool, error_code: i64) -> Json<Value> {
     let replies: Vec<Value> = items
         .iter()
         .map(|item| {
             let id = item.get("id").cloned().unwrap_or(Value::Null);
-            if present {
-                json!({"id": id, "result": {"vsize": 141}, "error": Value::Null})
-            } else {
-                json!({
-                    "id": id,
-                    "result": Value::Null,
-                    "error": {"code": error_code, "message": "Transaction not in mempool"},
-                })
-            }
+            reply_for(&id, present, error_code)
+        })
+        .collect();
+    Json(Value::Array(replies))
+}
+
+/// Reply to a JSON-RPC batch, deciding Present vs not-in-mempool PER
+/// ITEM by reading the requested txid out of that item's own `params`.
+///
+/// A uniform answer cannot catch a misattribution bug: if a caller
+/// lines up verdicts against the wrong request, every permutation of
+/// the same uniform answer looks identical. Keying the answer to the
+/// txid actually named in each request's `params` makes a swapped
+/// pairing produce a different, checkable set of verdicts.
+fn keyed_batch_reply(
+    items: &[Value],
+    present: impl Fn([u8; 32]) -> bool,
+    error_code: i64,
+) -> Json<Value> {
+    let replies: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let id = item.get("id").cloned().unwrap_or(Value::Null);
+            let hex_str = item
+                .get("params")
+                .and_then(|p| p.get(0))
+                .and_then(Value::as_str)
+                .expect("getmempoolentry params carry the txid as a display-order hex string");
+            let mut internal: [u8; 32] = hex::decode(hex_str)
+                .expect("valid hex")
+                .try_into()
+                .expect("32-byte txid");
+            internal.reverse(); // display order -> internal order
+            reply_for(&id, present(internal), error_code)
         })
         .collect();
     Json(Value::Array(replies))
@@ -420,7 +463,23 @@ async fn an_unusable_probe_answer_is_unadjudicated_not_absent() {
     assert!(!answer.present_in_mempool.contains(&target));
 }
 
-/// Chunking must not drop or duplicate a transaction at the boundary.
+/// Whether the synthetic txid built for index `i` in this test must
+/// come back `Present`. Shared between the mock, which decides each
+/// item's answer by decoding the txid out of its own request, and the
+/// assertion, which computes the expected set the same way: any
+/// mismatch (for example a probe verdict attached to the wrong
+/// transaction) then changes WHICH txids land in `present_in_mempool`,
+/// not just how many.
+fn should_be_present(txid: [u8; 32]) -> bool {
+    u64::from_be_bytes(txid[..8].try_into().expect("8 bytes")) % 2 == 0
+}
+
+/// Chunking must not drop, duplicate, or misattribute a transaction at
+/// the boundary. The mock's answer is keyed to each txid's own identity
+/// (`should_be_present`), not uniform, so a verdict attached to the
+/// wrong transaction changes the specific membership of
+/// `present_in_mempool` and is caught by the identity assertion below,
+/// not just an aggregate count.
 #[tokio::test]
 async fn chunk_boundaries_probe_every_txid_exactly_once() {
     use std::sync::Arc;
@@ -445,7 +504,7 @@ async fn chunk_boundaries_probe_every_txid_exactly_once() {
                             "a chunk must never exceed the cap"
                         );
                         counter.fetch_add(items.len(), Ordering::SeqCst);
-                        return batch_reply(items, true, -5);
+                        return keyed_batch_reply(items, should_be_present, -5);
                     }
                     match req.get("method").and_then(Value::as_str).unwrap_or("") {
                         "getmempoolinfo" => {
@@ -489,7 +548,18 @@ async fn chunk_boundaries_probe_every_txid_exactly_once() {
         let answer = sc.ask(TEMPLATE_HEIGHT, &unknown).await.expect("lookup");
 
         assert_eq!(probed.load(Ordering::SeqCst), n, "n = {n}");
-        assert_eq!(answer.present_in_mempool.len(), n, "n = {n}");
+
+        let expected_present: std::collections::HashSet<[u8; 32]> = unknown
+            .iter()
+            .copied()
+            .filter(|t| should_be_present(*t))
+            .collect();
+        assert_eq!(
+            answer.present_in_mempool, expected_present,
+            "n = {n}: present_in_mempool must hold exactly the txids the mock marked \
+             present, keyed by their own identity, not any other permutation of the \
+             same count"
+        );
         assert!(answer.unadjudicated.is_empty(), "n = {n}");
     }
 }
