@@ -47,8 +47,10 @@ use crate::bitcoind_rpc::{BitcoindClient, MempoolProbe, RpcError};
 /// fast false rejection into a timeout, which is strictly worse: the
 /// operator loses the verdict entirely instead of getting a wrong one
 /// they can see. Two seconds leaves the rest of the template handling
-/// half the window. On the Setup B node `getrawmempool` against a 94k
-/// mempool over loopback returns in well under that.
+/// half the window. The lookup no longer fetches the whole mempool: its
+/// cost is proportional to the unknown count, and it measured flat at
+/// roughly 10 ms across 94k/200k/500k mempools, so the 2 s budget is
+/// headroom against a large unknown set, not against mempool size.
 pub const SECOND_CHANCE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Most blocks walked back from the tip when looking for template
@@ -272,11 +274,16 @@ pub struct Adjudication {
 
 /// Why a second-chance lookup produced no answer.
 ///
-/// Two variants because they call for different operator action: an
+/// Six variants, each calling for different operator action:
 /// [`SecondChanceError::Rpc`] means bitcoind is broken or
-/// misconfigured, a [`SecondChanceError::Deadline`] means it is slow
-/// enough to threaten the upstream verdict budget. Both uphold the
-/// rejection; only one of them is fixed by tuning.
+/// misconfigured; [`SecondChanceError::Deadline`] means it is slow
+/// enough to threaten the upstream verdict budget; [`SecondChanceError::MempoolLoading`]
+/// means wait for the node's own startup rather than touch anything;
+/// [`SecondChanceError::EmptyMempool`] means the node has nothing to
+/// adjudicate against; [`SecondChanceError::BlockWalkIncomplete`] and
+/// [`SecondChanceError::MempoolProbeIncomplete`] mean part of the
+/// lookup ran and part did not. All six uphold the rejection; only some
+/// are fixed by tuning.
 #[derive(Debug, Error)]
 pub enum SecondChanceError {
     #[error("second-chance lookup failed: {0}")]
@@ -285,8 +292,20 @@ pub enum SecondChanceError {
     #[error("second-chance lookup exceeded its {SECOND_CHANCE_DEADLINE:?} deadline")]
     Deadline,
 
+    /// `getmempoolinfo` reported `loaded: false`. The node is still
+    /// replaying `mempool.dat` and every probe against it would answer
+    /// "not in mempool" for a reason that has nothing to do with
+    /// absence. Distinct from [`SecondChanceError::EmptyMempool`]
+    /// because the operator action differs: this one resolves itself
+    /// once the node finishes loading, an empty mempool does not.
     #[error(
-        "getrawmempool succeeded but returned an empty set, which cannot establish that any \
+        "bitcoind is still loading its mempool (getmempoolinfo reported loaded=false), so \
+         \"not in mempool\" cannot be trusted as absence"
+    )]
+    MempoolLoading,
+
+    #[error(
+        "getmempoolinfo reported the mempool is empty, which cannot establish that any \
          transaction is absent"
     )]
     EmptyMempool,
@@ -314,6 +333,7 @@ impl SecondChanceError {
         match self {
             SecondChanceError::Rpc(_) => "rpc_error",
             SecondChanceError::Deadline => "deadline",
+            SecondChanceError::MempoolLoading => "mempool_loading",
             SecondChanceError::EmptyMempool => "empty_mempool",
             SecondChanceError::BlockWalkIncomplete(_) => "block_walk_incomplete",
             SecondChanceError::MempoolProbeIncomplete(_) => "mempool_probe_incomplete",
@@ -345,6 +365,14 @@ pub enum SecondChanceOutcome {
         unknown_before: u32,
         reason: String,
         kind: String,
+        /// How many of `unknown_before` had no usable probe answer, on
+        /// the [`SecondChanceError::MempoolProbeIncomplete`] path. Zero
+        /// on every other path, where nothing was adjudicated at all
+        /// rather than partially adjudicated. Carried here so the count
+        /// lands in [`MempoolAdjudicationRecord::unadjudicated`]
+        /// instead of living only inside the free-text `reason`
+        /// sentence, where nothing machine-readable can key off it.
+        unadjudicated: u32,
     },
 }
 
@@ -511,7 +539,10 @@ pub struct MempoolAdjudicationRecord {
     /// Present only for `lookup_failed`: why bitcoind was not asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lookup_error: Option<String>,
-    /// Present only for `lookup_failed`: `rpc_error` or `deadline`.
+    /// Present only for `lookup_failed`: one of the six kinds
+    /// [`SecondChanceError::as_label`] emits (`rpc_error`, `deadline`,
+    /// `mempool_loading`, `empty_mempool`, `block_walk_incomplete`,
+    /// `mempool_probe_incomplete`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lookup_error_kind: Option<String>,
 }
@@ -549,19 +580,24 @@ impl From<&SecondChanceOutcome> for MempoolAdjudicationRecord {
                 unknown_before,
                 reason,
                 kind,
+                unadjudicated,
             } => Self {
                 outcome: label,
-                // The first-pass counts are real and are recorded. The
-                // four adjudication counts below stay zero because
-                // nothing was adjudicated, which `outcome` states
-                // outright so they cannot be read as "bitcoind knew
-                // none of them".
+                // The first-pass counts are real and are recorded.
+                // `in_mempool`, `mined`, and `still_absent` stay zero
+                // because nothing was adjudicated, which `outcome`
+                // states outright so they cannot be read as "bitcoind
+                // knew none of them". `unadjudicated` is the exception:
+                // on the mempool-probe-incomplete path it carries the
+                // real count instead of hiding it inside the free-text
+                // `lookup_error` sentence, where nothing machine-readable
+                // could key off it.
                 total: *total,
                 unknown_before: *unknown_before,
                 in_mempool: 0,
                 mined: 0,
                 still_absent: 0,
-                unadjudicated: 0,
+                unadjudicated: *unadjudicated,
                 blocks_scanned: 0,
                 block_walk_truncated: false,
                 tip_height: None,
@@ -605,8 +641,12 @@ impl SecondChance {
     ///
     /// [`SecondChanceError::Rpc`] when bitcoind answered badly,
     /// [`SecondChanceError::Deadline`] when it did not answer in time,
-    /// [`SecondChanceError::EmptyMempool`] when its mempool is too
-    /// small to establish anything. Either way the caller must let the
+    /// [`SecondChanceError::MempoolLoading`] when it is still replaying
+    /// `mempool.dat`, [`SecondChanceError::EmptyMempool`] when its
+    /// mempool is too small to establish anything,
+    /// [`SecondChanceError::BlockWalkIncomplete`] and
+    /// [`SecondChanceError::MempoolProbeIncomplete`] when part of the
+    /// lookup ran and part did not. Either way the caller must let the
     /// original rejection stand: a lookup that could not run is not
     /// evidence of absence, and this module exists because that exact
     /// distinction was lost once already, when silently failing
@@ -630,18 +670,42 @@ impl SecondChance {
         template_height: u32,
         unknown: &[[u8; 32]],
     ) -> Result<BitcoindAnswer, SecondChanceError> {
-        // 1. Degenerate-node guard, BEFORE any probe.
+        // 1. Degenerate-node guards, BEFORE any probe. Two of them,
+        // because a node mid-restart can pass either one alone.
         //
-        // The same floor the view install path applies
-        // (`mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE`), for the same
-        // reason. A bitcoind still loading `mempool.dat`, on the wrong
-        // chain, or freshly restarted answers "not in mempool" for
-        // EVERY txid, which is byte-identical to "it holds none of
-        // them". Without this the targeted-probe change would silently
-        // delete the guard that the whole-mempool fetch was carrying,
-        // and every rejection in that window would be recorded as a
-        // confirmed detection.
+        // 1a. Still loading. A bitcoind still replaying `mempool.dat`
+        // answers "not in mempool" for EVERY txid it has not yet
+        // reached, which is byte-identical to "it holds none of them".
+        // This is the case a bare size floor misses: live peer relay
+        // can already have pushed `size` above the floor a second into
+        // the restart, while the reload itself has not resolved a
+        // single one of the template's transactions yet. Checked first
+        // because it is the sharper claim: `loaded: false` is a direct
+        // statement from bitcoind that its answers are not trustworthy
+        // yet, where the size floor below is only an inference from a
+        // count.
         let info = self.client.get_mempool_info().await?;
+        if !info.loaded {
+            warn!(
+                size = info.size,
+                "second chance: bitcoind is still loading its mempool (getmempoolinfo \
+                 loaded=false); refusing to adjudicate against it. A node mid-load answers \
+                 \"not in mempool\" for every txid it has not yet replayed, which is \
+                 byte-identical to it genuinely holding none of them, and size alone would \
+                 not have caught this because peer relay can already have pushed it above the \
+                 floor below"
+            );
+            return Err(SecondChanceError::MempoolLoading);
+        }
+        // 1b. The same floor the view install path applies
+        // (`mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE`), for the same
+        // reason: a mempool with nothing in it, on the wrong chain, or
+        // otherwise degenerate cannot establish absence either, even
+        // though it correctly reports itself as loaded. Without this
+        // the targeted-probe change would silently delete the guard
+        // that the whole-mempool fetch was carrying, and every
+        // rejection in that window would be recorded as a confirmed
+        // detection.
         if info.size < crate::mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE {
             warn!(
                 size = info.size,

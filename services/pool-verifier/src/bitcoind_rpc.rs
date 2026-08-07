@@ -333,6 +333,33 @@ pub const MEMPOOL_MISSING_ENTRY_CODE: i64 = -5;
 pub struct MempoolInfo {
     /// Transactions currently in the mempool.
     pub size: usize,
+    /// Whether bitcoind has finished loading `mempool.dat`.
+    ///
+    /// A node still loading answers "not in mempool" for every txid it
+    /// has not yet replayed, which is byte-identical to it genuinely
+    /// holding none of them. `size` alone does not catch this window: a
+    /// node a second into a restart can already show a nonzero `size`
+    /// from live peer relay while still missing everything the reload
+    /// has not reached yet, so `size >= 1` passes while every probe
+    /// still reads "absent" for a reason that has nothing to do with
+    /// absence.
+    ///
+    /// REQUIRED, not `#[serde(default)]`. If a Core version omits this
+    /// field, deserialization fails outright, which surfaces as an
+    /// `RpcError` and therefore `lookup_failed`: loud and safe. Either
+    /// default direction would silently fabricate an answer instead:
+    /// defaulting to `true` treats an unknown node as trustworthy,
+    /// defaulting to `false` refuses a healthy one, and only the first
+    /// of those two is a false-evidence hazard, so there is no safe
+    /// default to pick.
+    ///
+    /// Like [`MEMPOOL_MISSING_ENTRY_CODE`], this field's presence and
+    /// meaning are external knowledge about Bitcoin Core's documented
+    /// RPC contract, NOT verified against a live node from this
+    /// development environment. If the field's behavior differs from
+    /// documented, the failure direction is loud (a deserialization
+    /// error), never a silently wrong `loaded` value.
+    pub loaded: bool,
 }
 
 /// What bitcoind said about one specific transaction.
@@ -631,13 +658,28 @@ mod tests {
         ));
     }
 
-    /// getmempoolinfo carries many fields; we read one and must ignore
+    /// getmempoolinfo carries many fields; we read two and must ignore
     /// the rest rather than failing to deserialize.
     #[test]
-    fn mempool_info_reads_size_and_ignores_the_rest() {
+    fn mempool_info_reads_size_and_loaded_and_ignores_the_rest() {
         let raw = r#"{"loaded":true,"size":94211,"bytes":41000000,"usage":210000000,
                       "maxmempool":300000000,"mempoolminfee":0.00001000}"#;
         let info: MempoolInfo = serde_json::from_str(raw).unwrap();
         assert_eq!(info.size, 94_211);
+        assert!(info.loaded);
+    }
+
+    /// `loaded` is REQUIRED, not defaulted. A response that omits it
+    /// must fail to deserialize rather than silently pick a direction:
+    /// this is the fail-loud half of the degenerate-node guard, and the
+    /// only test that would notice a `#[serde(default)]` regression.
+    #[test]
+    fn mempool_info_without_loaded_field_fails_to_deserialize() {
+        let raw = r#"{"size":94211,"bytes":41000000}"#;
+        assert!(
+            serde_json::from_str::<MempoolInfo>(raw).is_err(),
+            "a getmempoolinfo payload missing `loaded` must not deserialize; silently \
+             defaulting it would fabricate evidence in one direction or the other"
+        );
     }
 }

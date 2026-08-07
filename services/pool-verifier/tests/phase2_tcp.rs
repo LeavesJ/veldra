@@ -173,9 +173,14 @@ async fn rpc_handler(State(state): State<MockState>, Json(raw): Json<Value>) -> 
 
     if method == "getmempoolinfo" {
         let size = state.display_hex_txids.read().expect("mock lock").len();
+        // `loaded: true`: none of these tests drive the still-loading
+        // window, which is covered directly in
+        // `tests/pb40_walk_coverage.rs`. A test here that needs the
+        // size floor (e.g. an empty mempool) clears `display_hex_txids`
+        // to drive `size` to zero instead.
         return (
             StatusCode::OK,
-            Json(json!({"result": {"size": size}, "error": null, "id": id})),
+            Json(json!({"result": {"loaded": true, "size": size}, "error": null, "id": id})),
         );
     }
 
@@ -1025,8 +1030,8 @@ async fn phase2_tcp_second_chance_failure_upholds_the_rejection_unadjudicated() 
 /// mempool nor any block at or above the template's height, and the
 /// soak runbook reads it as a genuine detection candidate. Before this
 /// was fixed, an errored `getbestblockhash` produced
-/// `blocks_scanned: 0, block_walk_truncated: false` — byte-identical to
-/// a healthy walk with nothing to scan — and the verdict claimed a
+/// `blocks_scanned: 0, block_walk_truncated: false`, byte-identical to
+/// a healthy walk with nothing to scan, and the verdict claimed a
 /// completed adjudication the lookup never performed. The rejection
 /// still stands either way; what must not stand is the evidence label.
 #[tokio::test]

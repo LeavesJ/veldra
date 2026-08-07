@@ -172,7 +172,7 @@ async fn mempool_only(Json(req): Json<Value>) -> Json<Value> {
         return batch_reply(items, false, -5);
     }
     if req.get("method").and_then(Value::as_str) == Some("getmempoolinfo") {
-        return Json(json!({"result": {"size": 94_211}, "error": null, "id": 1}));
+        return Json(json!({"result": {"loaded": true, "size": 94_211}, "error": null, "id": 1}));
     }
     Json(json!({
         "result": null,
@@ -181,10 +181,12 @@ async fn mempool_only(Json(req): Json<Value>) -> Json<Value> {
     }))
 }
 
-/// A bitcoind whose mempool is successfully, uselessly empty.
+/// A bitcoind whose mempool is successfully, uselessly empty. Reports
+/// `loaded: true` so this exercises the size floor specifically, not
+/// the separate `loaded` guard.
 async fn empty_mempool(Json(req): Json<Value>) -> Json<Value> {
     if req.get("method").and_then(Value::as_str) == Some("getmempoolinfo") {
-        return Json(json!({"result": {"size": 0}, "error": null, "id": 1}));
+        return Json(json!({"result": {"loaded": true, "size": 0}, "error": null, "id": 1}));
     }
     Json(json!({"result": null, "error": {"code": -5, "message": "n/a"}, "id": 1}))
 }
@@ -326,7 +328,7 @@ async fn a_failed_walk_is_distinguishable_from_a_healthy_empty_one() {
     );
 }
 
-/// An empty-but-successful getrawmempool cannot establish that any
+/// An empty-but-successful getmempoolinfo cannot establish that any
 /// transaction is absent, so it is refused rather than adjudicated.
 #[tokio::test]
 async fn an_empty_fresh_mempool_is_refused_not_treated_as_an_answer() {
@@ -364,9 +366,9 @@ async fn the_block_walk_runs_first_and_shrinks_the_probe_set() {
                     return batch_reply(items, false, -5);
                 }
                 match req.get("method").and_then(Value::as_str).unwrap_or("") {
-                    "getmempoolinfo" => {
-                        Json(json!({"result": {"size": 94_211}, "error": null, "id": 1}))
-                    }
+                    "getmempoolinfo" => Json(
+                        json!({"result": {"loaded": true, "size": 94_211}, "error": null, "id": 1}),
+                    ),
                     "getbestblockhash" => Json(
                         json!({"result": block_hash(TEMPLATE_HEIGHT), "error": null, "id": 1}),
                     ),
@@ -447,7 +449,11 @@ async fn an_empty_mempool_is_refused_before_any_probe_is_issued() {
                     return batch_reply(items, false, -5);
                 }
                 if req.get("method").and_then(Value::as_str) == Some("getmempoolinfo") {
-                    return Json(json!({"result": {"size": 0}, "error": null, "id": 1}));
+                    // `loaded: true` so this drives the size floor
+                    // specifically, not the separate `loaded` guard.
+                    return Json(
+                        json!({"result": {"loaded": true, "size": 0}, "error": null, "id": 1}),
+                    );
                 }
                 Json(json!({"result": null, "error": {"code": -5, "message": "n/a"}, "id": 1}))
             }
@@ -468,6 +474,58 @@ async fn an_empty_mempool_is_refused_before_any_probe_is_issued() {
     );
 }
 
+/// A bitcoind still loading `mempool.dat` is refused BEFORE any probe
+/// is issued, even though its reported `size` is well above the
+/// installable floor. This is the exact case a bare size check misses:
+/// live peer relay can already have pushed `size` to a realistic value
+/// while the node has not finished replaying its saved mempool, so
+/// every probe would still answer "not in mempool" for a reason that
+/// has nothing to do with absence.
+#[tokio::test]
+async fn a_mempool_still_loading_is_refused_before_any_probe_is_issued() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let probed = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&probed);
+
+    let app = Router::new().route(
+        "/",
+        post(move |Json(req): Json<Value>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                if let Some(items) = req.as_array() {
+                    counter.fetch_add(items.len(), Ordering::SeqCst);
+                    return batch_reply(items, false, -5);
+                }
+                if req.get("method").and_then(Value::as_str) == Some("getmempoolinfo") {
+                    // A realistic size, well above the installable
+                    // floor, paired with `loaded: false`: the shape
+                    // that only the `loaded` guard, not the size
+                    // floor, can catch.
+                    return Json(
+                        json!({"result": {"loaded": false, "size": 94_211}, "error": null, "id": 1}),
+                    );
+                }
+                Json(json!({"result": null, "error": {"code": -5, "message": "n/a"}, "id": 1}))
+            }
+        }),
+    );
+    let sc = spawn_router(app).await;
+
+    let err = sc
+        .ask(TEMPLATE_HEIGHT, &probe_set())
+        .await
+        .expect_err("a still-loading mempool must be refused");
+
+    assert_eq!(err.as_label(), "mempool_loading");
+    assert_eq!(
+        probed.load(Ordering::SeqCst),
+        0,
+        "the loaded guard must fire before any probe is issued, exactly like the size guard"
+    );
+}
+
 /// A probe that returns an unusable answer lands in `unadjudicated`,
 /// never in the proven-absent set.
 #[tokio::test]
@@ -477,7 +535,9 @@ async fn an_unusable_probe_answer_is_unadjudicated_not_absent() {
             return batch_reply(items, false, -32603);
         }
         match req.get("method").and_then(Value::as_str).unwrap_or("") {
-            "getmempoolinfo" => Json(json!({"result": {"size": 94_211}, "error": null, "id": 1})),
+            "getmempoolinfo" => {
+                Json(json!({"result": {"loaded": true, "size": 94_211}, "error": null, "id": 1}))
+            }
             "getbestblockhash" => {
                 Json(json!({"result": block_hash(TEMPLATE_HEIGHT - 1), "error": null, "id": 1}))
             }
@@ -548,9 +608,9 @@ async fn chunk_boundaries_probe_every_txid_exactly_once() {
                         return keyed_batch_reply(items, should_be_present, -5);
                     }
                     match req.get("method").and_then(Value::as_str).unwrap_or("") {
-                        "getmempoolinfo" => {
-                            Json(json!({"result": {"size": 94_211}, "error": null, "id": 1}))
-                        }
+                        "getmempoolinfo" => Json(json!({
+                            "result": {"loaded": true, "size": 94_211}, "error": null, "id": 1
+                        })),
                         "getbestblockhash" => Json(
                             json!({"result": block_hash(TEMPLATE_HEIGHT - 1), "error": null, "id": 1}),
                         ),

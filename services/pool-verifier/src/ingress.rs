@@ -88,6 +88,10 @@ async fn run_second_chance(
                 return Some(SecondChanceOutcome::LookupFailed {
                     total,
                     unknown_before,
+                    // The real count, so a reviewer or a dashboard can
+                    // key off it directly instead of parsing it back out
+                    // of the free-text `reason` sentence above.
+                    unadjudicated: adjudication.unadjudicated,
                     kind: reason.as_label().to_string(),
                     reason: reason.to_string(),
                 });
@@ -113,11 +117,17 @@ async fn run_second_chance(
                     "PB-40 second chance could not rule out the mined case; the Class M rejection \
                      stands UNADJUDICATED rather than as a confirmed detection"
                 );
+                let reason = SecondChanceError::BlockWalkIncomplete(shortfall.clone());
                 return Some(SecondChanceOutcome::LookupFailed {
                     total,
                     unknown_before,
-                    reason: SecondChanceError::BlockWalkIncomplete(shortfall.clone()).to_string(),
-                    kind: "block_walk_incomplete".to_string(),
+                    // Verified zero: the `adjudication.unadjudicated > 0`
+                    // branch above already returned if any probe came
+                    // back unusable, so by construction nothing is
+                    // unadjudicated on this path.
+                    unadjudicated: adjudication.unadjudicated,
+                    reason: reason.to_string(),
+                    kind: reason.as_label().to_string(),
                 });
             }
             Some(SecondChanceOutcome::Upheld(adjudication))
@@ -135,6 +145,9 @@ async fn run_second_chance(
             Some(SecondChanceOutcome::LookupFailed {
                 total,
                 unknown_before,
+                // Genuinely unknown: no adjudication ran at all, so
+                // there is no probed count to carry.
+                unadjudicated: 0,
                 reason: e.to_string(),
                 kind: e.as_label().to_string(),
             })
@@ -392,13 +405,13 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// System error boundary: reason codes not produced by policy evaluation.
 ///
-/// `VerdictReason::PolicyLoadError`       — emitted when policy lock is poisoned
-///                                          or policy state is unavailable.
-/// `VerdictReason::MempoolBackendUnavailable` — reserved for future fail-closed
-///                                          mode. Currently, missing mempool triggers
-///                                          degraded-mode tier selection.
-/// `VerdictReason::InternalError`         — emitted on unexpected handler failures
-///                                          (e.g., serialize errors).
+/// `VerdictReason::PolicyLoadError`: emitted when policy lock is poisoned
+///                                    or policy state is unavailable.
+/// `VerdictReason::MempoolBackendUnavailable`: reserved for future fail-closed
+///                                    mode. Currently, missing mempool triggers
+///                                    degraded-mode tier selection.
+/// `VerdictReason::InternalError`: emitted on unexpected handler failures
+///                                    (e.g., serialize errors).
 // Ten parameters is over the clippy threshold. Splitting them into a
 // struct would only rename the same values at the one call site in
 // main.rs, so the seam is not earned.
@@ -1124,7 +1137,7 @@ pub(crate) async fn handle_tcp_connection<R, W>(
 
             let accepted = eval.reason.is_none();
 
-            // reason_code string comes from rg-protocol — single source of truth.
+            // reason_code string comes from rg-protocol, the single source of truth.
             let reason_code_str: Option<String> =
                 eval.reason.as_ref().map(|r| r.as_str().to_string());
 
