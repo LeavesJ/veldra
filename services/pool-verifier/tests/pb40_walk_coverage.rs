@@ -417,14 +417,55 @@ async fn the_block_walk_runs_first_and_shrinks_the_probe_set() {
 /// A degenerate mempool is refused BEFORE any probe is issued, not
 /// after. Assert the probe count, because an error raised after
 /// probing would pass a test that only checks the error.
+///
+/// `empty_mempool` itself is not batch-aware, so a premature probe
+/// against it would blow up on deserialization rather than fail this
+/// assertion: the plain mock's fallback arm answers a batch array with
+/// a bare object, which is a shape the client-side batch parser cannot
+/// accept. That is an INCIDENTAL protection, not the one this test
+/// claims to provide, so the router here is batch-aware and counts
+/// every txid it is actually asked about, the same way
+/// `the_block_walk_runs_first_and_shrinks_the_probe_set` does. If the
+/// guard-before-probe ordering ever regresses, this fails on the
+/// count, not on a parser panic that would also fire for unrelated
+/// reasons.
 #[tokio::test]
 async fn an_empty_mempool_is_refused_before_any_probe_is_issued() {
-    let sc = spawn_router(Router::new().route("/", post(empty_mempool))).await;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let probed = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&probed);
+
+    let app = Router::new().route(
+        "/",
+        post(move |Json(req): Json<Value>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                if let Some(items) = req.as_array() {
+                    counter.fetch_add(items.len(), Ordering::SeqCst);
+                    return batch_reply(items, false, -5);
+                }
+                if req.get("method").and_then(Value::as_str) == Some("getmempoolinfo") {
+                    return Json(json!({"result": {"size": 0}, "error": null, "id": 1}));
+                }
+                Json(json!({"result": null, "error": {"code": -5, "message": "n/a"}, "id": 1}))
+            }
+        }),
+    );
+    let sc = spawn_router(app).await;
+
     let err = sc
         .ask(TEMPLATE_HEIGHT, &probe_set())
         .await
         .expect_err("an empty mempool must be refused");
+
     assert_eq!(err.as_label(), "empty_mempool");
+    assert_eq!(
+        probed.load(Ordering::SeqCst),
+        0,
+        "the degenerate-mempool guard must fire before any probe is issued"
+    );
 }
 
 /// A probe that returns an unusable answer lands in `unadjudicated`,

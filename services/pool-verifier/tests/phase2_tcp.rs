@@ -30,7 +30,6 @@ use axum::routing::post;
 use axum::{Json, Router};
 use rg_protocol::gateway::{InternalMessage, msg_types};
 use rg_protocol::{PROTOCOL_VERSION, TemplatePropose, TemplateVerdict, VerdictReason};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -106,6 +105,10 @@ struct MockState {
     /// written before PB-40 runs in and which the second-chance block
     /// walk must tolerate.
     tip_block: Arc<std::sync::RwLock<Option<MockBlock>>>,
+    /// PB-40: error code every batch probe replies with. `-5` is the
+    /// normal "not in mempool"; anything else drives the unadjudicated
+    /// path.
+    probe_error_code: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// One block for the `getblock` mock. Always a chain of length one:
@@ -120,20 +123,7 @@ struct MockBlock {
     display_hex_txids: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct RpcRequest {
-    method: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    params: Value,
-    #[serde(default)]
-    id: Value,
-}
-
-async fn rpc_handler(
-    State(state): State<MockState>,
-    Json(req): Json<RpcRequest>,
-) -> impl IntoResponse {
+async fn rpc_handler(State(state): State<MockState>, Json(raw): Json<Value>) -> impl IntoResponse {
     state.request_count.fetch_add(1, Ordering::SeqCst);
 
     if state.always_fail.load(Ordering::SeqCst) || state.fail_next.swap(false, Ordering::SeqCst) {
@@ -142,15 +132,57 @@ async fn rpc_handler(
             Json(json!({
                 "result": null,
                 "error": {"code": -32603, "message": "mock-induced failure"},
-                "id": req.id,
+                "id": null,
             })),
         );
     }
 
-    // PB-40 second-chance RPCs. A test that never seeds `tip_block`
-    // gets the same error Bitcoin Core would give for an unknown
-    // block, which is the path the block walk must survive.
-    if req.method == "getbestblockhash" || req.method == "getblock" {
+    // PB-40 targeted probes arrive as a JSON-RPC batch. Answer from the
+    // same txid set `getrawmempool` serves, so a test that seeds the
+    // mempool sees the same answer through either path.
+    if let Some(items) = raw.as_array() {
+        let held: Vec<String> = state.display_hex_txids.read().expect("mock lock").clone();
+        let replies: Vec<Value> = items
+            .iter()
+            .map(|item| {
+                let wanted = item
+                    .get("params")
+                    .and_then(|p| p.get(0))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let id = item.get("id").cloned().unwrap_or(Value::Null);
+                if held.iter().any(|h| h == wanted) {
+                    json!({"id": id, "result": {"vsize": 141}, "error": Value::Null})
+                } else {
+                    json!({
+                        "id": id,
+                        "result": Value::Null,
+                        "error": {
+                            "code": state.probe_error_code.load(Ordering::SeqCst),
+                            "message": "Transaction not in mempool",
+                        },
+                    })
+                }
+            })
+            .collect();
+        return (StatusCode::OK, Json(Value::Array(replies)));
+    }
+
+    let method = raw.get("method").and_then(Value::as_str).unwrap_or("");
+    let id = raw.get("id").cloned().unwrap_or(Value::Null);
+
+    if method == "getmempoolinfo" {
+        let size = state.display_hex_txids.read().expect("mock lock").len();
+        return (
+            StatusCode::OK,
+            Json(json!({"result": {"size": size}, "error": null, "id": id})),
+        );
+    }
+
+    // PB-40 second-chance block RPCs. A test that never seeds
+    // `tip_block` gets the same error Bitcoin Core would give for an
+    // unknown block, which is the path the block walk must survive.
+    if method == "getbestblockhash" || method == "getblock" {
         let tip = state.tip_block.read().expect("mock lock").clone();
         let Some(tip) = tip else {
             return (
@@ -158,14 +190,14 @@ async fn rpc_handler(
                 Json(json!({
                     "result": null,
                     "error": {"code": -5, "message": "Block not found"},
-                    "id": req.id,
+                    "id": id,
                 })),
             );
         };
-        if req.method == "getbestblockhash" {
+        if method == "getbestblockhash" {
             return (
                 StatusCode::OK,
-                Json(json!({"result": tip.hash, "error": null, "id": req.id})),
+                Json(json!({"result": tip.hash, "error": null, "id": id})),
             );
         }
         return (
@@ -181,18 +213,18 @@ async fn rpc_handler(
                     "previousblockhash": Value::Null,
                 },
                 "error": null,
-                "id": req.id,
+                "id": id,
             })),
         );
     }
 
-    if req.method != "getrawmempool" {
+    if method != "getrawmempool" {
         return (
             StatusCode::OK,
             Json(json!({
                 "result": null,
                 "error": {"code": -32601, "message": "method not supported"},
-                "id": req.id,
+                "id": id,
             })),
         );
     }
@@ -203,7 +235,7 @@ async fn rpc_handler(
         Json(json!({
             "result": *txids,
             "error": null,
-            "id": req.id,
+            "id": id,
         })),
     )
 }
@@ -427,6 +459,7 @@ fn make_mock_state(display_hex: Vec<String>) -> MockState {
         fail_next: Arc::new(AtomicBool::new(false)),
         always_fail: Arc::new(AtomicBool::new(false)),
         tip_block: Arc::new(std::sync::RwLock::new(None)),
+        probe_error_code: Arc::new(std::sync::atomic::AtomicI64::new(-5)),
     }
 }
 
@@ -1080,6 +1113,51 @@ async fn phase2_tcp_empty_fresh_mempool_is_unadjudicated_not_upheld() {
         failed, 1,
         "expected lookup_failed for the empty answer\n--- metrics ---\n{metrics}"
     );
+}
+
+/// A probe that cannot establish absence must not produce `upheld`.
+///
+/// The mempool is healthy and populated, so the degenerate-node guard
+/// does not fire, but every probe answers with an unexpected error. The
+/// rejection stands and is recorded unadjudicated.
+#[tokio::test]
+#[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
+async fn phase2_tcp_unadjudicated_probe_is_not_upheld() {
+    let (template, _display_hex) = regtest_segwit_template_and_display_hex();
+    let booted = boot_with_frozen_view(decoy_display_hex_txids(8)).await;
+
+    // A healthy tip so the block walk completes and cannot be the
+    // reason for the unadjudicated outcome.
+    {
+        let mut g = booted.mock.tip_block.write().expect("mock write lock");
+        *g = Some(MockBlock {
+            hash: "a".repeat(64),
+            height: 101,
+            display_hex_txids: vec![],
+        });
+    }
+    booted.mock.probe_error_code.store(-32603, Ordering::SeqCst);
+
+    let verdict = round_trip_template(booted.verifier_port, template).await;
+
+    let metrics = fetch_metrics_text(booted.http_port).await;
+    let upheld = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"upheld\"}",
+    );
+    let failed = parse_counter(
+        &metrics,
+        "verifier_phase2_second_chance_total{outcome=\"lookup_failed\"}",
+    );
+    drop(booted);
+
+    assert!(!verdict.accepted, "the rejection still stands");
+    assert_eq!(
+        upheld, 0,
+        "a probe that established nothing cannot support a detection claim\n\
+         --- metrics ---\n{metrics}"
+    );
+    assert_eq!(failed, 1, "--- metrics ---\n{metrics}");
 }
 
 // Compile-time assertions that the test crate sees the symbols it
