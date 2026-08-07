@@ -882,7 +882,7 @@ In `empty_mempool`, replace its `getrawmempool` branch with:
     }
 ```
 
-Finally, every `sc.ask(TEMPLATE_HEIGHT)` call in this file gains a second argument. Add this helper above `const TEMPLATE_HEIGHT`:
+Finally, every `sc.ask(TEMPLATE_HEIGHT)` call in this file gains a second argument. There are SEVEN, not six. Add this helper above `const TEMPLATE_HEIGHT`:
 
 ```rust
 /// The unknown set these coverage tests probe with. One txid that this
@@ -893,7 +893,7 @@ fn probe_set() -> Vec<[u8; 32]> {
 }
 ```
 
-and change every `sc.ask(TEMPLATE_HEIGHT).await` to `sc.ask(TEMPLATE_HEIGHT, &probe_set()).await`. There are six such call sites; find them with:
+and change every `sc.ask(TEMPLATE_HEIGHT).await` to `sc.ask(TEMPLATE_HEIGHT, &probe_set()).await`. Find them all with:
 
 ```bash
 grep -n "ask(TEMPLATE_HEIGHT" services/pool-verifier/tests/pb40_walk_coverage.rs
@@ -1141,6 +1141,15 @@ cargo test -p pool-verifier --test pb40_walk_coverage 2>&1 | tail -25
 
 Expected: compile error, `this method takes 2 arguments but 1 argument was supplied` and `cannot find value 'MEMPOOL_PROBE_CHUNK'`.
 
+**Note on scope, learned the hard way:** changing `ask`'s signature breaks
+`services/pool-verifier/src/ingress.rs:57`, which calls `lookup.ask(template_height)`.
+Task 4 MUST update that one call site to `lookup.ask(template_height, unknown).await`
+(the binding is already in scope), or the package does not compile and the task
+cannot end committable. Change nothing else in `ingress.rs`; Task 5 owns the
+decision rule. Note also that `cargo test -p pool-verifier --test <name>` still
+builds the package's `[[bin]]` target, so a broken binary blocks even a scoped
+integration-test run.
+
 - [ ] **Step 4: Implement the probe path**
 
 In `services/pool-verifier/src/second_chance.rs`, add the constant after `MAX_RECENT_BLOCKS_SCANNED`:
@@ -1353,19 +1362,17 @@ git commit -m "feat(pool-verifier): probe only the unknown txids, after the bloc
 - Consumes: `Adjudication.unadjudicated`, `SecondChanceError::MempoolProbeIncomplete`, the two-argument `ask`.
 - Produces: no new public API. `verifier_phase2_second_chance_total{outcome="lookup_failed"}` gains `lookup_error_kind = "mempool_probe_incomplete"`.
 
-- [ ] **Step 1: Pass the unknown set to `ask`**
+- [ ] **Step 1: Confirm the call site already passes the unknown set**
 
-In `run_second_chance`, change:
+Task 4 had to make this change to leave the package compiling, so it should
+already be present. Verify:
 
-```rust
-    match lookup.ask(template_height).await {
+```bash
+grep -n "lookup.ask(" services/pool-verifier/src/ingress.rs
 ```
 
-to:
-
-```rust
-    match lookup.ask(template_height, unknown).await {
-```
+Expected: `match lookup.ask(template_height, unknown).await {`. If it still
+reads `lookup.ask(template_height)`, make that change now.
 
 - [ ] **Step 2: Add the probe-completeness gate**
 
