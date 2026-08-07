@@ -54,7 +54,7 @@ async fn run_second_chance(
     let total = *total;
     let unknown_before = u32::try_from(unknown.len()).unwrap_or(u32::MAX);
 
-    match lookup.ask(template_height).await {
+    match lookup.ask(template_height, unknown).await {
         Ok(answer) => {
             let adjudication = second_chance::adjudicate(total, unknown, &answer);
             if !adjudication.still_exceeds(tolerance_pct) {

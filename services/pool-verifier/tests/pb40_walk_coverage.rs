@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use pool_verifier::bitcoind_rpc::BitcoindClient;
-use pool_verifier::second_chance::{MAX_RECENT_BLOCKS_SCANNED, SecondChance};
+use pool_verifier::second_chance::{MAX_RECENT_BLOCKS_SCANNED, MEMPOOL_PROBE_CHUNK, SecondChance};
 
 /// A walkable chain: block at height `h` has hash `hex(h)` and parent
 /// `hex(h-1)`, and carries one distinctive txid so a caller can tell
@@ -43,13 +43,41 @@ fn display_hex(txid: [u8; 32]) -> String {
     hex::encode(d)
 }
 
+/// Reply to a JSON-RPC batch, echoing each request's `id`.
+///
+/// `present` decides whether each probed transaction reports as held.
+/// `error_code` is the code used when it does not: `-5` is Core's
+/// "not in mempool", anything else drives the unadjudicated path.
+fn batch_reply(items: &[Value], present: bool, error_code: i64) -> Json<Value> {
+    let replies: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let id = item.get("id").cloned().unwrap_or(Value::Null);
+            if present {
+                json!({"id": id, "result": {"vsize": 141}, "error": Value::Null})
+            } else {
+                json!({
+                    "id": id,
+                    "result": Value::Null,
+                    "error": {"code": error_code, "message": "Transaction not in mempool"},
+                })
+            }
+        })
+        .collect();
+    Json(Value::Array(replies))
+}
+
 async fn rpc(State(chain): State<Chain>, Json(req): Json<Value>) -> Json<Value> {
+    // A JSON-RPC batch arrives as an ARRAY. This chain never holds the
+    // template's transactions, so every probe answers "not in mempool".
+    if let Some(items) = req.as_array() {
+        return batch_reply(items, false, -5);
+    }
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
-        // Non-empty so the second chance's empty-mempool floor does not
-        // trip; deliberately holds none of the template's txids.
-        "getrawmempool" => Json(json!({
-            "result": ["11".repeat(32), "22".repeat(32)], "error": null, "id": 1
+        // Healthy, populated node: the degenerate-node floor must not trip.
+        "getmempoolinfo" => Json(json!({
+            "result": {"loaded": true, "size": 94_211}, "error": null, "id": 1
         })),
         "getbestblockhash" => Json(json!({
             "result": block_hash(chain.tip_height), "error": null, "id": 1
@@ -97,8 +125,11 @@ async fn spawn(tip_height: u32) -> SecondChance {
 /// A bitcoind that answers `getrawmempool` and errors on everything
 /// else: the mempool half of the lookup succeeds, the block walk does not.
 async fn mempool_only(Json(req): Json<Value>) -> Json<Value> {
-    if req.get("method").and_then(Value::as_str) == Some("getrawmempool") {
-        return Json(json!({"result": ["11".repeat(32)], "error": null, "id": 1}));
+    if let Some(items) = req.as_array() {
+        return batch_reply(items, false, -5);
+    }
+    if req.get("method").and_then(Value::as_str) == Some("getmempoolinfo") {
+        return Json(json!({"result": {"size": 94_211}, "error": null, "id": 1}));
     }
     Json(json!({
         "result": null,
@@ -109,10 +140,37 @@ async fn mempool_only(Json(req): Json<Value>) -> Json<Value> {
 
 /// A bitcoind whose mempool is successfully, uselessly empty.
 async fn empty_mempool(Json(req): Json<Value>) -> Json<Value> {
-    if req.get("method").and_then(Value::as_str) == Some("getrawmempool") {
-        return Json(json!({"result": [], "error": null, "id": 1}));
+    if req.get("method").and_then(Value::as_str) == Some("getmempoolinfo") {
+        return Json(json!({"result": {"size": 0}, "error": null, "id": 1}));
     }
     Json(json!({"result": null, "error": {"code": -5, "message": "n/a"}, "id": 1}))
+}
+
+/// The unknown set these coverage tests probe with. One txid that this
+/// synthetic chain never mines and never holds in its mempool, so the
+/// mempool half is constant and the block walk is the only variable.
+fn probe_set() -> Vec<[u8; 32]> {
+    vec![[0x7Eu8; 32]]
+}
+
+/// Spawn a `SecondChance` against an already-built router.
+///
+/// Takes a `Router` rather than a bare handler on purpose: generic over
+/// `axum::handler::Handler<T, S>` needs bounds that are easy to get
+/// subtly wrong and produce inscrutable trait errors, and every caller
+/// here already has a one-route router to hand.
+async fn spawn_router(app: Router) -> SecondChance {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    SecondChance::new(BitcoindClient::new(
+        format!("http://{addr}/"),
+        "u".into(),
+        "p".into(),
+        std::time::Duration::from_secs(5),
+    ))
 }
 
 const TEMPLATE_HEIGHT: u32 = 800_000;
@@ -133,7 +191,7 @@ async fn truncation_reports_only_when_blocks_were_actually_lost() {
     // With a cap of 6, gap 5 owes exactly 6: complete, not truncated.
     for gap in 0..=4u32 {
         let sc = spawn(TEMPLATE_HEIGHT + gap).await;
-        let answer = sc.ask(TEMPLATE_HEIGHT).await.expect("lookup");
+        let answer = sc.ask(TEMPLATE_HEIGHT, &probe_set()).await.expect("lookup");
         assert!(
             !answer.block_walk_truncated,
             "gap {gap} owes {} blocks, under the cap; must not report truncated",
@@ -145,7 +203,7 @@ async fn truncation_reports_only_when_blocks_were_actually_lost() {
 
     // The boundary that used to be wrong.
     let sc = spawn(TEMPLATE_HEIGHT + MAX_RECENT_BLOCKS_SCANNED - 1).await;
-    let answer = sc.ask(TEMPLATE_HEIGHT).await.expect("lookup");
+    let answer = sc.ask(TEMPLATE_HEIGHT, &probe_set()).await.expect("lookup");
     assert_eq!(answer.blocks_scanned, MAX_RECENT_BLOCKS_SCANNED);
     assert!(
         !answer.block_walk_truncated,
@@ -163,7 +221,7 @@ async fn truncation_reports_only_when_blocks_were_actually_lost() {
 
     // One block further and the walk genuinely loses coverage.
     let sc = spawn(TEMPLATE_HEIGHT + MAX_RECENT_BLOCKS_SCANNED).await;
-    let answer = sc.ask(TEMPLATE_HEIGHT).await.expect("lookup");
+    let answer = sc.ask(TEMPLATE_HEIGHT, &probe_set()).await.expect("lookup");
     assert!(
         answer.block_walk_truncated,
         "owing {} blocks against a cap of {MAX_RECENT_BLOCKS_SCANNED} must report truncated",
@@ -185,7 +243,7 @@ async fn truncation_reports_only_when_blocks_were_actually_lost() {
 #[tokio::test]
 async fn tip_below_the_template_is_complete_coverage_not_a_shortfall() {
     let sc = spawn(TEMPLATE_HEIGHT - 1).await;
-    let answer = sc.ask(TEMPLATE_HEIGHT).await.expect("lookup");
+    let answer = sc.ask(TEMPLATE_HEIGHT, &probe_set()).await.expect("lookup");
 
     assert_eq!(answer.blocks_scanned, 0);
     assert!(!answer.block_walk_truncated);
@@ -206,25 +264,15 @@ async fn tip_below_the_template_is_complete_coverage_not_a_shortfall() {
 async fn a_failed_walk_is_distinguishable_from_a_healthy_empty_one() {
     let healthy = spawn(TEMPLATE_HEIGHT - 1)
         .await
-        .ask(TEMPLATE_HEIGHT)
+        .ask(TEMPLATE_HEIGHT, &probe_set())
         .await
         .expect("healthy lookup");
 
-    let app = Router::new().route("/", post(mempool_only));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    let broken = SecondChance::new(BitcoindClient::new(
-        format!("http://{addr}/"),
-        "u".into(),
-        "p".into(),
-        std::time::Duration::from_secs(5),
-    ))
-    .ask(TEMPLATE_HEIGHT)
-    .await
-    .expect("mempool half still succeeds");
+    let broken = spawn_router(Router::new().route("/", post(mempool_only)))
+        .await
+        .ask(TEMPLATE_HEIGHT, &probe_set())
+        .await
+        .expect("mempool half still succeeds");
 
     assert_eq!(healthy.blocks_scanned, broken.blocks_scanned, "both are 0");
     assert_eq!(healthy.block_walk_truncated, broken.block_walk_truncated);
@@ -239,7 +287,62 @@ async fn a_failed_walk_is_distinguishable_from_a_healthy_empty_one() {
 /// transaction is absent, so it is refused rather than adjudicated.
 #[tokio::test]
 async fn an_empty_fresh_mempool_is_refused_not_treated_as_an_answer() {
-    let app = Router::new().route("/", post(empty_mempool));
+    let sc = spawn_router(Router::new().route("/", post(empty_mempool))).await;
+
+    let err = sc.ask(TEMPLATE_HEIGHT, &probe_set()).await.expect_err(
+        "an empty mempool must be refused: scoring every unknown absent against it would \
+         uphold the rejection and record it as a confirmed detection",
+    );
+    assert_eq!(err.as_label(), "empty_mempool");
+}
+
+/// Cost must be proportional to the unknown set, not the mempool. The
+/// direct evidence for that is the number of transactions actually
+/// probed, so count them.
+#[tokio::test]
+async fn the_block_walk_runs_first_and_shrinks_the_probe_set() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let probed = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&probed);
+
+    // A chain whose tip block at TEMPLATE_HEIGHT holds the template's
+    // transaction: the mined case, where every unknown left the mempool
+    // at once.
+    let mined_txid = tx_in_block(TEMPLATE_HEIGHT);
+    let app = Router::new().route(
+        "/",
+        post(move |Json(req): Json<Value>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                if let Some(items) = req.as_array() {
+                    counter.fetch_add(items.len(), Ordering::SeqCst);
+                    return batch_reply(items, false, -5);
+                }
+                match req.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "getmempoolinfo" => {
+                        Json(json!({"result": {"size": 94_211}, "error": null, "id": 1}))
+                    }
+                    "getbestblockhash" => Json(
+                        json!({"result": block_hash(TEMPLATE_HEIGHT), "error": null, "id": 1}),
+                    ),
+                    "getblock" => Json(json!({
+                        "result": {
+                            "hash": block_hash(TEMPLATE_HEIGHT),
+                            "height": TEMPLATE_HEIGHT,
+                            "tx": [display_hex(mined_txid)],
+                            "previousblockhash": Value::Null,
+                        },
+                        "error": null, "id": 1
+                    })),
+                    _ => Json(
+                        json!({"result": null, "error": {"code": -32601, "message": "no"}, "id": 1}),
+                    ),
+                }
+            }
+        }),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
@@ -252,9 +355,141 @@ async fn an_empty_fresh_mempool_is_refused_not_treated_as_an_answer() {
         std::time::Duration::from_secs(5),
     ));
 
-    let err = sc.ask(TEMPLATE_HEIGHT).await.expect_err(
-        "an empty mempool must be refused: scoring every unknown absent against it would \
-         uphold the rejection and record it as a confirmed detection",
+    let answer = sc
+        .ask(TEMPLATE_HEIGHT, &[mined_txid])
+        .await
+        .expect("lookup");
+
+    assert!(
+        answer.recent_block_txids.contains(&mined_txid),
+        "the block walk should have found it"
     );
+    assert_eq!(
+        probed.load(Ordering::SeqCst),
+        0,
+        "the block walk already resolved every unknown, so nothing should have been probed"
+    );
+}
+
+/// A degenerate mempool is refused BEFORE any probe is issued, not
+/// after. Assert the probe count, because an error raised after
+/// probing would pass a test that only checks the error.
+#[tokio::test]
+async fn an_empty_mempool_is_refused_before_any_probe_is_issued() {
+    let sc = spawn_router(Router::new().route("/", post(empty_mempool))).await;
+    let err = sc
+        .ask(TEMPLATE_HEIGHT, &probe_set())
+        .await
+        .expect_err("an empty mempool must be refused");
     assert_eq!(err.as_label(), "empty_mempool");
+}
+
+/// A probe that returns an unusable answer lands in `unadjudicated`,
+/// never in the proven-absent set.
+#[tokio::test]
+async fn an_unusable_probe_answer_is_unadjudicated_not_absent() {
+    async fn work_queue_exceeded(Json(req): Json<Value>) -> Json<Value> {
+        if let Some(items) = req.as_array() {
+            return batch_reply(items, false, -32603);
+        }
+        match req.get("method").and_then(Value::as_str).unwrap_or("") {
+            "getmempoolinfo" => Json(json!({"result": {"size": 94_211}, "error": null, "id": 1})),
+            "getbestblockhash" => {
+                Json(json!({"result": block_hash(TEMPLATE_HEIGHT - 1), "error": null, "id": 1}))
+            }
+            "getblock" => Json(json!({
+                "result": {
+                    "hash": block_hash(TEMPLATE_HEIGHT - 1),
+                    "height": TEMPLATE_HEIGHT - 1,
+                    "tx": [], "previousblockhash": Value::Null,
+                },
+                "error": null, "id": 1
+            })),
+            _ => Json(json!({"result": null, "error": {"code": -1, "message": "no"}, "id": 1})),
+        }
+    }
+
+    let sc = spawn_router(Router::new().route("/", post(work_queue_exceeded))).await;
+    let target = [0x7Eu8; 32];
+    let answer = sc.ask(TEMPLATE_HEIGHT, &[target]).await.expect("lookup");
+
+    assert!(
+        answer.unadjudicated.contains(&target),
+        "an unusable answer must be unadjudicated"
+    );
+    assert!(!answer.present_in_mempool.contains(&target));
+}
+
+/// Chunking must not drop or duplicate a transaction at the boundary.
+#[tokio::test]
+async fn chunk_boundaries_probe_every_txid_exactly_once() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for n in [
+        MEMPOOL_PROBE_CHUNK - 1,
+        MEMPOOL_PROBE_CHUNK,
+        MEMPOOL_PROBE_CHUNK + 1,
+        MEMPOOL_PROBE_CHUNK * 2,
+    ] {
+        let probed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&probed);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    if let Some(items) = req.as_array() {
+                        assert!(
+                            items.len() <= MEMPOOL_PROBE_CHUNK,
+                            "a chunk must never exceed the cap"
+                        );
+                        counter.fetch_add(items.len(), Ordering::SeqCst);
+                        return batch_reply(items, true, -5);
+                    }
+                    match req.get("method").and_then(Value::as_str).unwrap_or("") {
+                        "getmempoolinfo" => {
+                            Json(json!({"result": {"size": 94_211}, "error": null, "id": 1}))
+                        }
+                        "getbestblockhash" => Json(
+                            json!({"result": block_hash(TEMPLATE_HEIGHT - 1), "error": null, "id": 1}),
+                        ),
+                        "getblock" => Json(json!({
+                            "result": {
+                                "hash": block_hash(TEMPLATE_HEIGHT - 1),
+                                "height": TEMPLATE_HEIGHT - 1,
+                                "tx": [], "previousblockhash": Value::Null,
+                            },
+                            "error": null, "id": 1
+                        })),
+                        _ => Json(json!({"result": null, "error": {"code": -1, "message": "x"}, "id": 1})),
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let sc = SecondChance::new(BitcoindClient::new(
+            format!("http://{addr}/"),
+            "u".into(),
+            "p".into(),
+            std::time::Duration::from_secs(5),
+        ));
+
+        let unknown: Vec<[u8; 32]> = (0..n)
+            .map(|i| {
+                let mut t = [0u8; 32];
+                t[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                t
+            })
+            .collect();
+        let answer = sc.ask(TEMPLATE_HEIGHT, &unknown).await.expect("lookup");
+
+        assert_eq!(probed.load(Ordering::SeqCst), n, "n = {n}");
+        assert_eq!(answer.present_in_mempool.len(), n, "n = {n}");
+        assert!(answer.unadjudicated.is_empty(), "n = {n}");
+    }
 }

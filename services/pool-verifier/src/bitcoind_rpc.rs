@@ -473,6 +473,36 @@ mod tests {
         assert_eq!(params, vec![[display.to_string()]]);
     }
 
+    /// `probe_params` must preserve INPUT ORDER across multiple txids,
+    /// not merely convert each one's byte order correctly. The test
+    /// above cannot see a reordering: with a single input, `.rev()` on
+    /// the iterator is a no-op. Three distinct txids, checked in order,
+    /// is the direct evidence: a mutation that adds `.rev()` to
+    /// `probe_params`'s iterator would return them last-to-first, and
+    /// the assertion at index 0 would fail because `gather`'s
+    /// `chunk.iter().zip(probes)` depends on this exact alignment.
+    #[test]
+    fn probe_params_preserves_input_order_across_three_txids() {
+        fn display(t: [u8; 32]) -> String {
+            let mut d = t;
+            d.reverse();
+            hex::encode(d)
+        }
+
+        let first = [0x11u8; 32];
+        let mut second = [0x22u8; 32];
+        second[0] = 0xBB;
+        let mut third = [0x33u8; 32];
+        third[0] = 0xCC;
+
+        let params = probe_params(&[first, second, third]);
+        assert_eq!(
+            params,
+            vec![[display(first)], [display(second)], [display(third)]],
+            "each txid's display-order hex must land at its own input index, in order"
+        );
+    }
+
     #[test]
     fn parse_txid_hex_rejects_wrong_length() {
         assert!(parse_txid_hex("dead").is_err());

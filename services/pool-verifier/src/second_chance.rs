@@ -32,7 +32,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::bitcoind_rpc::{BitcoindClient, RpcError};
+use crate::bitcoind_rpc::{BitcoindClient, MempoolProbe, RpcError};
 
 /// Wall-clock budget for the whole second-chance lookup, mempool
 /// fetch and block walk together.
@@ -63,6 +63,16 @@ pub const SECOND_CHANCE_DEADLINE: Duration = Duration::from_secs(2);
 /// long, and reaching it is recorded on the verdict rather than
 /// silently truncating the search.
 pub const MAX_RECENT_BLOCKS_SCANNED: u32 = 6;
+
+/// Transactions probed per JSON-RPC batch.
+///
+/// Derived, not picked. At roughly 600 bytes per `getmempoolentry`
+/// reply a chunk response stays near 150 KB; the worst realistic
+/// template (~3000 unknowns) bounds to 12 sequential round trips; and
+/// every chunk boundary is a point where the deadline is re-checked.
+/// A `const` and not a `[policy]` key: Invariant 4 does not want a knob
+/// with one caller and one value.
+pub const MEMPOOL_PROBE_CHUNK: usize = 250;
 
 /// Cap on still-absent txids recorded in the durable evidence.
 ///
@@ -288,6 +298,12 @@ pub enum SecondChanceError {
     /// unadjudicated rather than as a confirmed detection.
     #[error("block walk incomplete, so the mined case could not be ruled out: {0}")]
     BlockWalkIncomplete(String),
+
+    /// Some transactions could not be probed, and the decision would
+    /// otherwise have been `upheld`. Absence from an incomplete probe
+    /// set is not evidence, so the verdict is reported unadjudicated.
+    #[error("mempool probe incomplete, so absence could not be established: {0}")]
+    MempoolProbeIncomplete(String),
 }
 
 impl SecondChanceError {
@@ -300,6 +316,7 @@ impl SecondChanceError {
             SecondChanceError::Deadline => "deadline",
             SecondChanceError::EmptyMempool => "empty_mempool",
             SecondChanceError::BlockWalkIncomplete(_) => "block_walk_incomplete",
+            SecondChanceError::MempoolProbeIncomplete(_) => "mempool_probe_incomplete",
         }
     }
 }
@@ -535,7 +552,7 @@ impl From<&SecondChanceOutcome> for MempoolAdjudicationRecord {
             } => Self {
                 outcome: label,
                 // The first-pass counts are real and are recorded. The
-                // three adjudication counts below stay zero because
+                // four adjudication counts below stay zero because
                 // nothing was adjudicated, which `outcome` states
                 // outright so they cannot be read as "bitcoind knew
                 // none of them".
@@ -575,63 +592,118 @@ impl SecondChance {
         Self { client }
     }
 
-    /// Gather bitcoind's answer for a template building block
-    /// `template_height`, within [`SECOND_CHANCE_DEADLINE`].
+    /// Ask bitcoind about the specific transactions the polled view did
+    /// not contain, within [`SECOND_CHANCE_DEADLINE`].
     ///
-    /// The deadline is enforced here rather than at the call site so
-    /// no future caller can forget it and put the upstream verdict
-    /// budget at risk.
+    /// Cost is proportional to `unknown.len()`, not to mempool size.
+    /// The whole-mempool fetch this replaced took 858 ms against 94,000
+    /// transactions and exceeded its 2 second budget at 500,000, which
+    /// meant the mechanism degraded exactly during the fee spikes that
+    /// produce the most Class M rejections.
     ///
     /// # Errors
     ///
     /// [`SecondChanceError::Rpc`] when bitcoind answered badly,
-    /// [`SecondChanceError::Deadline`] when it did not answer in time.
-    /// Either way the caller must let the original rejection stand: a
-    /// lookup that could not run is not evidence of absence, and this
-    /// module exists because that exact distinction was lost once
-    /// already, when silently failing `bitcoin-cli` calls read as
-    /// "transaction genuinely absent" for two rounds of investigation.
-    pub async fn ask(&self, template_height: u32) -> Result<BitcoindAnswer, SecondChanceError> {
-        tokio::time::timeout(SECOND_CHANCE_DEADLINE, self.gather(template_height))
-            .await
-            .map_err(|_| SecondChanceError::Deadline)?
+    /// [`SecondChanceError::Deadline`] when it did not answer in time,
+    /// [`SecondChanceError::EmptyMempool`] when its mempool is too
+    /// small to establish anything. Either way the caller must let the
+    /// original rejection stand: a lookup that could not run is not
+    /// evidence of absence, and this module exists because that exact
+    /// distinction was lost once already, when silently failing
+    /// `bitcoin-cli` calls read as "transaction genuinely absent" for
+    /// two rounds of investigation.
+    pub async fn ask(
+        &self,
+        template_height: u32,
+        unknown: &[[u8; 32]],
+    ) -> Result<BitcoindAnswer, SecondChanceError> {
+        tokio::time::timeout(
+            SECOND_CHANCE_DEADLINE,
+            self.gather(template_height, unknown),
+        )
+        .await
+        .map_err(|_| SecondChanceError::Deadline)?
     }
 
-    async fn gather(&self, template_height: u32) -> Result<BitcoindAnswer, SecondChanceError> {
-        let present_in_mempool: HashSet<[u8; 32]> =
-            self.client.get_raw_mempool().await?.into_iter().collect();
-
+    async fn gather(
+        &self,
+        template_height: u32,
+        unknown: &[[u8; 32]],
+    ) -> Result<BitcoindAnswer, SecondChanceError> {
+        // 1. Degenerate-node guard, BEFORE any probe.
+        //
         // The same floor the view install path applies
         // (`mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE`), for the same
-        // reason and on the same evidence grounds. A successful but
-        // empty `getrawmempool` carries exactly the information content
-        // of an RPC error: it cannot tell us that any transaction is
-        // absent. Scoring every unknown "absent" against it would
-        // uphold the rejection and record it as an adjudicated
-        // detection candidate. Refusing it here means the caller emits
-        // `lookup_failed` instead, which upholds the rejection just the
-        // same but says truthfully that nobody adjudicated it.
-        if present_in_mempool.len() < crate::mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE {
+        // reason. A bitcoind still loading `mempool.dat`, on the wrong
+        // chain, or freshly restarted answers "not in mempool" for
+        // EVERY txid, which is byte-identical to "it holds none of
+        // them". Without this the targeted-probe change would silently
+        // delete the guard that the whole-mempool fetch was carrying,
+        // and every rejection in that window would be recorded as a
+        // confirmed detection.
+        let info = self.client.get_mempool_info().await?;
+        if info.size < crate::mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE {
             warn!(
-                size = present_in_mempool.len(),
+                size = info.size,
                 min = crate::mempool_view::MIN_INSTALLABLE_MEMPOOL_SIZE,
-                "second chance: getrawmempool succeeded but returned an empty set; refusing to \
-                 adjudicate against it. Every unknown transaction would score absent and the \
-                 rejection would be recorded as a confirmed detection"
+                "second chance: bitcoind's mempool is empty or too small to establish absence; \
+                 refusing to adjudicate against it. Every unknown transaction would probe as \
+                 absent and the rejection would be recorded as a confirmed detection"
             );
             return Err(SecondChanceError::EmptyMempool);
         }
 
+        // 2. Block walk FIRST. It is O(blocks) and it resolves the
+        // worst case for the probe set: the mined case, where a block
+        // arrives between template construction and this check and the
+        // template's entire transaction set leaves the mempool at once.
+        // Subtracting what it found keeps the probe set small exactly
+        // when it would otherwise be largest.
         let coverage = self.recent_blocks(template_height).await;
         let block_walk_shortfall = coverage.shortfall();
         let (recent_block_txids, blocks_scanned, tip_height, block_walk_truncated) =
             coverage.parts();
 
+        // 3. Probe only what the walk did not resolve. Deduplicated,
+        // because a duplicated txid in the template would otherwise be
+        // paid for twice.
+        let to_probe: Vec<[u8; 32]> = unknown
+            .iter()
+            .copied()
+            .filter(|t| !recent_block_txids.contains(t))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut present_in_mempool = HashSet::new();
+        let mut unadjudicated = HashSet::new();
+        for chunk in to_probe.chunks(MEMPOOL_PROBE_CHUNK) {
+            // Sequential, not concurrent. Core's rpcworkqueue is shared
+            // with the polling task, and inducing "Work queue depth
+            // exceeded" is the documented trigger for the block walk
+            // failing. This mechanism must not create the pressure that
+            // breaks its own sibling.
+            let probes = self.client.probe_mempool(chunk).await?;
+            // `probe_mempool` returns a Vec index-aligned to its input
+            // by construction, resolved by JSON-RPC id rather than by
+            // position, so this zip is safe.
+            for (txid, probe) in chunk.iter().zip(probes) {
+                match probe {
+                    MempoolProbe::Present => {
+                        present_in_mempool.insert(*txid);
+                    }
+                    MempoolProbe::Absent => {}
+                    MempoolProbe::Unadjudicated { reason } => {
+                        warn!(reason = %reason, "second chance: a mempool probe gave no usable answer");
+                        unadjudicated.insert(*txid);
+                    }
+                }
+            }
+        }
+
         Ok(BitcoindAnswer {
             present_in_mempool,
-            // Task 4 replaces the whole-mempool fetch with targeted
-            // probes, which is what can actually produce this.
-            unadjudicated: HashSet::new(),
+            unadjudicated,
             recent_block_txids,
             blocks_scanned,
             block_walk_truncated,
