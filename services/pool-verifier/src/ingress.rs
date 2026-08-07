@@ -65,6 +65,33 @@ async fn run_second_chance(
                 // that a complete walk would contradict.
                 return Some(SecondChanceOutcome::Withdrawn(adjudication));
             }
+            // An unadjudicated probe blocks an `upheld` for the same
+            // reason an incomplete block walk does. `upheld` asserts
+            // bitcoind held these transactions in neither its mempool
+            // nor a recent block, and a transaction nobody could ask
+            // about has established neither half of that. The rejection
+            // still stands; only the evidence label changes.
+            if adjudication.unadjudicated > 0 {
+                warn!(
+                    height = template_height,
+                    unknown_before,
+                    total,
+                    still_absent = adjudication.still_absent,
+                    unadjudicated = adjudication.unadjudicated,
+                    "PB-40 second chance could not establish absence for every unknown; the \
+                     Class M rejection stands UNADJUDICATED rather than as a confirmed detection"
+                );
+                let reason = SecondChanceError::MempoolProbeIncomplete(format!(
+                    "{} of {unknown_before} unknown transactions had no usable probe answer",
+                    adjudication.unadjudicated
+                ));
+                return Some(SecondChanceOutcome::LookupFailed {
+                    total,
+                    unknown_before,
+                    kind: reason.as_label().to_string(),
+                    reason: reason.to_string(),
+                });
+            }
             // UPHELD is not safe under partial coverage. It asserts
             // bitcoind held the transactions in neither its mempool nor
             // any recent block, and the runbook reads it as a genuine
