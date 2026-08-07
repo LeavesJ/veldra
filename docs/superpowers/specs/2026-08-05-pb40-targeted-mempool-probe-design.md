@@ -140,7 +140,7 @@ because it is a direct per-transaction statement rather than an inference.
 has NOT been verified against a real bitcoind from the development environment.
 The design therefore treats only that exact code as absent and every unexpected
 code as `Unadjudicated`. If the code is wrong, every probe becomes
-`Unadjudicated`, which forces `lookup_failed` — loud and visible in
+`Unadjudicated`, which forces `lookup_failed`, loud and visible in
 `verifier_phase2_second_chance_total`. It cannot degrade into "all absent",
 which would fabricate detections. Verify the code against the node during
 rollout and record the result; do not treat the belief as established.
@@ -152,9 +152,9 @@ Generalising the rule from `7d891bc` rather than inventing a second one.
 Two counts, kept **disjoint** so the durable record cannot be double-counted by
 a reviewer:
 
-- `still_absent` — probed and definitively **not** in the mempool, and not
+- `still_absent`: probed and definitively **not** in the mempool, and not
   mined. Proven absent.
-- `unadjudicated` — no usable answer. Proven nothing.
+- `unadjudicated`: no usable answer. Proven nothing.
 
 The decision uses their sum, named separately so the two ideas never get
 conflated in code or in the record:

@@ -209,8 +209,9 @@ echo "  sc=upheld        => bitcoind knew none of them AND the block walk comple
 echo "                      genuine detection candidate. Corroborate against the pool"
 echo "                      block-found feed at this height."
 echo "  sc=lookup_failed => the lookup could not be completed: UNADJUDICATED, count"
-echo "                      separately, never as a detection. sc_error says which:"
-echo "                      rpc_error / deadline / empty_mempool / block_walk_incomplete."
+echo "                      separately, never as a detection. sc_error_kind says which:"
+echo "                      rpc_error / deadline / mempool_loading / empty_mempool /"
+echo "                      block_walk_incomplete / mempool_probe_incomplete."
 echo "  sc missing       => verdict predates PB-40; it cannot be adjudicated at all."
 echo "  sc_walk_shortfall non-null => the mined case was not fully ruled out; sc_mined"
 echo "                      is a FLOOR, not a count. Check sc_blocks_scanned against"
@@ -251,6 +252,7 @@ jq -c \
        sc_tip_height:     (.mempool_adjudication.tip_height // null),
        sc_walk_shortfall: (.mempool_adjudication.block_walk_shortfall // null),
        sc_error:          (.mempool_adjudication.lookup_error // null),
+       sc_error_kind:     (.mempool_adjudication.lookup_error_kind // null),
        detail:    .reason_detail
      }' \
   "$VERDICT_LOG" \

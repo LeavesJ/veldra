@@ -10,7 +10,7 @@
 |---|---|---|
 | Pre v2.0 launch announcement | Must run | One full week before the announcement date |
 | `[policy.mempool] tolerance_pct` default change | Must run | Before the change ships in a release |
-| Material change to the Class M code path (`check_invariant_shield_with_mempool`, `mempool_view::evaluate`, `bitcoind_rpc::get_raw_mempool`) | Must run | Before the next launch announcement |
+| Material change to the Class M code path (`check_invariant_shield_with_mempool`, `mempool_view::evaluate`, `bitcoind_rpc::get_raw_mempool`, `second_chance.rs`, `bitcoind_rpc::probe_mempool`) | Must run | Before the next launch announcement |
 | Operator deploys to a different bitcoind release (e.g. Core 27 → 28) | Should run | Within two weeks of the deploy |
 | Routine quarterly health check | May run | Anytime, opportunistic |
 
@@ -44,7 +44,7 @@ If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak be
   `agreed`). `phase2_degraded_total` likewise increments only when a
   template reaches Class M against a Degraded view. Do not mix baselines
   taken on a pre-PB-18 binary with deltas from a PB-18 binary.
-- A pool-verifier instance running in **`VELDRA_MODE=observe`**, NOT `shadow`. Observe reports verdicts without enforcing, which is what this soak needs, and it persists them to disk. **`shadow` does NOT persist verdicts at all** (`DeployMode::persist_verdicts` is `Observe | Inline`, `services/reservegrid-common/src/mode.rs:46`), so `append_verdict_to_disk` returns early and `data/verdicts.log` is never written. Under shadow the entire PB-40 adjudication record — the authoritative and only durable evidence this soak's acceptance criterion reads — silently does not exist. `docker-compose.setup-b.yml` already defaults to `observe`; do not flip it to shadow for the soak despite this runbook's historical name.
+- A pool-verifier instance running in **`VELDRA_MODE=observe`**, NOT `shadow`. Observe reports verdicts without enforcing, which is what this soak needs, and it persists them to disk. **`shadow` does NOT persist verdicts at all** (`DeployMode::persist_verdicts` is `Observe | Inline`, `services/reservegrid-common/src/mode.rs:46`), so `append_verdict_to_disk` returns early and `data/verdicts.log` is never written. Under shadow the entire PB-40 adjudication record, the authoritative and only durable evidence this soak's acceptance criterion reads, silently does not exist. `docker-compose.setup-b.yml` already defaults to `observe`; do not flip it to shadow for the soak despite this runbook's historical name.
 - An operator-controlled bitcoind reachable from the verifier over JSON-RPC. Mainnet, not regtest.
 - `[policy.mempool] enforce = true` plus `tolerance_pct = 4.0` plus `poll_interval_secs = 10` plus `max_stale_secs = 60` in the verifier's `policy.toml`.
 - `VELDRA_BITCOIND_RPC_USER` plus `VELDRA_BITCOIND_RPC_PASS` set in the verifier's environment.
@@ -63,6 +63,25 @@ If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak be
      "$VELDRA_BITCOIND_RPC_URL" | jq '.result | length'
    ```
    Expect a non-zero integer within a few hundred ms. If the call hangs, fix the bitcoind path before T+0.
+
+   Then run the five-second check this runbook has never written down but the
+   design spec's Risk 1 requires: `MEMPOOL_MISSING_ENTRY_CODE` in `bitcoind_rpc.rs`
+   assumes Bitcoin Core answers `getmempoolentry` with error code `-5` for a txid
+   it does not hold, and that assumption is external knowledge, never verified
+   against a live node from the development environment. Verify it against THIS
+   node before the soak starts:
+   ```sh
+   ZERO_TXID=$(printf '0%.0s' {1..64})
+   curl --user "$VELDRA_BITCOIND_RPC_USER:$VELDRA_BITCOIND_RPC_PASS" \
+     -d "{\"jsonrpc\":\"1.0\",\"id\":\"soak\",\"method\":\"getmempoolentry\",\"params\":[\"$ZERO_TXID\"]}" \
+     -H 'content-type: application/json' \
+     "$VELDRA_BITCOIND_RPC_URL" | jq '.error.code'
+   ```
+   Expect exactly `-5`. If the code differs, every `getmempoolentry` probe in the
+   second-chance lookup resolves `Unadjudicated` instead of `Absent`, every such
+   lookup degrades to `lookup_failed`, and the week-long soak produces no
+   adjudicable evidence at all. This check catches that in five seconds instead
+   of at T+7.
 3. Baseline the four Phase 2 counters and gauges. Run:
    ```sh
    scripts/phase2-baseline.sh
@@ -91,12 +110,13 @@ Three checks at days 1, 3, 5 plus the wrap-up at day 7. Each spot check follows 
    ```
    The script reads `./data/phase2-baseline.json`, fetches current values from `/metrics`, prints the five counter deltas plus the two live gauges, and dumps every Class M `v2_invariant_mempool_tolerance_exceeded` rejection from `./data/verdicts.log` (last 50 by default; bump with `--max-rejections N`). Output is human readable; pipe to a file so the DEVLOG entry inherits the same shape across all four spot checks. The script also flags a `delta_degraded > 0` warning so an operator-environment fault during the soak is impossible to miss.
 2. For each rejection, read the `mempool_adjudication` object on its verdict record in `./data/verdicts.log`. **This is the authoritative evidence and it is the only evidence that survives.** Do not re-query the txids with `bitcoin-cli`; see the warning below. Three outcomes, keyed off `outcome`:
-   - **`upheld`:** bitcoind was asked at rejection time, the block walk COMPLETED, and it held the transactions in neither its mempool nor any block at or above the template's height. This is a genuine candidate detection. Cross-reference against the pool's block-found feed for corroboration and log to DEVLOG with the `still_absent` count and `still_absent_sample`. An `upheld` can only be emitted when the walk was complete; an incomplete one is reported `lookup_failed` instead, so this label never over-claims.
-   - **`lookup_failed`:** the lookup could not be completed, so this rejection is **UNADJUDICATED**. It is not a false positive and it is not a detection. Count it separately, read `lookup_error_kind`, and treat a nonzero total as a soak-validity problem (see T+7 step 4), never as a pass. Five kinds, all meaning "nobody established anything":
-     - `rpc_error` — bitcoind answered badly. Fix the node.
+   - **`upheld`:** bitcoind was asked at rejection time, the block walk COMPLETED, and it held the transactions in neither its mempool nor any block at or above the template's height. **Topology decides what this means: on a shared-bitcoind deployment (Setup B, where the template source and the verifier read the same node) an `upheld` is a false positive and counts toward `FP_total`; only on a deployment whose verifier bitcoind is independent of the template source is it a genuine candidate detection.** Cross-reference against the pool's block-found feed for corroboration and log to DEVLOG with the `still_absent` count and `still_absent_sample`. An `upheld` can only be emitted when the walk was complete; an incomplete one is reported `lookup_failed` instead, so this label never over-claims.
+   - **`lookup_failed`:** the lookup could not be completed, so this rejection is **UNADJUDICATED**. It is not a false positive and it is not a detection. Count it separately, read `lookup_error_kind`, and treat a nonzero total as a soak-validity problem (see T+7 step 4), never as a pass. Six kinds, all meaning "nobody established anything":
+     - `rpc_error`: bitcoind answered badly. Fix the node.
      - `deadline`: bitcoind was too slow for the 2s budget. The lookup's cost is proportional to the number of unknown transactions, not to mempool size, so a run of these means either a very large unknown set or a slow node, NOT congestion.
-     - `empty_mempool` — `getrawmempool` returned an empty set, which cannot establish that anything is absent.
-     - `block_walk_incomplete` — the mempool half succeeded but the block walk errored or truncated, so the mined case could not be ruled out. Read `block_walk_shortfall`.
+     - `mempool_loading`: `getmempoolinfo` reported `loaded: false`. bitcoind is still replaying `mempool.dat`; wait for it to finish and do not restart it again.
+     - `empty_mempool`: `getmempoolinfo` reported a mempool too small to establish that anything is absent.
+     - `block_walk_incomplete`: the mempool half succeeded but the block walk errored or truncated, so the mined case could not be ruled out. Read `block_walk_shortfall`.
      - `mempool_probe_incomplete`: bitcoind was reachable but one or more transactions got no usable answer from `getmempoolentry`, so absence could not be established for all of them. Read `lookup_error` for the count.
    - **`block_walk_shortfall` on any record:** `mined` is a FLOOR, not a count, and `still_absent` may include transactions that were in fact mined. Check `blocks_scanned` against the blocks the walk owed, which is `tip_height - height + 1`.
    - **`withdrawn` never appears here.** A rejection the second-chance lookup overturned is not emitted as a rejection at all; it lands as an accepted verdict with the adjudication attached, and it is counted by `verifier_phase2_second_chance_total{outcome="withdrawn"}`. A nonzero withdrawn count is the mempool-view staleness of PB-40 being caught in the act. It is expected and healthy, not a failure.
@@ -111,7 +131,7 @@ Three checks at days 1, 3, 5 plus the wrap-up at day 7. Each spot check follows 
 ## T+7 Wrap-Up
 
 1. Final counter snapshot. Run `scripts/phase2-spot-check.sh | tee -a docs/DEVLOG.md.spotchecks` one more time at T+7. The deltas at this run cover the full soak window.
-2. `FP_total` is `delta_rejected` where the verdict's `mempool_adjudication.outcome` is `upheld`, corroborated against the block-found feed. It is read from the durable verdict records and the counters, NOT hand-counted from a fresh `bitcoin-cli` sweep.
+2. `FP_total` is `delta_rejected` where the verdict's `mempool_adjudication.outcome` is `upheld` (see the topology conditional under the `upheld` definition in the T+1/T+3/T+5 section above: on a shared-bitcoind deployment this is a false positive by construction, so the two definitions cannot drift apart), corroborated against the block-found feed. It is read from the durable verdict records and the counters, NOT hand-counted from a fresh `bitcoin-cli` sweep.
 3. Compute the false-positive rate against total Class M checks:
    ```
    total_classM_checks = delta_agreed + delta_recovered + delta_rejected + delta_stale + delta_skipped
