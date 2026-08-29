@@ -95,6 +95,12 @@ docs/SESSION_HANDOFF.md
 # private-docs pattern in scripts/gate.sh keeps them from being re-tracked.
 docs/superpowers/
 
+# Felix project marker. Names a LOCAL Felix project in ~/Documents/Felix;
+# meaningless to anyone cloning this public repo, and tracking it would be
+# another change to a public tracked set. Consistent with standing decision 1
+# keeping scripts/gate.sh untracked.
+.felix
+
 # Private assets and design drafts (local only)
 ReserveGrid-OS-Founders-Guide.md
 ReserveGrid-OS-Founders-Guide.pdf
