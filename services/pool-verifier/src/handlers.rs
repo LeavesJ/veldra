@@ -287,7 +287,7 @@ pub(crate) async fn get_verdicts_csv(
     let start = log.len().saturating_sub(limit);
 
     let mut out = String::new();
-    out.push_str("log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,tier_source,min_avg_fee_used,avg_fee_sats_per_tx,reason_code,reason_detail,reason,timestamp,template_weight,total_sigops,coinbase_sigops,created_at_unix_ms,safety_warnings\n");
+    out.push_str("log_id,template_id,height,total_fees,tx_count,accepted,fee_tier,tier_source,min_avg_fee_used,avg_fee_sats_per_tx,reason_code,reason_detail,reason,timestamp,template_weight,total_sigops,coinbase_sigops,created_at_unix_ms,safety_warnings,second_chance,second_chance_still_absent\n");
 
     for v in log.iter().skip(start) {
         let reason_code = v
@@ -309,10 +309,19 @@ pub(crate) async fn get_verdicts_csv(
             .map(|t| t.to_string())
             .unwrap_or_default();
         let sw = v.safety_warnings.join(";");
+        // PB-40: without these two columns a reviewer tallying
+        // rejections from CSV would see no adjudication at all and
+        // count every upheld or unadjudicated rejection as confirmed.
+        // The NDJSON verdict log carries the full record including the
+        // still-absent txids; these are the two fields a tally needs.
+        let (sc, sc_absent) = v.mempool_adjudication.as_ref().map_or_else(
+            || (String::new(), String::new()),
+            |a| (a.outcome.clone(), a.still_absent.to_string()),
+        );
 
         let _ = writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},\"{}\",\"{}\",\"{}\",{},{},{},{},{},\"{}\"",
+            "{},{},{},{},{},{},{},{},{},{},\"{}\",\"{}\",\"{}\",{},{},{},{},{},\"{}\",{},{}",
             v.log_id,
             v.template_id,
             v.height,
@@ -332,6 +341,8 @@ pub(crate) async fn get_verdicts_csv(
             cs,
             ca,
             sw,
+            sc,
+            sc_absent,
         );
     }
 

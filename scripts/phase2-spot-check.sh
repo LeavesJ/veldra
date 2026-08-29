@@ -69,13 +69,20 @@ fi
 METRICS_TEXT="$(curl --silent --show-error --fail --max-time 10 "$METRICS_URL")"
 
 parse_counter_with_label() {
-  local name="$1"
-  local label="$2"
+  parse_counter_by_label_key result "$1" "$2"
+}
+
+# PB-40's verifier_phase2_second_chance_total keys on `outcome`, not
+# `result`, so the label name is a parameter rather than baked in.
+parse_counter_by_label_key() {
+  local key="$1"
+  local name="$2"
+  local label="$3"
   echo "$METRICS_TEXT" \
-    | awk -v name="$name" -v label="$label" '
+    | awk -v name="$name" -v key="$key" -v label="$label" '
         $0 ~ /^#/ { next }
-        index($0, name "{result=\"" label "\"}") == 1 ||
-        index($0, name "_total{result=\"" label "\"}") == 1 {
+        index($0, name "{" key "=\"" label "\"}") == 1 ||
+        index($0, name "_total{" key "=\"" label "\"}") == 1 {
           print $NF; exit
         }
       '
@@ -95,6 +102,10 @@ CUR_AGREED="$(parse_counter_with_label verifier_phase2_checks_total agreed)"
 CUR_REJECTED="$(parse_counter_with_label verifier_phase2_checks_total rejected)"
 CUR_SKIPPED="$(parse_counter_with_label verifier_phase2_checks_total skipped)"
 CUR_STALE="$(parse_counter_with_label verifier_phase2_checks_total stale)"
+CUR_RECOVERED="$(parse_counter_with_label verifier_phase2_checks_total recovered)"
+CUR_SC_WITHDRAWN="$(parse_counter_by_label_key outcome verifier_phase2_second_chance_total withdrawn)"
+CUR_SC_UPHELD="$(parse_counter_by_label_key outcome verifier_phase2_second_chance_total upheld)"
+CUR_SC_FAILED="$(parse_counter_by_label_key outcome verifier_phase2_second_chance_total lookup_failed)"
 CUR_DEGRADED="$(parse_counter verifier_phase2_degraded_total)"
 CUR_VIEW_AGE="$(parse_counter verifier_mempool_view_age_seconds)"
 CUR_VIEW_SIZE="$(parse_counter verifier_mempool_view_size)"
@@ -103,6 +114,10 @@ CUR_AGREED="${CUR_AGREED:-0}"
 CUR_REJECTED="${CUR_REJECTED:-0}"
 CUR_SKIPPED="${CUR_SKIPPED:-0}"
 CUR_STALE="${CUR_STALE:-0}"
+CUR_RECOVERED="${CUR_RECOVERED:-0}"
+CUR_SC_WITHDRAWN="${CUR_SC_WITHDRAWN:-0}"
+CUR_SC_UPHELD="${CUR_SC_UPHELD:-0}"
+CUR_SC_FAILED="${CUR_SC_FAILED:-0}"
 CUR_DEGRADED="${CUR_DEGRADED:-0}"
 CUR_VIEW_AGE="${CUR_VIEW_AGE:-0}"
 CUR_VIEW_SIZE="${CUR_VIEW_SIZE:-0}"
@@ -112,6 +127,13 @@ BASE_REJECTED="$(jq -r '.counters.verifier_phase2_checks_total_rejected' "$BASEL
 BASE_SKIPPED="$(jq -r '.counters.verifier_phase2_checks_total_skipped' "$BASELINE_PATH")"
 BASE_STALE="$(jq -r '.counters.verifier_phase2_checks_total_stale' "$BASELINE_PATH")"
 BASE_DEGRADED="$(jq -r '.counters.verifier_phase2_degraded_total' "$BASELINE_PATH")"
+# `// 0` so a baseline captured before PB-40 still parses: those files
+# have no recovered or second-chance keys, and jq would yield "null"
+# into the arithmetic below.
+BASE_RECOVERED="$(jq -r '.counters.verifier_phase2_checks_total_recovered // 0' "$BASELINE_PATH")"
+BASE_SC_WITHDRAWN="$(jq -r '.counters.verifier_phase2_second_chance_total_withdrawn // 0' "$BASELINE_PATH")"
+BASE_SC_UPHELD="$(jq -r '.counters.verifier_phase2_second_chance_total_upheld // 0' "$BASELINE_PATH")"
+BASE_SC_FAILED="$(jq -r '.counters.verifier_phase2_second_chance_total_lookup_failed // 0' "$BASELINE_PATH")"
 BASE_AT="$(jq -r '.captured_at' "$BASELINE_PATH")"
 
 DELTA_AGREED=$((CUR_AGREED - BASE_AGREED))
@@ -119,7 +141,11 @@ DELTA_REJECTED=$((CUR_REJECTED - BASE_REJECTED))
 DELTA_SKIPPED=$((CUR_SKIPPED - BASE_SKIPPED))
 DELTA_STALE=$((CUR_STALE - BASE_STALE))
 DELTA_DEGRADED=$((CUR_DEGRADED - BASE_DEGRADED))
-TOTAL_CLASSM=$((DELTA_AGREED + DELTA_REJECTED + DELTA_SKIPPED + DELTA_STALE))
+DELTA_RECOVERED=$((CUR_RECOVERED - BASE_RECOVERED))
+DELTA_SC_WITHDRAWN=$((CUR_SC_WITHDRAWN - BASE_SC_WITHDRAWN))
+DELTA_SC_UPHELD=$((CUR_SC_UPHELD - BASE_SC_UPHELD))
+DELTA_SC_FAILED=$((CUR_SC_FAILED - BASE_SC_FAILED))
+TOTAL_CLASSM=$((DELTA_AGREED + DELTA_REJECTED + DELTA_RECOVERED + DELTA_SKIPPED + DELTA_STALE))
 
 NOW="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
@@ -132,7 +158,13 @@ printf "  agreed    %10d  (current %d)\n" "$DELTA_AGREED"   "$CUR_AGREED"
 printf "  rejected  %10d  (current %d)\n" "$DELTA_REJECTED" "$CUR_REJECTED"
 printf "  skipped   %10d  (current %d)\n" "$DELTA_SKIPPED"  "$CUR_SKIPPED"
 printf "  stale     %10d  (current %d)\n" "$DELTA_STALE"    "$CUR_STALE"
+printf "  recovered %10d  (current %d)\n" "$DELTA_RECOVERED" "$CUR_RECOVERED"
 printf "  total     %10d\n"               "$TOTAL_CLASSM"
+echo
+echo "PB-40 second-chance lookups (delta since baseline):"
+printf "  withdrawn     %10d  false positives caught in the act, no rejection emitted\n" "$DELTA_SC_WITHDRAWN"
+printf "  upheld        %10d  adjudicated rejections, the only detection candidates\n"   "$DELTA_SC_UPHELD"
+printf "  lookup_failed %10d  UNADJUDICATED, evidence in neither direction\n"            "$DELTA_SC_FAILED"
 echo
 printf "  degraded  %10d  (current %d)\n" "$DELTA_DEGRADED" "$CUR_DEGRADED"
 printf "  view_age  %10ss\n"              "$CUR_VIEW_AGE"
@@ -146,25 +178,62 @@ if (( DELTA_DEGRADED > 0 )); then
   echo "  the bitcoind side and consider restarting the soak from T+0."
 fi
 
+if (( DELTA_SC_FAILED > 0 )); then
+  echo
+  echo "WARNING: $DELTA_SC_FAILED Class M rejection(s) could not be adjudicated because"
+  echo "  bitcoind was unreachable at rejection time. These are evidence in NEITHER"
+  echo "  direction and must not be scored as passes. Check the verdict records'"
+  echo "  mempool_adjudication.lookup_error, fix the cause, and re-run the window."
+fi
+
 if (( DELTA_REJECTED == 0 )); then
   echo
   echo "Zero Class M rejections in the window so far. PASS condition holds."
+  if (( DELTA_SC_WITHDRAWN > 0 )); then
+    echo "  ($DELTA_SC_WITHDRAWN stale-view false positive(s) were withdrawn before"
+    echo "   becoming rejections. Expected and healthy: that is PB-40 working.)"
+  fi
   exit 0
 fi
 
 echo
 echo "═══ Candidate false positives (last $MAX_REJECTIONS Class M rejections) ═══"
 echo
-echo "Each row below is a Class M rejection. Cross-reference each against the"
-echo "pool's block-found feed for the same block_height per the runbook FP review:"
-echo "  pool mined the block AT this height with same coinbase => CONFIRMED FP, count it"
-echo "  different pool mined that height                      => ambiguous, do NOT count"
-echo "  no block at that height yet                           => stale template, do NOT count"
+echo "Each row is a Class M rejection with the bitcoind answer captured AT rejection"
+echo "time (PB-40). Read the sc_* fields; do NOT re-query these txids with bitcoin-cli."
+echo "The mempool tail churns within minutes, so a later query reports transactions"
+echo "absent whether or not they were ever real, and the review then scores every"
+echo "rejection a true positive. That is the wrong answer, confidently."
+echo
+echo "  sc=upheld        => bitcoind knew none of them AND the block walk completed:"
+echo "                      genuine detection candidate. Corroborate against the pool"
+echo "                      block-found feed at this height."
+echo "  sc=lookup_failed => the lookup could not be completed: UNADJUDICATED, count"
+echo "                      separately, never as a detection. sc_error_kind says which:"
+echo "                      rpc_error / deadline / mempool_loading / empty_mempool /"
+echo "                      block_walk_incomplete / mempool_probe_incomplete."
+echo "  sc missing       => verdict predates PB-40; it cannot be adjudicated at all."
+echo "  sc_walk_shortfall non-null => the mined case was not fully ruled out; sc_mined"
+echo "                      is a FLOOR, not a count. Check sc_blocks_scanned against"
+echo "                      (sc_tip_height - height + 1), the number of blocks owed."
 echo
 
 if [[ ! -f "$VERDICT_LOG" ]]; then
-  echo "  (verdict log not found at $VERDICT_LOG; check the runbook's verdict log path)"
-  exit 0
+  # Non-zero on purpose. Rejections are climbing and the durable record
+  # that is supposed to adjudicate them does not exist, so this run
+  # produced NO evidence. Exiting 0 here would let a soak with zero
+  # adjudicable records read as a clean spot check, which is the exact
+  # false-pass shape PB-40 exists to prevent. The usual cause is
+  # VELDRA_MODE=shadow, which does not persist verdicts at all
+  # (DeployMode::persist_verdicts is Observe|Inline), or a verdict log
+  # the verifier's uid cannot write.
+  echo
+  echo "ERROR: $DELTA_REJECTED Class M rejection(s) in this window and NO verdict log at"
+  echo "  $VERDICT_LOG. This spot check produced no adjudicable evidence."
+  echo "  Check VELDRA_MODE (shadow does NOT persist verdicts; use observe) and that the"
+  echo "  log path is writable by the verifier's uid. The verifier logs"
+  echo "  'verdict durability write FAILED' on every failed append."
+  exit 1
 fi
 
 jq -c \
@@ -174,6 +243,16 @@ jq -c \
        ts:        (.timestamp // .ts // null),
        id:        .id,
        height:    (.block_height // .height // null),
+       sc:        (.mempool_adjudication.outcome // "missing"),
+       sc_unknown_before: (.mempool_adjudication.unknown_before // null),
+       sc_in_mempool:     (.mempool_adjudication.in_mempool // null),
+       sc_mined:          (.mempool_adjudication.mined // null),
+       sc_still_absent:   (.mempool_adjudication.still_absent // null),
+       sc_blocks_scanned: (.mempool_adjudication.blocks_scanned // null),
+       sc_tip_height:     (.mempool_adjudication.tip_height // null),
+       sc_walk_shortfall: (.mempool_adjudication.block_walk_shortfall // null),
+       sc_error:          (.mempool_adjudication.lookup_error // null),
+       sc_error_kind:     (.mempool_adjudication.lookup_error_kind // null),
        detail:    .reason_detail
      }' \
   "$VERDICT_LOG" \

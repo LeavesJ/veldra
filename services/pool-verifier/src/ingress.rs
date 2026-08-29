@@ -21,6 +21,7 @@ use crate::verdicts::{
     current_timestamp, current_timestamp_ms,
 };
 use pool_verifier::policy::Phase2Attribution;
+use pool_verifier::second_chance::{self, SecondChance, SecondChanceError, SecondChanceOutcome};
 use rg_protocol::gateway::{InternalMessage, MAX_INTERNAL_LINE_BYTES, msg_types};
 use rg_protocol::{
     PROTOCOL_VERSION, PolicyContext, TemplatePropose, TemplateVerdict, VerdictReason,
@@ -28,6 +29,131 @@ use rg_protocol::{
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, timeout};
+
+/// PB-40: put a Class M rejection to bitcoind before it stands.
+///
+/// Returns `None` when there is nothing to adjudicate: the template
+/// was not rejected by Class M, or `[policy.mempool] enforce` is off
+/// so there is no bitcoind to ask. Every other path returns a
+/// [`SecondChanceOutcome`] that is both counted and durably recorded.
+///
+/// A failed lookup yields [`SecondChanceOutcome::LookupFailed`] and
+/// the rejection stands. It deliberately does NOT fall through to
+/// acceptance: a lookup that could not run is not evidence that the
+/// transactions are present, and treating silence as a clean answer is
+/// the exact mistake that made 68 rejections unadjudicable.
+async fn run_second_chance(
+    lookup: Option<&SecondChance>,
+    phase2: &Phase2Attribution,
+    template_height: u32,
+    tolerance_pct: f64,
+) -> Option<SecondChanceOutcome> {
+    let (Phase2Attribution::Rejected { unknown, total }, Some(lookup)) = (phase2, lookup) else {
+        return None;
+    };
+    let total = *total;
+    let unknown_before = u32::try_from(unknown.len()).unwrap_or(u32::MAX);
+
+    match lookup.ask(template_height, unknown).await {
+        Ok(answer) => {
+            let adjudication = second_chance::adjudicate(total, unknown, &answer);
+            if !adjudication.still_exceeds(tolerance_pct) {
+                // WITHDRAWN is safe under partial coverage. The walk can
+                // only ever ADD transactions to the known set, so a
+                // fuller answer could not have pushed the recomputed
+                // count back over tolerance. Nothing is asserted here
+                // that a complete walk would contradict.
+                return Some(SecondChanceOutcome::Withdrawn(adjudication));
+            }
+            // An unadjudicated probe blocks an `upheld` for the same
+            // reason an incomplete block walk does. `upheld` asserts
+            // bitcoind held these transactions in neither its mempool
+            // nor a recent block, and a transaction nobody could ask
+            // about has established neither half of that. The rejection
+            // still stands; only the evidence label changes.
+            if adjudication.unadjudicated > 0 {
+                warn!(
+                    height = template_height,
+                    unknown_before,
+                    total,
+                    still_absent = adjudication.still_absent,
+                    unadjudicated = adjudication.unadjudicated,
+                    "PB-40 second chance could not establish absence for every unknown; the \
+                     Class M rejection stands UNADJUDICATED rather than as a confirmed detection"
+                );
+                let reason = SecondChanceError::MempoolProbeIncomplete(format!(
+                    "{} of {unknown_before} unknown transactions had no usable probe answer",
+                    adjudication.unadjudicated
+                ));
+                return Some(SecondChanceOutcome::LookupFailed {
+                    total,
+                    unknown_before,
+                    // The real count, so a reviewer or a dashboard can
+                    // key off it directly instead of parsing it back out
+                    // of the free-text `reason` sentence above.
+                    unadjudicated: adjudication.unadjudicated,
+                    kind: reason.as_label().to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+            // UPHELD is not safe under partial coverage. It asserts
+            // bitcoind held the transactions in neither its mempool nor
+            // any recent block, and the runbook reads it as a genuine
+            // detection candidate. A walk that errored or truncated
+            // never established the second half of that claim, so
+            // absence from it is not evidence and the verdict is
+            // reported unadjudicated instead. It still upholds the
+            // rejection; only the evidence label changes, which is the
+            // whole point.
+            if let Some(shortfall) = answer.block_walk_shortfall.as_ref() {
+                warn!(
+                    height = template_height,
+                    unknown_before,
+                    total,
+                    still_absent = adjudication.still_absent,
+                    blocks_scanned = adjudication.blocks_scanned,
+                    tip_height = adjudication.tip_height,
+                    shortfall = %shortfall,
+                    "PB-40 second chance could not rule out the mined case; the Class M rejection \
+                     stands UNADJUDICATED rather than as a confirmed detection"
+                );
+                let reason = SecondChanceError::BlockWalkIncomplete(shortfall.clone());
+                return Some(SecondChanceOutcome::LookupFailed {
+                    total,
+                    unknown_before,
+                    // Verified zero: the `adjudication.unadjudicated > 0`
+                    // branch above already returned if any probe came
+                    // back unusable, so by construction nothing is
+                    // unadjudicated on this path.
+                    unadjudicated: adjudication.unadjudicated,
+                    reason: reason.to_string(),
+                    kind: reason.as_label().to_string(),
+                });
+            }
+            Some(SecondChanceOutcome::Upheld(adjudication))
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                kind = e.as_label(),
+                height = template_height,
+                unknown_before,
+                total,
+                "PB-40 second chance could not reach bitcoind; the Class M rejection stands \
+                 UNADJUDICATED and must not be read as a confirmed detection"
+            );
+            Some(SecondChanceOutcome::LookupFailed {
+                total,
+                unknown_before,
+                // Genuinely unknown: no adjudication ran at all, so
+                // there is no probed count to carry.
+                unadjudicated: 0,
+                reason: e.to_string(),
+                kind: e.as_label().to_string(),
+            })
+        }
+    }
+}
 
 /// Build an optional `TlsAcceptor` for the verifier TCP channel.
 ///
@@ -279,13 +405,13 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// System error boundary: reason codes not produced by policy evaluation.
 ///
-/// `VerdictReason::PolicyLoadError`       — emitted when policy lock is poisoned
-///                                          or policy state is unavailable.
-/// `VerdictReason::MempoolBackendUnavailable` — reserved for future fail-closed
-///                                          mode. Currently, missing mempool triggers
-///                                          degraded-mode tier selection.
-/// `VerdictReason::InternalError`         — emitted on unexpected handler failures
-///                                          (e.g., serialize errors).
+/// `VerdictReason::PolicyLoadError`: emitted when policy lock is poisoned
+///                                    or policy state is unavailable.
+/// `VerdictReason::MempoolBackendUnavailable`: reserved for future fail-closed
+///                                    mode. Currently, missing mempool triggers
+///                                    degraded-mode tier selection.
+/// `VerdictReason::InternalError`: emitted on unexpected handler failures
+///                                    (e.g., serialize errors).
 // Ten parameters is over the clippy threshold. Splitting them into a
 // struct would only rename the same values at the one call site in
 // main.rs, so the seam is not earned.
@@ -866,6 +992,9 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                     reason: Some(VerdictReason::PolicyLoadError.as_str().to_string()),
                     reason_code: Some(VerdictReason::PolicyLoadError.as_str().to_string()),
                     reason_detail: Some("policy lock poisoned".to_string()),
+                    // Class M never ran on this path, so there is
+                    // nothing bitcoind could have been asked about.
+                    mempool_adjudication: None,
                     timestamp: current_timestamp(),
                     min_avg_fee_used: 0,
                     fee_tier: "unknown".to_string(),
@@ -954,7 +1083,7 @@ pub(crate) async fn handle_tcp_connection<R, W>(
             } else {
                 None
             };
-            let eval = if let Some(snap) = mempool_snap.as_ref() {
+            let mut eval = if let Some(snap) = mempool_snap.as_ref() {
                 pool_verifier::policy::evaluate_dynamic_phase2(
                     &propose,
                     &cfg,
@@ -966,9 +1095,49 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                 pool_verifier::policy::evaluate_dynamic(&propose, &cfg, mempool_tx_count, now_ms)
             };
 
+            // ── PB-40: second-chance lookup at Class M rejection time ──
+            // The check above compared this template against a view up
+            // to `poll_interval_secs` old, while `getblocktemplate`
+            // preferentially selects transactions that arrived inside
+            // exactly that window. Before a Class M rejection is
+            // allowed to stand, ask bitcoind whether it holds the
+            // transactions the polled view did not, and record what it
+            // said: that answer is unrecoverable afterwards, because
+            // the same transactions are RBF-replaced or evicted within
+            // minutes and a later re-query would report them absent.
+            let second_chance = run_second_chance(
+                state_clone.second_chance.as_deref(),
+                &eval.phase2,
+                propose.block_height,
+                cfg.mempool.tolerance_pct,
+            )
+            .await;
+            if let Some(SecondChanceOutcome::Withdrawn(adj)) = second_chance.as_ref() {
+                info!(
+                    template_id = propose.id,
+                    height = propose.block_height,
+                    reason_code = VerdictReason::V2InvariantMempoolToleranceExceeded.as_str(),
+                    total = adj.total,
+                    unknown_before = adj.unknown_before,
+                    in_mempool = adj.in_mempool,
+                    mined = adj.mined,
+                    still_absent = adj.still_absent,
+                    blocks_scanned = adj.blocks_scanned,
+                    tolerance_pct = cfg.mempool.tolerance_pct,
+                    "PB-40 second chance withdrew a Class M rejection: bitcoind holds \
+                     transactions the polled mempool view did not"
+                );
+                // The rejection is withdrawn on the recomputed count.
+                // Detail is cleared with it so an accepted verdict can
+                // never carry a rejection string; the adjudication
+                // survives on the durable verdict record below.
+                eval.reason = None;
+                eval.detail = None;
+            }
+
             let accepted = eval.reason.is_none();
 
-            // reason_code string comes from rg-protocol — single source of truth.
+            // reason_code string comes from rg-protocol, the single source of truth.
             let reason_code_str: Option<String> =
                 eval.reason.as_ref().map(|r| r.as_str().to_string());
 
@@ -992,17 +1161,35 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                 metrics
                     .mempool_view_size
                     .set(i64::try_from(snap.size).unwrap_or(i64::MAX));
-                let result_label = match eval.phase2 {
-                    Phase2Attribution::NotRun => None,
-                    Phase2Attribution::Agreed => Some("agreed"),
-                    Phase2Attribution::Stale => Some("stale"),
-                    Phase2Attribution::SkippedDegraded => {
+                let result_label = match (&eval.phase2, second_chance.as_ref()) {
+                    (Phase2Attribution::NotRun, _) => None,
+                    (Phase2Attribution::Agreed, _) => Some("agreed"),
+                    (Phase2Attribution::Stale, _) => Some("stale"),
+                    (Phase2Attribution::SkippedDegraded, _) => {
                         metrics.phase2_degraded_total.inc();
                         Some("skipped")
                     }
-                    Phase2Attribution::SkippedUnprimed => Some("unprimed"),
-                    Phase2Attribution::Rejected => Some("rejected"),
+                    (Phase2Attribution::SkippedUnprimed, _) => Some("unprimed"),
+                    // PB-40: a first-pass rejection that bitcoind
+                    // overturned is neither "agreed" nor "rejected".
+                    // Folding it into "agreed" would hide the defect
+                    // this mechanism exists to measure, and leaving it
+                    // in "rejected" would report a rejection that did
+                    // not happen.
+                    (
+                        Phase2Attribution::Rejected { .. },
+                        Some(SecondChanceOutcome::Withdrawn(_)),
+                    ) => Some("recovered"),
+                    (Phase2Attribution::Rejected { .. }, _) => Some("rejected"),
                 };
+                if let Some(outcome) = second_chance.as_ref() {
+                    metrics
+                        .phase2_second_chance_total
+                        .get_or_create(&crate::metrics::SecondChanceLabels {
+                            outcome: outcome.as_label().to_string(),
+                        })
+                        .inc();
+                }
                 if let Some(result_label) = result_label {
                     metrics
                         .phase2_checks_total
@@ -1083,7 +1270,34 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                 coinbase_sigops: propose.coinbase_sigops,
                 created_at_unix_ms: propose.created_at_unix_ms,
                 safety_warnings: safety_warning_codes,
+                mempool_adjudication: second_chance.as_ref().map(Into::into),
             };
+
+            // PB-40: rejections were not logged at all. The Setup B
+            // container emitted 8 lines in 7.5 hours, all startup,
+            // while 68 templates were rejected, and `/verdicts` is a
+            // capped 1000-entry ring that held only 23 of them. A
+            // rejection that leaves no trace outside a ring buffer is
+            // not evidence. Doctrine also requires every rejection to
+            // be traceable through structured tracing carrying
+            // `reason_code` plus policy context.
+            if !accepted {
+                warn!(
+                    template_id = propose.id,
+                    height = propose.block_height,
+                    log_id,
+                    reason_code = logged.reason_code.as_deref().unwrap_or("unknown"),
+                    reason_detail = logged.reason_detail.as_deref().unwrap_or(""),
+                    fee_tier = %eval.fee_tier.as_str(),
+                    min_avg_fee_used = eval.min_avg_fee_used,
+                    tx_count = propose.tx_count,
+                    second_chance = logged
+                        .mempool_adjudication
+                        .as_ref()
+                        .map_or("not_applicable", |a| a.outcome.as_str()),
+                    "template rejected"
+                );
+            }
 
             metrics.templates_evaluated_total.inc();
             metrics
@@ -1332,6 +1546,7 @@ mod tests {
                 toml_text: String::new(),
             })),
             mempool_view: None,
+            second_chance: None,
         };
         let mut registry = prometheus_client::registry::Registry::default();
         let metrics = std::sync::Arc::new(crate::metrics::VerifierMetrics::new_registered(

@@ -742,7 +742,11 @@ pub enum ShieldOutcome {
 /// PB-18(a): what the Class M (Phase 2 mempool ground truth) check
 /// actually did during this evaluation, reported by the evaluation
 /// path itself so the ingress metrics cannot misattribute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: the `Rejected` variant carries the unknown txid list.
+// It rides here rather than on a parallel `Option` field of
+// `EvalResult` so that unknown txids without a Class M rejection is
+// not a representable state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase2Attribution {
     /// Class M never executed: no mempool snapshot supplied, no
     /// `raw_block_hex`, or an earlier check rejected the template
@@ -756,8 +760,14 @@ pub enum Phase2Attribution {
     SkippedDegraded,
     /// Skipped because the view was Unprimed (boot window, PB-13).
     SkippedUnprimed,
-    /// Rejected with a Class M reason code.
-    Rejected,
+    /// Rejected with a Class M reason code, carrying the evidence the
+    /// PB-40 second-chance lookup needs to adjudicate it.
+    Rejected {
+        /// Every template txid the served view did not contain.
+        unknown: Vec<[u8; 32]>,
+        /// Non-coinbase transactions in the template.
+        total: u32,
+    },
 }
 
 /// Map a `ConsensusViolation` returned by the rg-consensus facade to
@@ -1269,33 +1279,31 @@ fn check_invariant_shield_inner(
                     _ => Phase2Attribution::SkippedUnprimed,
                 };
             }
-            crate::mempool_view::MempoolCheckOutcome::ToleranceExceeded {
-                unknown_count,
-                total,
-                sample_unknown,
-            } => {
-                // Per-tx detail mode emits every unknown txid; default
-                // (aggregate) mode emits the existing bounded sample.
-                // sample_unknown from mempool_view::evaluate is already
-                // capped at SAMPLE_UNKNOWN_CAP, so per-tx mode
-                // recomputes the full list against the snapshot.
-                let txids_to_emit: Vec<[u8; 32]> = if per_tx_detail {
-                    txids
-                        .iter()
-                        .filter(|t| !snapshot.txids.contains(*t))
-                        .copied()
-                        .collect()
+            crate::mempool_view::MempoolCheckOutcome::ToleranceExceeded { unknown, total } => {
+                // `evaluate` returns every unknown txid. Per-tx detail
+                // mode emits all of them (bounded by the wire budget);
+                // default aggregate mode emits the leading
+                // SAMPLE_UNKNOWN_CAP as representatives.
+                let unknown_count = u32::try_from(unknown.len()).unwrap_or(u32::MAX);
+                let emit_len = if per_tx_detail {
+                    unknown.len()
                 } else {
-                    sample_unknown
+                    unknown.len().min(crate::mempool_view::SAMPLE_UNKNOWN_CAP)
                 };
-                let detail =
-                    format_mempool_tolerance_detail_bounded(unknown_count, total, &txids_to_emit);
+                let detail = format_mempool_tolerance_detail_bounded(
+                    unknown_count,
+                    total,
+                    &unknown[..emit_len],
+                );
                 return (
                     ShieldOutcome::Rejected {
                         reason: VerdictReason::V2InvariantMempoolToleranceExceeded,
                         detail,
                     },
-                    Phase2Attribution::Rejected,
+                    // The full unknown set travels with the
+                    // attribution so ingress can put it to bitcoind
+                    // before the rejection is allowed to stand (PB-40).
+                    Phase2Attribution::Rejected { unknown, total },
                 );
             }
         }
@@ -3059,7 +3067,11 @@ mod tests {
             result.reason,
             Some(VerdictReason::V2InvariantMempoolToleranceExceeded)
         );
-        assert_eq!(result.phase2, Phase2Attribution::Rejected);
+        assert!(
+            matches!(result.phase2, Phase2Attribution::Rejected { .. }),
+            "expected a Class M rejection attribution, got {:?}",
+            result.phase2
+        );
     }
 
     #[test]
@@ -3109,7 +3121,11 @@ mod tests {
             result.reason,
             Some(VerdictReason::V2InvariantMempoolToleranceExceeded)
         );
-        assert_eq!(result.phase2, Phase2Attribution::Rejected);
+        assert!(
+            matches!(result.phase2, Phase2Attribution::Rejected { .. }),
+            "expected a Class M rejection attribution, got {:?}",
+            result.phase2
+        );
     }
 
     // ── Class M boot gate: shipped placeholder credentials ──────

@@ -68,13 +68,20 @@ METRICS_TEXT="$(curl --silent --show-error --fail --max-time 10 "$METRICS_URL")"
 # The parsers below retain dual single/double suffix tolerance so they
 # keep working against both post-fix and any older pre-fix verifier.
 parse_counter_with_label() {
-  local name="$1"
-  local label="$2"
+  parse_counter_by_label_key result "$1" "$2"
+}
+
+# PB-40's verifier_phase2_second_chance_total keys on `outcome`, not
+# `result`, so the label name is a parameter rather than baked in.
+parse_counter_by_label_key() {
+  local key="$1"
+  local name="$2"
+  local label="$3"
   echo "$METRICS_TEXT" \
-    | awk -v name="$name" -v label="$label" '
+    | awk -v name="$name" -v key="$key" -v label="$label" '
         $0 ~ /^#/ { next }
-        index($0, name "{result=\"" label "\"}") == 1 ||
-        index($0, name "_total{result=\"" label "\"}") == 1 {
+        index($0, name "{" key "=\"" label "\"}") == 1 ||
+        index($0, name "_total{" key "=\"" label "\"}") == 1 {
           print $NF; exit
         }
       '
@@ -95,6 +102,13 @@ AGREED="$(parse_counter_with_label verifier_phase2_checks_total agreed)"
 REJECTED="$(parse_counter_with_label verifier_phase2_checks_total rejected)"
 SKIPPED="$(parse_counter_with_label verifier_phase2_checks_total skipped)"
 STALE="$(parse_counter_with_label verifier_phase2_checks_total stale)"
+# PB-40: a first-pass tolerance breach that bitcoind overturned. It is
+# a Class M check that ran, so it belongs in the soak denominator, and
+# it emitted no rejection, so it never belongs in FP_total.
+RECOVERED="$(parse_counter_with_label verifier_phase2_checks_total recovered)"
+SC_WITHDRAWN="$(parse_counter_by_label_key outcome verifier_phase2_second_chance_total withdrawn)"
+SC_UPHELD="$(parse_counter_by_label_key outcome verifier_phase2_second_chance_total upheld)"
+SC_FAILED="$(parse_counter_by_label_key outcome verifier_phase2_second_chance_total lookup_failed)"
 DEGRADED="$(parse_counter verifier_phase2_degraded_total)"
 VIEW_AGE="$(parse_counter verifier_mempool_view_age_seconds)"
 VIEW_SIZE="$(parse_counter verifier_mempool_view_size)"
@@ -105,6 +119,10 @@ AGREED="${AGREED:-0}"
 REJECTED="${REJECTED:-0}"
 SKIPPED="${SKIPPED:-0}"
 STALE="${STALE:-0}"
+RECOVERED="${RECOVERED:-0}"
+SC_WITHDRAWN="${SC_WITHDRAWN:-0}"
+SC_UPHELD="${SC_UPHELD:-0}"
+SC_FAILED="${SC_FAILED:-0}"
 DEGRADED="${DEGRADED:-0}"
 VIEW_AGE="${VIEW_AGE:-0}"
 VIEW_SIZE="${VIEW_SIZE:-0}"
@@ -118,6 +136,10 @@ jq -n \
   --argjson rejected "$REJECTED" \
   --argjson skipped  "$SKIPPED" \
   --argjson stale    "$STALE" \
+  --argjson recovered "$RECOVERED" \
+  --argjson sc_withdrawn "$SC_WITHDRAWN" \
+  --argjson sc_upheld "$SC_UPHELD" \
+  --argjson sc_failed "$SC_FAILED" \
   --argjson degraded "$DEGRADED" \
   --argjson view_age "$VIEW_AGE" \
   --argjson view_size "$VIEW_SIZE" \
@@ -130,6 +152,10 @@ jq -n \
       verifier_phase2_checks_total_rejected: $rejected,
       verifier_phase2_checks_total_skipped:  $skipped,
       verifier_phase2_checks_total_stale:    $stale,
+      verifier_phase2_checks_total_recovered: $recovered,
+      verifier_phase2_second_chance_total_withdrawn:    $sc_withdrawn,
+      verifier_phase2_second_chance_total_upheld:       $sc_upheld,
+      verifier_phase2_second_chance_total_lookup_failed: $sc_failed,
       verifier_phase2_degraded_total:        $degraded
     },
     gauges: {
@@ -139,5 +165,6 @@ jq -n \
   }' > "$OUT_PATH"
 
 echo "phase2-baseline: wrote $OUT_PATH at $CAPTURED_AT"
-echo "  agreed=$AGREED  rejected=$REJECTED  skipped=$SKIPPED  stale=$STALE"
+echo "  agreed=$AGREED  rejected=$REJECTED  recovered=$RECOVERED  skipped=$SKIPPED  stale=$STALE"
+echo "  second_chance: withdrawn=$SC_WITHDRAWN  upheld=$SC_UPHELD  lookup_failed=$SC_FAILED"
 echo "  degraded=$DEGRADED  view_age=${VIEW_AGE}s  view_size=$VIEW_SIZE"

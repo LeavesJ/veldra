@@ -136,7 +136,68 @@ The 4% default is operationally tunable, set per the criteria:
   catches genuine attacks, consider lowering toward 2%.
 - **Acceptance metric for default 4%:** zero false positives across
   one week of shadow-mode production observation against a real
-  operator bitcoind.
+  operator bitcoind. **Superseded in method by the PB-40 amendment
+  below: this must be read from
+  `verifier_phase2_second_chance_total{outcome=...}` and the
+  `mempool_adjudication` record on each durable verdict, never by
+  re-querying the txids after the soak. See the amendment for why the
+  obvious procedure returns the wrong answer.**
+
+**F2b amendment (PB-40, 2026-08-04): the tolerance window alone is
+not sufficient, and the acceptance metric above was unmeasurable as
+written.**
+
+Measured on the Setup B node: 68 rejections in 7.5 hours across 2,932
+templates. Every sampled one was a false positive. A rejection was
+caught live (`log_id=2952`, 187 of 2738 unknown) and its sampled txids
+queried against bitcoind within seconds: **10 of 10 were in the
+mempool.**
+
+The cause is not propagation lag between peers, which is what the 4%
+headroom above was sized for. It is temporal skew against the
+verifier's own polled view: `getrawmempool` is sampled every
+`poll_interval_secs` (default 10) while `getblocktemplate`
+preferentially selects freshly-arrived high-fee transactions, so
+transactions that entered inside that window score unknown by
+construction. The observed unknown-ratio distribution clusters against
+the threshold rather than spreading, with 43% of sampled rejections in
+the single percentage band immediately above 4.0 (min 4.16, median
+5.23, max 16.17), which is the signature of a window artefact and not
+of tampering. Widening the percentage does not fix a defect whose
+magnitude is set by arrival rate.
+
+**Three consequences for this ADR:**
+
+1. **A tolerance breach is now a question, not a verdict.** Before a
+   Class M rejection is emitted the verifier asks bitcoind directly
+   about the specific unknown transactions
+   (`pool-verifier/src/second_chance.rs`). Present in the mempool, or
+   mined into a block at or above the template's own height, means
+   known, and the unknown count is recomputed. Only what bitcoind
+   knows in neither place counts.
+
+2. **Retroactive adjudication is INVALID and fails dangerously.** The
+   same sampled txids from a 35-minute-old rejection came back 9 of 9
+   ABSENT, not because they were ever invalid but because they are the
+   churny tail that gets RBF-replaced or evicted from a 93k mempool
+   within minutes. A T+7 review that re-queries week-old rejection
+   records will therefore find them absent and score every rejection a
+   TRUE positive. **Any acceptance procedure that adjudicates after
+   the fact produces a confidently incorrect PASS.** The bitcoind
+   answer must be captured at rejection time and read from the durable
+   verdict record afterwards; it cannot be recovered later.
+
+3. **On a single-bitcoind deployment Class M is structurally
+   incapable of a true positive.** The template's transactions come
+   from the same mempool being checked against: Setup B runs the
+   template-manager on `network: host` and the verifier on
+   `rpc_url = 127.0.0.1:8332`, one listener, one process. So
+   `FP_total == 0` is exactly the right criterion for Setup B, but it
+   validates **"the check does not cry wolf", NOT "the check catches
+   attacks."** A clean soak on this topology is not detection
+   evidence, and no future reader should cite it as such. Detection
+   evidence requires a deployment where the verifier's bitcoind is
+   genuinely independent of the template source.
 
 **F2c (rejected): Coinbase-and-fee-only.** Verifier checks only that
 the coinbase output sum is consistent with declared mempool fees plus
