@@ -88,6 +88,12 @@ docs/meeting-xu.md
 docs/one-pager-xu.md
 docs/outreach/
 docs/SESSION_HANDOFF.md
+# SDD working artefacts: the implementation plan and design spec for a single
+# work session. Local only, per J's T3 call on the tracked set of a PUBLIC
+# repo. The durable record of WHY a change was made lives in the tracked ADRs
+# and runbooks; these are the scaffolding that produced it. The matching
+# private-docs pattern in scripts/gate.sh keeps them from being re-tracked.
+docs/superpowers/
 
 # Private assets and design drafts (local only)
 ReserveGrid-OS-Founders-Guide.md
