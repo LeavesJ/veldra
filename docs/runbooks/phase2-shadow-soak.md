@@ -82,6 +82,23 @@ If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak be
    lookup degrades to `lookup_failed`, and the week-long soak produces no
    adjudicable evidence at all. This check catches that in five seconds instead
    of at T+7.
+
+   Then the second unverified belief, which costs the same five seconds.
+   `MempoolInfo` in `bitcoind_rpc.rs` declares `loaded` as a REQUIRED field, so
+   a Core build that does not send it fails deserialization and every lookup
+   errors. That is the safe direction, loud rather than silently wrong, but it
+   still burns the soak. Confirm this node sends it:
+   ```sh
+   curl --user "$VELDRA_BITCOIND_RPC_USER:$VELDRA_BITCOIND_RPC_PASS" \
+     -d '{"jsonrpc":"1.0","id":"soak","method":"getmempoolinfo","params":[]}' \
+     -H 'content-type: application/json' \
+     "$VELDRA_BITCOIND_RPC_URL" | jq '{loaded: .result.loaded, size: .result.size}'
+   ```
+   Expect `loaded` to be a boolean and `true`, and `size` to be a non-zero
+   integer. `loaded: false` means bitcoind is still replaying `mempool.dat`;
+   wait, do not restart it, and do not start the soak until it flips. A `null`
+   `loaded` means this Core build predates the field and the second-chance
+   lookup cannot run against it at all.
 3. Baseline the four Phase 2 counters and gauges. Run:
    ```sh
    scripts/phase2-baseline.sh
