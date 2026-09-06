@@ -1580,26 +1580,6 @@ async fn handle_submit_shares(
         "share accepted",
     );
 
-    // Emit share_accepted event (success).
-    let evt = ShareAcceptedEvent {
-        event_type: "share_accepted",
-        share_id_hex: share_id_hex.clone(),
-        event_id_hex: event_id_hex.clone(),
-        sv2_response: "success",
-        reason_code: None,
-        reason_detail: None,
-        worker_id: worker_id.clone(),
-        channel_id: share.channel_id,
-        sequence_number: share.sequence_number,
-        job_id: share.job_id,
-        block_height: job_block_height,
-        timestamp_ms: unix_ms_now(),
-        difficulty_u64: difficulty,
-    };
-    if let Err(e) = share_event_tx.try_send(evt) {
-        warn!(error = %e, "share_event_tx full; share event dropped");
-    }
-
     // Enqueue for upstream relay.
     let prev_hash_wire = job_prev_hash;
     let mut prev_hash_display = job_prev_hash;
@@ -1618,8 +1598,8 @@ async fn handle_submit_shares(
         ntime: share.ntime,
         nbits: job_nbits,
         nonce: share.nonce,
-        event_id_hex,
-        worker_id,
+        event_id_hex: event_id_hex.clone(),
+        worker_id: worker_id.clone(),
         validation_level: "full".to_string(),
         gateway_instance_id: config.gateway_instance_id.clone(),
         channel_id: share.channel_id,
@@ -1656,6 +1636,30 @@ async fn handle_submit_shares(
             sequence_number = share.sequence_number,
             "share_forward_tx full; share dropped and REJECTED to the miner",
         );
+        // The accounting stream must agree with what the miner was told.
+        // Every other rejection in this function emits an error event, and the
+        // success event below now fires ONLY on a successful enqueue, so a
+        // dropped share is no longer credited in shares_total, in the channel
+        // registry's shares_accepted, or as a WAL pending record that no
+        // forward result will ever complete.
+        let evt = ShareAcceptedEvent {
+            event_type: "share_accepted",
+            share_id_hex: share_id_hex.clone(),
+            event_id_hex: event_id_hex.clone(),
+            sv2_response: "error",
+            reason_code: Some(GatewayReason::ShareDroppedQueueFull.as_str().to_string()),
+            reason_detail: Some(GatewayReason::ShareDroppedQueueFull.to_string()),
+            worker_id: worker_id.clone(),
+            channel_id: share.channel_id,
+            sequence_number: share.sequence_number,
+            job_id: share.job_id,
+            block_height: job_block_height,
+            timestamp_ms: unix_ms_now(),
+            difficulty_u64: 0,
+        };
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
         return send_share_error(
             transport,
             share.channel_id,
@@ -1663,6 +1667,26 @@ async fn handle_submit_shares(
             GatewayReason::ShareDroppedQueueFull,
         )
         .await;
+    }
+
+    // Emitted ONLY after the share is safely queued for relay (PB-38).
+    let evt = ShareAcceptedEvent {
+        event_type: "share_accepted",
+        share_id_hex: share_id_hex.clone(),
+        event_id_hex: event_id_hex.clone(),
+        sv2_response: "success",
+        reason_code: None,
+        reason_detail: None,
+        worker_id: worker_id.clone(),
+        channel_id: share.channel_id,
+        sequence_number: share.sequence_number,
+        job_id: share.job_id,
+        block_height: job_block_height,
+        timestamp_ms: unix_ms_now(),
+        difficulty_u64: difficulty,
+    };
+    if let Err(e) = share_event_tx.try_send(evt) {
+        warn!(error = %e, "share_event_tx full; share event dropped");
     }
 
     let success = sv2_codec::SubmitSharesSuccess {
@@ -2074,25 +2098,6 @@ async fn handle_submit_shares_extended(
         "extended share accepted",
     );
 
-    let evt = ShareAcceptedEvent {
-        event_type: "share_accepted",
-        share_id_hex: share_id_hex.clone(),
-        event_id_hex: event_id_hex.clone(),
-        sv2_response: "success",
-        reason_code: None,
-        reason_detail: None,
-        worker_id: worker_id.clone(),
-        channel_id: share.channel_id,
-        sequence_number: share.sequence_number,
-        job_id: share.job_id,
-        block_height: job_block_height,
-        timestamp_ms: unix_ms_now(),
-        difficulty_u64: difficulty,
-    };
-    if let Err(e) = share_event_tx.try_send(evt) {
-        warn!(error = %e, "share_event_tx full; share event dropped");
-    }
-
     // Enqueue for upstream relay.
     let prev_hash_wire = job_prev_hash;
     let mut prev_hash_display = job_prev_hash;
@@ -2111,8 +2116,8 @@ async fn handle_submit_shares_extended(
         ntime: share.ntime,
         nbits: job_nbits,
         nonce: share.nonce,
-        event_id_hex,
-        worker_id,
+        event_id_hex: event_id_hex.clone(),
+        worker_id: worker_id.clone(),
         validation_level: "full".to_string(),
         gateway_instance_id: config.gateway_instance_id.clone(),
         channel_id: share.channel_id,
@@ -2143,6 +2148,30 @@ async fn handle_submit_shares_extended(
             sequence_number = share.sequence_number,
             "share_forward_tx full; share dropped and REJECTED to the miner",
         );
+        // The accounting stream must agree with what the miner was told.
+        // Every other rejection in this function emits an error event, and the
+        // success event below now fires ONLY on a successful enqueue, so a
+        // dropped share is no longer credited in shares_total, in the channel
+        // registry's shares_accepted, or as a WAL pending record that no
+        // forward result will ever complete.
+        let evt = ShareAcceptedEvent {
+            event_type: "share_accepted",
+            share_id_hex: share_id_hex.clone(),
+            event_id_hex: event_id_hex.clone(),
+            sv2_response: "error",
+            reason_code: Some(GatewayReason::ShareDroppedQueueFull.as_str().to_string()),
+            reason_detail: Some(GatewayReason::ShareDroppedQueueFull.to_string()),
+            worker_id: worker_id.clone(),
+            channel_id: share.channel_id,
+            sequence_number: share.sequence_number,
+            job_id: share.job_id,
+            block_height: job_block_height,
+            timestamp_ms: unix_ms_now(),
+            difficulty_u64: 0,
+        };
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
         return send_share_error(
             transport,
             share.channel_id,
@@ -2150,6 +2179,26 @@ async fn handle_submit_shares_extended(
             GatewayReason::ShareDroppedQueueFull,
         )
         .await;
+    }
+
+    // Emitted ONLY after the share is safely queued for relay (PB-38).
+    let evt = ShareAcceptedEvent {
+        event_type: "share_accepted",
+        share_id_hex: share_id_hex.clone(),
+        event_id_hex: event_id_hex.clone(),
+        sv2_response: "success",
+        reason_code: None,
+        reason_detail: None,
+        worker_id: worker_id.clone(),
+        channel_id: share.channel_id,
+        sequence_number: share.sequence_number,
+        job_id: share.job_id,
+        block_height: job_block_height,
+        timestamp_ms: unix_ms_now(),
+        difficulty_u64: difficulty,
+    };
+    if let Err(e) = share_event_tx.try_send(evt) {
+        warn!(error = %e, "share_event_tx full; share event dropped");
     }
 
     let success = sv2_codec::SubmitSharesSuccess {
@@ -2417,7 +2466,9 @@ mod tests {
     /// with a genuinely saturated relay queue, and return the SV2 `msg_type`
     /// the miner actually receives. `extended` selects which of the two
     /// handlers is exercised; PB-38 notes the defect repeats in both.
-    async fn pb38_reply_msg_type_on_full_queue(extended: bool) -> u8 {
+    async fn pb38_reply_msg_type_on_full_queue(
+        extended: bool,
+    ) -> (u8, String, Vec<(String, Option<String>)>) {
         use crate::transport::perform_handshake;
         use secp256k1::Keypair;
         use tokio::net::TcpListener;
@@ -2439,7 +2490,7 @@ mod tests {
             share_forward_tx.try_send(pb38_filler_submission()).is_err(),
             "queue must be saturated or this test proves nothing"
         );
-        let (share_event_tx, _share_event_rx) = mpsc::channel::<ShareAcceptedEvent>(64);
+        let (share_event_tx, mut share_event_rx) = mpsc::channel::<ShareAcceptedEvent>(64);
 
         #[allow(clippy::cast_possible_truncation)]
         let ntime = (unix_ms_now() / 1000) as u32;
@@ -2515,9 +2566,19 @@ mod tests {
             }
         });
 
-        let msg_type = pb38_miner_side(addr, authority_pubkey, extended, ntime).await;
+        let (msg_type, error_code) = pb38_miner_side(addr, authority_pubkey, extended, ntime).await;
         responder.await.unwrap().unwrap();
-        msg_type
+
+        // Drain the accounting stream. The gateway's own books must agree
+        // with what the miner was told: a T2 review found the success event
+        // was emitted BEFORE the enqueue, so a rejected share was still
+        // credited in shares_total, in the channel registry and as a WAL
+        // pending record no forward result would ever complete.
+        let mut events = Vec::new();
+        while let Ok(evt) = share_event_rx.try_recv() {
+            events.push((evt.sv2_response.to_string(), evt.reason_code.clone()));
+        }
+        (msg_type, error_code, events)
     }
 
     /// The miner half of the PB-38 harness: complete the Noise handshake,
@@ -2527,7 +2588,7 @@ mod tests {
         authority_pubkey: secp256k1::XOnlyPublicKey,
         extended: bool,
         ntime: u32,
-    ) -> u8 {
+    ) -> (u8, String) {
         use noise_sv2::{INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE, Initiator};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
@@ -2589,37 +2650,71 @@ mod tests {
         let mut hdr_bytes = [0u8; crate::transport::SV2_FRAME_HEADER_SIZE];
         hdr_bytes.copy_from_slice(&encrypted[..crate::transport::SV2_FRAME_HEADER_SIZE]);
 
-        crate::transport::Sv2FrameHeader::parse(&hdr_bytes).msg_type
+        let hdr = crate::transport::Sv2FrameHeader::parse(&hdr_bytes);
+        let body = &encrypted[crate::transport::SV2_FRAME_HEADER_SIZE..];
+        let error_code = if hdr.msg_type == MESSAGE_TYPE_SUBMIT_SHARES_ERROR {
+            sv2_codec::SubmitSharesError::decode(body)
+                .map(|e| e.error_code)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        (hdr.msg_type, error_code)
+    }
+
+    /// Assert the WHOLE contract for a queue-full drop, not just that some
+    /// error came back. A T2 reviewer noted the first version of these tests
+    /// would have passed the moment anything rejected the fixture earlier in
+    /// the pipeline, for an entirely unrelated reason.
+    fn pb38_assert_rejected(
+        msg_type: u8,
+        error_code: &str,
+        events: &[(String, Option<String>)],
+        what: &str,
+    ) {
+        assert_ne!(
+            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+            "{what}: the forward queue was full and the share was dropped, but \
+             the miner was told SubmitShares.Success. This is the pool's \
+             accounting path: the miner is credited for a share upstream never \
+             received."
+        );
+        assert_eq!(
+            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
+            "{what}: a share dropped at enqueue must be reported as an error"
+        );
+        assert_eq!(
+            error_code,
+            GatewayReason::ShareDroppedQueueFull.to_sv2_error_code(),
+            "{what}: the error must be the one ShareDroppedQueueFull maps to, \
+             otherwise this test passes on any unrelated earlier rejection and \
+             proves nothing about the enqueue branch"
+        );
+        assert!(
+            !events.iter().any(|(response, _)| response == "success"),
+            "{what}: the gateway told the miner the share was REJECTED but \
+             filed a success accounting event, which credits shares_total, the \
+             channel registry and a WAL pending record for a share that was \
+             thrown away. Events seen: {events:?}"
+        );
+        assert!(
+            events.iter().any(|(response, reason)| response == "error"
+                && reason.as_deref() == Some(GatewayReason::ShareDroppedQueueFull.as_str())),
+            "{what}: the accounting stream must carry the rejection with \
+             reason_code share_dropped_queue_full. Events seen: {events:?}"
+        );
     }
 
     #[tokio::test]
     async fn full_forward_queue_rejects_a_standard_share_to_the_miner() {
-        let msg_type = pb38_reply_msg_type_on_full_queue(false).await;
-        assert_ne!(
-            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
-            "the forward queue was full and the share was dropped, but the \
-             miner was told SubmitShares.Success. This is the pool's \
-             accounting path: the miner is credited for a share upstream \
-             never received."
-        );
-        assert_eq!(
-            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
-            "a share dropped at enqueue must be reported as an error"
-        );
+        let (msg_type, error_code, events) = pb38_reply_msg_type_on_full_queue(false).await;
+        pb38_assert_rejected(msg_type, &error_code, &events, "standard share");
     }
 
     #[tokio::test]
     async fn full_forward_queue_rejects_an_extended_share_to_the_miner() {
-        let msg_type = pb38_reply_msg_type_on_full_queue(true).await;
-        assert_ne!(
-            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
-            "the extended-share path has the same defect as the standard one; \
-             PB-38 notes the shape repeats and it must be covered separately"
-        );
-        assert_eq!(
-            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
-            "a dropped extended share must be reported as an error"
-        );
+        let (msg_type, error_code, events) = pb38_reply_msg_type_on_full_queue(true).await;
+        pb38_assert_rejected(msg_type, &error_code, &events, "extended share");
     }
 
     #[test]
