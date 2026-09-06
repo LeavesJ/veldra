@@ -2097,7 +2097,17 @@ async fn ingest_share(
 /// `ShareSubmissionRecord` must stay field-for-field identical to the
 /// gateway's `ShareSubmission`, in DECLARATION ORDER, because `serde_json` emits
 /// fields in that order; `the_two_wire_structs_serialize_to_identical_bytes`
-/// fails loudly if either declaration drifts.
+/// catches a rename, a reorder, an added field, and (only because its fixtures
+/// carry boundary values) an integer-width change.
+///
+/// There is a THIRD condition the doc used to leave unstated: every field must
+/// be a fixed point under serialize, parse, serialize. `difficulty_display` is
+/// an `f64` and that does NOT hold with stock `serde_json`, whose float parser
+/// is not correctly rounded; above roughly 2^51 the value moves by an ULP and
+/// the recomputed hash differs. The `float_roundtrip` feature in this crate's
+/// Cargo.toml is what makes it hold, and
+/// `difficulty_round_trips_across_the_whole_u64_domain` is what stops that
+/// feature being dropped by accident.
 fn canonical_body_hash(submission: &ShareSubmissionRecord) -> [u8; 32] {
     use sha2::Digest;
     let mut canonical = submission.clone();
@@ -2755,6 +2765,71 @@ mod tests {
         ));
     }
 
+    /// The body hash is computed over serialized JSON on BOTH sides, so the
+    /// verifier can only reproduce the signer's bytes if every field is a fixed
+    /// point under serialize, parse, serialize. Floats are where that dies, and
+    /// this test is the guard on the Cargo feature that saves it.
+    ///
+    /// MEASURED, not assumed. With stock `serde_json` the parser is not
+    /// correctly rounded and it is the VALUE that moves, not the formatting:
+    ///
+    ///   u64 2251799813685247 serialized `2251799813685247.0`
+    ///                        came back  `2251799813685247.2`
+    ///   u64 9007199254740991 serialized `9007199254740991.0`
+    ///                        came back  `9007199254740990.0`
+    ///
+    /// Sweeping every power of two and every power minus one across the whole
+    /// u64 range, the smallest failing value was 2251799813685247, which is
+    /// 2^51 - 1. The `float_roundtrip` feature on `serde_json` makes the parser
+    /// correctly rounded and takes the failure count to zero across that entire
+    /// sweep. This test covers the WHOLE u64 domain rather than a safe subset,
+    /// so dropping the feature turns it red instead of silently rejecting
+    /// shares above difficulty 2^51 in production.
+    #[test]
+    fn difficulty_round_trips_across_the_whole_u64_domain() {
+        let mut probes: Vec<u64> = vec![0, 1, 2, 3, 1_000, 1_000_000];
+        for e in 0..64u32 {
+            probes.push(1u64 << e);
+            probes.push((1u64 << e).saturating_sub(1));
+            probes.push((1u64 << e).saturating_add(1));
+        }
+        // The exact values measured to fail without `float_roundtrip`.
+        probes.extend([
+            2_251_799_813_685_247u64,
+            9_007_199_254_740_991,
+            8_870_465_209_849_823,
+            1_148_526_734_580_180_129,
+            u64::MAX / 3,
+            u64::MAX,
+        ]);
+        probes.sort_unstable();
+        probes.dedup();
+
+        for raw in probes {
+            #[allow(clippy::cast_precision_loss)]
+            let d = raw as f64;
+            let mut gateway = sample_gateway_submission();
+            gateway.difficulty_display = d;
+            let secret = b"f64-domain-probe";
+            sv2_gateway::shares::sign_submission(secret, &mut gateway);
+            let wire = serde_json::to_string(&gateway).unwrap();
+            let received: ShareSubmissionRecord =
+                serde_json::from_str(&wire).expect("wire must deserialize");
+
+            let mut event_id = [0u8; 32];
+            event_id.copy_from_slice(&hex::decode(&received.event_id_hex).unwrap());
+            let sig = hex::decode(&received.gateway_signature_hex).unwrap();
+            let body_hash = canonical_body_hash(&received);
+
+            assert!(
+                verify_gateway_signature(secret, &event_id, &body_hash, &sig),
+                "difficulty {raw} (as f64 {d:?}) did not survive the canonical \
+                 round trip. If this is the only failure, `float_roundtrip` has \
+                 been dropped from serde_json in this crate's Cargo.toml."
+            );
+        }
+    }
+
     /// The replay property the body hash exists for. A signature captured from
     /// one submission must not verify against a different body carrying the
     /// same event id. If this passes with the body hash unbound, the signature
@@ -2824,26 +2899,26 @@ mod tests {
     fn sample_gateway_submission() -> sv2_gateway::shares::ShareSubmission {
         sv2_gateway::shares::ShareSubmission {
             share_id_hex: "aa".repeat(32),
-            version: 0x2000_0000,
+            version: u32::MAX,
             prev_hash_wire_hex: "bb".repeat(32),
             prev_hash_display_hex: "bb".repeat(32),
             merkle_root_wire_hex: "cc".repeat(32),
             merkle_root_display_hex: "cc".repeat(32),
-            ntime: 1_700_000_000,
+            ntime: u32::MAX,
             nbits: 0x1d00_ffff,
-            nonce: 42,
+            nonce: u32::MAX,
             event_id_hex: "dd".repeat(32),
             worker_id: "test-worker".to_string(),
             validation_level: "full".to_string(),
             gateway_instance_id: "gw-01".to_string(),
-            channel_id: 1,
-            sequence_number: 0,
-            job_id: 10,
-            template_id: 100,
-            block_height: 200,
+            channel_id: u32::MAX,
+            sequence_number: u32::MAX,
+            job_id: u32::MAX,
+            template_id: u64::MAX,
+            block_height: u32::MAX,
             pool_account_id: None,
-            timestamp_ms: 1_700_000_000_000,
-            difficulty_u64: 1,
+            timestamp_ms: u64::MAX,
+            difficulty_u64: u64::MAX,
             difficulty_display: 1.0,
             source_instance_id: "src-01".to_string(),
             gateway_signature_hex: String::new(),
@@ -2887,9 +2962,20 @@ mod tests {
     /// Binding the body hash only works while both sides hash the same bytes,
     /// and the two structs are declared independently in two crates with
     /// nothing but a doc comment claiming they match. `serde_json` emits fields
-    /// in DECLARATION order, so a reordering, a rename, a type change or an
-    /// added field on either side silently breaks every signature in
-    /// production. This fails loudly at compile-or-test time instead.
+    /// in DECLARATION order, so a reordering, a rename or an added field on
+    /// either side silently breaks every signature in production. This catches
+    /// those.
+    ///
+    /// It catches an integer-width change ONLY because both fixtures carry
+    /// boundary values. That is deliberate and load bearing. An earlier version
+    /// used small values (`template_id: 100`, `job_id: 10`) and a T2 reviewer
+    /// showed it stayed green while `ShareSubmissionRecord.template_id` was
+    /// narrowed to `u32`, because JSON renders `100` identically at either
+    /// width. In production `template_id` is a full 64-bit `stable_template_id`
+    /// hash, so that drift would have rejected every share at the axum
+    /// extractor with no `reason_code` and no test signal. With `u64::MAX` in
+    /// the fixture the narrowing is a compile error instead. Keep the boundary
+    /// values; shrinking them re-blinds the guard.
     #[test]
     fn the_two_wire_structs_serialize_to_identical_bytes() {
         let gateway = sample_gateway_submission();
@@ -2936,26 +3022,26 @@ mod tests {
     fn sample_share_submission() -> ShareSubmissionRecord {
         ShareSubmissionRecord {
             share_id_hex: "aa".repeat(32),
-            version: 0x2000_0000,
+            version: u32::MAX,
             prev_hash_wire_hex: "bb".repeat(32),
             prev_hash_display_hex: "bb".repeat(32),
             merkle_root_wire_hex: "cc".repeat(32),
             merkle_root_display_hex: "cc".repeat(32),
-            ntime: 1_700_000_000,
+            ntime: u32::MAX,
             nbits: 0x1d00_ffff,
-            nonce: 42,
+            nonce: u32::MAX,
             event_id_hex: "dd".repeat(32),
             worker_id: "test-worker".to_string(),
             validation_level: "full".to_string(),
             gateway_instance_id: "gw-01".to_string(),
-            channel_id: 1,
-            sequence_number: 0,
-            job_id: 10,
-            template_id: 100,
-            block_height: 200,
+            channel_id: u32::MAX,
+            sequence_number: u32::MAX,
+            job_id: u32::MAX,
+            template_id: u64::MAX,
+            block_height: u32::MAX,
             pool_account_id: None,
-            timestamp_ms: 1_700_000_000_000,
-            difficulty_u64: 1,
+            timestamp_ms: u64::MAX,
+            difficulty_u64: u64::MAX,
             difficulty_display: 1.0,
             source_instance_id: "src-01".to_string(),
             gateway_signature_hex: String::new(),

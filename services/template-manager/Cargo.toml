@@ -8,7 +8,14 @@ publish = false
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "fs", "sync"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# PB-37: `float_roundtrip` is LOAD BEARING, not a nicety. The share-relay body
+# hash is recomputed here by re-serializing the parsed submission, so every
+# field must be a fixed point under serialize/parse/serialize. Without this
+# feature serde_json's float parser is not correctly rounded and
+# `difficulty_display` moves by an ULP above ~2^51, changing the body hash and
+# silently rejecting correctly signed shares.
+# `difficulty_round_trips_across_the_whole_u64_domain` fails if this is dropped.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 anyhow = "1"
 rg-protocol = { path = "../rg-protocol" }
 reservegrid-common = { path = "../reservegrid-common" }
