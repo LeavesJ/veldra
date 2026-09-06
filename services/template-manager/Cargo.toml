@@ -27,5 +27,12 @@ subtle = "2"
 tower-http = { version = "0.6", features = ["limit"] }
 prometheus-client = { workspace = true }
 
+# PB-37: the share-relay HMAC is a cross-service contract, and it was broken for
+# months because each side was only ever tested against a fixture built with its
+# own assumptions. The gateway's REAL signer is pulled in here so the contract
+# test can run both sides against each other rather than one side against itself.
+[dev-dependencies]
+sv2-gateway = { path = "../sv2-gateway" }
+
 [lints]
 workspace = true

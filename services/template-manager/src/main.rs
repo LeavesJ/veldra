@@ -2022,7 +2022,8 @@ async fn ingest_share(
             }
         };
 
-        if !verify_gateway_signature(&hmac_secret, &event_id_bytes, &sig_bytes) {
+        let body_hash = canonical_body_hash(&submission);
+        if !verify_gateway_signature(&hmac_secret, &event_id_bytes, &body_hash, &sig_bytes) {
             warn!(
                 share_id = %submission.share_id_hex,
                 "share rejected: invalid gateway signature",
@@ -2086,8 +2087,45 @@ async fn ingest_share(
     })
 }
 
-/// Verify that `signature` matches HMAC-SHA256(secret, `event_id`).
-fn verify_gateway_signature(secret: &[u8], event_id: &[u8; 32], signature: &[u8]) -> bool {
+/// SHA-256 over the canonical JSON body, which is the submission serialized
+/// with `gateway_signature_hex` emptied.
+///
+/// PB-37: this MUST reproduce, byte for byte, what
+/// `sv2_gateway::shares::sign_submission` hashed on the other side. Two things
+/// make that true and both are load bearing. The signature field is cleared
+/// before serializing, because the signer cannot hash its own output. And
+/// `ShareSubmissionRecord` must stay field-for-field identical to the
+/// gateway's `ShareSubmission`, in DECLARATION ORDER, because `serde_json` emits
+/// fields in that order; `the_two_wire_structs_serialize_to_identical_bytes`
+/// fails loudly if either declaration drifts.
+fn canonical_body_hash(submission: &ShareSubmissionRecord) -> [u8; 32] {
+    use sha2::Digest;
+    let mut canonical = submission.clone();
+    canonical.gateway_signature_hex = String::new();
+    // Serialization of this struct cannot fail: every field is a plain scalar,
+    // String or Option<String>. Fail closed on the impossible branch rather
+    // than unwrapping, so a future field that can fail cannot forge a match.
+    match serde_json::to_vec(&canonical) {
+        Ok(bytes) => sha2::Sha256::digest(&bytes).into(),
+        Err(_) => [0u8; 32],
+    }
+}
+
+/// Verify that `signature` matches HMAC-SHA256(secret, `event_id || body_hash`).
+///
+/// PB-37: the signer at `sv2_gateway::shares::compute_gateway_signature` binds
+/// BOTH the event id and the body hash, and this side used to bind the event id
+/// alone, so every correctly signed share was rejected whenever
+/// `VELDRA_SHARE_UPSTREAM_SECRET` was set. The signer's form is normative
+/// because binding the body is what stops a captured signature being replayed
+/// onto a different submission; dropping the body hash here would restore that
+/// replay hole even if the two sides agreed again.
+fn verify_gateway_signature(
+    secret: &[u8],
+    event_id: &[u8; 32],
+    body_hash: &[u8; 32],
+    signature: &[u8],
+) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
@@ -2096,6 +2134,7 @@ fn verify_gateway_signature(secret: &[u8], event_id: &[u8; 32], signature: &[u8]
         return false;
     };
     mac.update(event_id);
+    mac.update(body_hash);
     mac.verify_slice(signature).is_ok()
 }
 
@@ -2696,29 +2735,55 @@ mod tests {
 
     // ── Share ingest tests ──
 
+    // PB-37: `verify_gateway_signature_valid` used to live here. It built its
+    // fixture signature with `mac.update(&event_id)` only, which is this side's
+    // own convention, so it verified the verifier against itself and stayed
+    // green through a month of a broken relay path. It has been deleted rather
+    // than repaired; `gateway_signed_share_verifies_at_the_template_manager`
+    // does the same job against the gateway's real signer. What remains here is
+    // the property that test cannot cover: that the body hash is actually bound.
+
     #[test]
-    fn verify_gateway_signature_valid() {
+    fn verify_gateway_signature_invalid() {
+        let secret = b"test-secret";
+        let event_id = [0xAA; 32];
+        let body_hash = [0xBB; 32];
+        let bad_sig = [0xFF; 32];
+
+        assert!(!verify_gateway_signature(
+            secret, &event_id, &body_hash, &bad_sig
+        ));
+    }
+
+    /// The replay property the body hash exists for. A signature captured from
+    /// one submission must not verify against a different body carrying the
+    /// same event id. If this passes with the body hash unbound, the signature
+    /// is portable across submissions and PB-37's security rationale is gone.
+    #[test]
+    fn a_signature_does_not_carry_over_to_a_different_body() {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 
         let secret = b"test-secret";
         let event_id = [0xAA; 32];
+        let body_hash = [0xBB; 32];
+        let other_body_hash = [0xCC; 32];
 
         let mut mac = HmacSha256::new_from_slice(secret).unwrap();
         mac.update(&event_id);
+        mac.update(&body_hash);
         let sig = mac.finalize().into_bytes();
 
-        assert!(verify_gateway_signature(secret, &event_id, &sig));
-    }
-
-    #[test]
-    fn verify_gateway_signature_invalid() {
-        let secret = b"test-secret";
-        let event_id = [0xAA; 32];
-        let bad_sig = [0xFF; 32];
-
-        assert!(!verify_gateway_signature(secret, &event_id, &bad_sig));
+        assert!(
+            verify_gateway_signature(secret, &event_id, &body_hash, &sig),
+            "signature must verify against the body it was made for"
+        );
+        assert!(
+            !verify_gateway_signature(secret, &event_id, &other_body_hash, &sig),
+            "signature verified against a DIFFERENT body: the body hash is not \
+             bound, so a captured signature is replayable onto another submission"
+        );
     }
 
     #[test]
@@ -2729,11 +2794,143 @@ mod tests {
 
         let event_id = [0xBB; 32];
 
+        let body_hash = [0xCC; 32];
         let mut mac = HmacSha256::new_from_slice(b"secret-a").unwrap();
         mac.update(&event_id);
+        mac.update(&body_hash);
         let sig = mac.finalize().into_bytes();
 
-        assert!(!verify_gateway_signature(b"secret-b", &event_id, &sig));
+        assert!(!verify_gateway_signature(
+            b"secret-b",
+            &event_id,
+            &body_hash,
+            &sig
+        ));
+    }
+
+    // ── PB-37: the share-relay HMAC is a CROSS-SERVICE contract ────
+    //
+    // The gateway signs and the template-manager verifies. Every test that
+    // existed before these built its fixture with the verifying side's own
+    // convention, so the suite certified the two sides agreed while they did
+    // not, and the authenticated relay path was broken on main for a month.
+    // These two tests exist because X and Y both need to hold: X, the real
+    // signer's output must satisfy the real verifier; Y, the two independently
+    // declared structs must serialize to the same bytes, because the body hash
+    // is computed over those bytes on both sides.
+
+    /// Build the GATEWAY's own submission type, populated identically to
+    /// `sample_share_submission` so the two structs are compared like for like.
+    fn sample_gateway_submission() -> sv2_gateway::shares::ShareSubmission {
+        sv2_gateway::shares::ShareSubmission {
+            share_id_hex: "aa".repeat(32),
+            version: 0x2000_0000,
+            prev_hash_wire_hex: "bb".repeat(32),
+            prev_hash_display_hex: "bb".repeat(32),
+            merkle_root_wire_hex: "cc".repeat(32),
+            merkle_root_display_hex: "cc".repeat(32),
+            ntime: 1_700_000_000,
+            nbits: 0x1d00_ffff,
+            nonce: 42,
+            event_id_hex: "dd".repeat(32),
+            worker_id: "test-worker".to_string(),
+            validation_level: "full".to_string(),
+            gateway_instance_id: "gw-01".to_string(),
+            channel_id: 1,
+            sequence_number: 0,
+            job_id: 10,
+            template_id: 100,
+            block_height: 200,
+            pool_account_id: None,
+            timestamp_ms: 1_700_000_000_000,
+            difficulty_u64: 1,
+            difficulty_display: 1.0,
+            source_instance_id: "src-01".to_string(),
+            gateway_signature_hex: String::new(),
+        }
+    }
+
+    /// The contract test PB-37 says never existed: sign with the gateway's REAL
+    /// signer, ship the JSON it would actually put on the wire, and verify with
+    /// the template-manager's REAL verifier. No fixture, no re-implementation of
+    /// either side's convention. If this goes red, the authenticated share relay
+    /// is broken in production, whichever side moved.
+    #[test]
+    fn gateway_signed_share_verifies_at_the_template_manager() {
+        let secret = b"pb37-cross-service-secret";
+
+        // Gateway side: sign exactly as the running gateway does.
+        let mut submission = sample_gateway_submission();
+        sv2_gateway::shares::sign_submission(secret, &mut submission);
+        assert!(
+            !submission.gateway_signature_hex.is_empty(),
+            "gateway produced no signature; the test would pass vacuously"
+        );
+
+        // The wire: whatever the gateway serializes is what arrives.
+        let wire = serde_json::to_string(&submission).unwrap();
+        let received: ShareSubmissionRecord = serde_json::from_str(&wire).unwrap();
+
+        // Template-manager side: recover the two inputs it must bind.
+        let mut event_id = [0u8; 32];
+        event_id.copy_from_slice(&hex::decode(&received.event_id_hex).unwrap());
+        let sig = hex::decode(&received.gateway_signature_hex).unwrap();
+        let body_hash = canonical_body_hash(&received);
+
+        assert!(
+            verify_gateway_signature(secret, &event_id, &body_hash, &sig),
+            "a signature produced by the gateway's real signer was rejected by \
+             the template-manager's real verifier: the relay path is broken"
+        );
+    }
+
+    /// Binding the body hash only works while both sides hash the same bytes,
+    /// and the two structs are declared independently in two crates with
+    /// nothing but a doc comment claiming they match. `serde_json` emits fields
+    /// in DECLARATION order, so a reordering, a rename, a type change or an
+    /// added field on either side silently breaks every signature in
+    /// production. This fails loudly at compile-or-test time instead.
+    #[test]
+    fn the_two_wire_structs_serialize_to_identical_bytes() {
+        let gateway = sample_gateway_submission();
+        let tmgr = sample_share_submission();
+
+        let from_gateway = serde_json::to_vec(&gateway).unwrap();
+        let from_tmgr = serde_json::to_vec(&tmgr).unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&from_gateway),
+            String::from_utf8_lossy(&from_tmgr),
+            "sv2_gateway::shares::ShareSubmission and ShareSubmissionRecord no \
+             longer serialize identically. The share-relay body hash is computed \
+             over these bytes on both sides, so this divergence rejects every \
+             authenticated share. Reconcile the two declarations."
+        );
+    }
+
+    /// The verifier recomputes the body hash from what it received, so it must
+    /// reproduce the signer's canonical form: the signature field emptied, then
+    /// serialized. Pin that the round trip through the wire is lossless.
+    #[test]
+    fn canonical_body_hash_survives_the_wire_round_trip() {
+        use sha2::{Digest, Sha256};
+        let mut gateway = sample_gateway_submission();
+        gateway.gateway_signature_hex = String::new();
+        let signer_bytes = serde_json::to_vec(&gateway).unwrap();
+        let signer_hash: [u8; 32] = Sha256::digest(&signer_bytes).into();
+
+        // Now sign it, put it on the wire, and recover the hash at the far end.
+        let secret = b"pb37-cross-service-secret";
+        sv2_gateway::shares::sign_submission(secret, &mut gateway);
+        let wire = serde_json::to_string(&gateway).unwrap();
+        let received: ShareSubmissionRecord = serde_json::from_str(&wire).unwrap();
+
+        assert_eq!(
+            canonical_body_hash(&received),
+            signer_hash,
+            "the verifier could not reproduce the signer's body hash after a \
+             wire round trip"
+        );
     }
 
     fn sample_share_submission() -> ShareSubmissionRecord {
