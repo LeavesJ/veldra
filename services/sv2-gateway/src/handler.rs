@@ -1641,8 +1641,28 @@ async fn handle_submit_shares(
         });
         sign_submission(&secret, &mut submission);
     }
+    // PB-38: a share dropped here is a share upstream never receives, and
+    // this is the pool's accounting path. Reporting Success would credit the
+    // miner for work that was thrown away. `ShareDroppedQueueFull` already
+    // carries an SV2 wire code ("stale-share") and is deliberately NOT in the
+    // post-ACK telemetry group that `to_sv2_error_code` calls unreachable! on,
+    // because enqueue failure happens BEFORE the ACK and the miner can still
+    // be told the truth. Eviction, which happens after, cannot be.
     if let Err(e) = share_forward_tx.try_send(submission) {
-        warn!(error = %e, "share_forward_tx full; share submission dropped");
+        warn!(
+            error = %e,
+            reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+            channel_id = share.channel_id,
+            sequence_number = share.sequence_number,
+            "share_forward_tx full; share dropped and REJECTED to the miner",
+        );
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::ShareDroppedQueueFull,
+        )
+        .await;
     }
 
     let success = sv2_codec::SubmitSharesSuccess {
@@ -2114,11 +2134,22 @@ async fn handle_submit_shares_extended(
         });
         sign_submission(&secret, &mut submission);
     }
+    // PB-38: identical to the standard path. See the comment there.
     if let Err(e) = share_forward_tx.try_send(submission) {
         warn!(
             error = %e,
-            "share_forward_tx full; share submission dropped",
+            reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+            channel_id = share.channel_id,
+            sequence_number = share.sequence_number,
+            "share_forward_tx full; share dropped and REJECTED to the miner",
         );
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::ShareDroppedQueueFull,
+        )
+        .await;
     }
 
     let success = sv2_codec::SubmitSharesSuccess {
@@ -2283,6 +2314,313 @@ async fn distribute_job(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── PB-38: a full forward queue must not be reported as acceptance ──
+    //
+    // The enqueue at the end of the share path used to be a bare
+    // `try_send` whose Err arm only logged, with the SubmitShares.Success
+    // write immediately below it and no branch in between. The share was
+    // dropped, the miner was told it was accepted, and upstream never saw
+    // it. That is the pool's accounting path.
+    //
+    // The codebase had already decided what should happen: GatewayReason
+    // maps ShareDroppedQueueFull to the SV2 wire code "stale-share" and
+    // deliberately excludes it from the post-ACK telemetry group
+    // (ShareEvictedFromQueue, ShareForwardFailed, ShareUpstreamRejected)
+    // which `to_sv2_error_code` calls unreachable! on. Enqueue failure
+    // happens BEFORE the ACK, so the miner can be told; eviction happens
+    // after, so it cannot. That distinction was specified in the enum and
+    // never wired to the send site.
+    //
+    // This drives the REAL handler over a REAL Noise-handshaked transport
+    // with a genuinely saturated channel, and reads back the frame the
+    // miner would actually receive. PB-38 asked for a test that forces
+    // queue saturation because nothing did.
+
+    /// A target that accepts any hash, so the test exercises the enqueue
+    /// branch rather than proof-of-work.
+    const ANY_POW: [u8; 32] = [0xFF; 32];
+
+    fn pb38_handler_config() -> HandlerConfig {
+        HandlerConfig {
+            max_channels_per_conn: 4,
+            channel_target: ANY_POW,
+            channel_open_timeout: Duration::from_secs(5),
+            ntime_elapsed_slack_seconds: 3600,
+            max_future_block_time_seconds: 7200,
+            share_dedup_window_size: 128,
+            max_shares_per_second_per_channel: 0,
+            gateway_instance_id: "pb38-gw".to_string(),
+            share_hmac_secret: Arc::new(std::sync::RwLock::new(Vec::new())),
+            extended_channels_enabled: true,
+            extranonce_prefix_len: 2,
+            vardiff_enabled: false,
+            vardiff_target_shares_per_min: 20.0,
+            vardiff_retarget_interval: Duration::from_secs(60),
+            vardiff_min_difficulty: 1,
+            vardiff_max_difficulty: u64::MAX,
+            vardiff_max_adjustment_factor: 4.0,
+        }
+    }
+
+    /// A throwaway submission used only to occupy the relay queue.
+    fn pb38_filler_submission() -> ShareSubmission {
+        ShareSubmission {
+            share_id_hex: "00".repeat(32),
+            version: 0x2000_0000,
+            prev_hash_wire_hex: "00".repeat(32),
+            prev_hash_display_hex: "00".repeat(32),
+            merkle_root_wire_hex: "00".repeat(32),
+            merkle_root_display_hex: "00".repeat(32),
+            ntime: 0,
+            nbits: 0x1d00_ffff,
+            nonce: 0,
+            event_id_hex: "00".repeat(32),
+            worker_id: "filler".to_string(),
+            validation_level: "full".to_string(),
+            gateway_instance_id: "pb38-gw".to_string(),
+            channel_id: 1,
+            sequence_number: 0,
+            job_id: 42,
+            template_id: 1,
+            block_height: 1,
+            pool_account_id: None,
+            timestamp_ms: 0,
+            difficulty_u64: 1,
+            difficulty_display: 1.0,
+            source_instance_id: "pb38".to_string(),
+            gateway_signature_hex: String::new(),
+        }
+    }
+
+    fn pb38_job(ntime: u32) -> crate::jobs::JobRecord {
+        crate::jobs::JobRecord {
+            job_id: 42,
+            template_id: 1,
+            block_height: 1,
+            version: 0x2000_0000,
+            prev_hash: [0u8; 32],
+            nbits: 0x1d00_ffff,
+            coinbase_tx_prefix: vec![0x01, 0x00, 0x00, 0x00],
+            coinbase_tx_suffix: vec![0xFF, 0xFF, 0xFF, 0xFF],
+            merkle_path: Vec::new(),
+            activation_min_ntime: ntime.saturating_sub(600),
+            raw_min_ntime: ntime.saturating_sub(600),
+            raw_curtime: ntime,
+            source_instance_id: "pb38".to_string(),
+            activated: true,
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Drive the REAL share handler over a REAL Noise-handshaked transport
+    /// with a genuinely saturated relay queue, and return the SV2 `msg_type`
+    /// the miner actually receives. `extended` selects which of the two
+    /// handlers is exercised; PB-38 notes the defect repeats in both.
+    async fn pb38_reply_msg_type_on_full_queue(extended: bool) -> u8 {
+        use crate::transport::perform_handshake;
+        use secp256k1::Keypair;
+        use tokio::net::TcpListener;
+
+        let secp = secp256k1::Secp256k1::new();
+        let authority_kp = Keypair::new(&secp, &mut rand::thread_rng());
+        let authority_pubkey = authority_kp.x_only_public_key().0;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Saturate the relay queue: capacity one, already occupied. The
+        // receiver is held so the queue cannot drain.
+        let (share_forward_tx, _share_forward_rx) = mpsc::channel::<ShareSubmission>(1);
+        share_forward_tx
+            .try_send(pb38_filler_submission())
+            .expect("first send fills the queue");
+        assert!(
+            share_forward_tx.try_send(pb38_filler_submission()).is_err(),
+            "queue must be saturated or this test proves nothing"
+        );
+        let (share_event_tx, _share_event_rx) = mpsc::channel::<ShareAcceptedEvent>(64);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let ntime = (unix_ms_now() / 1000) as u32;
+
+        let responder = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let mut transport =
+                perform_handshake(stream, &authority_kp, 3600, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+
+            let config = pb38_handler_config();
+            let mut channels = ConnectionChannels::new(config.max_channels_per_conn);
+            if extended {
+                channels
+                    .open_extended_channel(
+                        1,
+                        vec![0xAA, 0xBB],
+                        "w1".to_string(),
+                        None,
+                        ANY_POW,
+                        0,
+                        4,
+                        6,
+                    )
+                    .unwrap();
+            } else {
+                channels
+                    .open_channel(1, vec![0xAA, 0xBB], "w1".to_string(), None, ANY_POW, 0)
+                    .unwrap();
+            }
+
+            let mut table = JobTable::new(300_000, 64);
+            table.insert(pb38_job(ntime));
+            let job_table = Arc::new(tokio::sync::RwLock::new(table));
+            let mut dedup = ShareDedupSet::new(128);
+            let peer_state = PeerState::new(peer);
+            let up = Counter::default();
+            let down = Counter::default();
+
+            let (_hdr, payload) = transport.read_frame().await.unwrap();
+
+            if extended {
+                handle_submit_shares_extended(
+                    &mut transport,
+                    &peer_state,
+                    &mut channels,
+                    &config,
+                    &job_table,
+                    &mut dedup,
+                    &share_event_tx,
+                    &share_forward_tx,
+                    &payload,
+                    &up,
+                    &down,
+                )
+                .await
+            } else {
+                handle_submit_shares(
+                    &mut transport,
+                    &peer_state,
+                    &mut channels,
+                    &config,
+                    &job_table,
+                    &mut dedup,
+                    &share_event_tx,
+                    &share_forward_tx,
+                    &payload,
+                    &up,
+                    &down,
+                )
+                .await
+            }
+        });
+
+        let msg_type = pb38_miner_side(addr, authority_pubkey, extended, ntime).await;
+        responder.await.unwrap().unwrap();
+        msg_type
+    }
+
+    /// The miner half of the PB-38 harness: complete the Noise handshake,
+    /// submit one share, and return the `msg_type` of the reply frame.
+    async fn pb38_miner_side(
+        addr: std::net::SocketAddr,
+        authority_pubkey: secp256k1::XOnlyPublicKey,
+        extended: bool,
+        ntime: u32,
+    ) -> u8 {
+        use noise_sv2::{INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE, Initiator};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut initiator = Initiator::from_raw_k(authority_pubkey.serialize()).unwrap();
+        let first = initiator.step_0().unwrap();
+        stream.write_all(&first).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut response = [0u8; INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE];
+        stream.read_exact(&mut response).await.unwrap();
+        let mut codec = initiator.step_2(response).unwrap();
+
+        let (msg_type, body) = if extended {
+            let share = sv2_codec::SubmitSharesExtended {
+                channel_id: 1,
+                sequence_number: 7,
+                job_id: 42,
+                nonce: 0,
+                ntime,
+                version: 0x2000_0000,
+                extranonce: vec![0x01, 0x02, 0x03, 0x04],
+            };
+            (MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED, share.encode().unwrap())
+        } else {
+            let share = sv2_codec::SubmitSharesStandard {
+                channel_id: 1,
+                sequence_number: 7,
+                job_id: 42,
+                nonce: 0,
+                ntime,
+                version: 0x2000_0000,
+            };
+            (MESSAGE_TYPE_SUBMIT_SHARES_STANDARD, share.encode().unwrap())
+        };
+
+        #[allow(clippy::cast_possible_truncation)]
+        let hdr = crate::transport::Sv2FrameHeader {
+            extension_type: 0x0000,
+            msg_type,
+            msg_length: body.len() as u32,
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&hdr.to_bytes());
+        frame.extend_from_slice(&body);
+        codec.encrypt(&mut frame).unwrap();
+        #[allow(clippy::cast_possible_truncation)]
+        let len_bytes = (frame.len() as u16).to_be_bytes();
+        stream.write_all(&len_bytes).await.unwrap();
+        stream.write_all(&frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut encrypted = vec![0u8; resp_len];
+        stream.read_exact(&mut encrypted).await.unwrap();
+        codec.decrypt(&mut encrypted).unwrap();
+        let mut hdr_bytes = [0u8; crate::transport::SV2_FRAME_HEADER_SIZE];
+        hdr_bytes.copy_from_slice(&encrypted[..crate::transport::SV2_FRAME_HEADER_SIZE]);
+
+        crate::transport::Sv2FrameHeader::parse(&hdr_bytes).msg_type
+    }
+
+    #[tokio::test]
+    async fn full_forward_queue_rejects_a_standard_share_to_the_miner() {
+        let msg_type = pb38_reply_msg_type_on_full_queue(false).await;
+        assert_ne!(
+            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+            "the forward queue was full and the share was dropped, but the \
+             miner was told SubmitShares.Success. This is the pool's \
+             accounting path: the miner is credited for a share upstream \
+             never received."
+        );
+        assert_eq!(
+            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
+            "a share dropped at enqueue must be reported as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_forward_queue_rejects_an_extended_share_to_the_miner() {
+        let msg_type = pb38_reply_msg_type_on_full_queue(true).await;
+        assert_ne!(
+            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+            "the extended-share path has the same defect as the standard one; \
+             PB-38 notes the shape repeats and it must be covered separately"
+        );
+        assert_eq!(
+            msg_type, MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
+            "a dropped extended share must be reported as an error"
+        );
+    }
 
     #[test]
     fn handler_exit_display() {
