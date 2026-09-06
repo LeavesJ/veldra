@@ -312,11 +312,33 @@ impl ShareWal {
         // no-op on tmpfs, and an earlier version of this measurement was
         // silently benchmarking RAM because /tmp on the node is tmpfs.
         //
-        // The cost is affordable here and only here. Both callers run inside
-        // spawn_blocking on the main loop's share_event_rx arm (main.rs:1677
-        // and :1582), so this never touches a miner's ACK path and never
-        // blocks the async reactor. Moving this call onto the connection
-        // handler would make that 0.79ms p99 miner-visible.
+        // WHERE THE COST LANDS, corrected by a T2 review that caught the
+        // first version of this comment measuring against the wrong
+        // denominator. Both callers run inside spawn_blocking, and neither
+        // touches a miner's ACK path or blocks the async reactor: the handler
+        // writes SubmitShares.Success itself and never waits on the WAL. But
+        // they sit on two DIFFERENT arms of the SAME main select loop,
+        // mark_pending on share_event_rx (main.rs:1677) and mark_completed on
+        // share_result_rx (main.rs:1582), and each `.await` suspends that one
+        // loop. So the budget is TWO syncs per accepted share, serialized:
+        // the node's 0.412ms yields roughly 1,170 accepted shares/s, not
+        // 2,340/s.
+        //
+        // That is a margin, not a chasm. deploy/gateway-prod.toml admits
+        // max_connections 1024 x max_channels_per_conn 4 = 4,096 channels at
+        // max_shares_per_second_per_channel 100. Realistic vardiff puts the
+        // offered rate far below the configured ceiling, but "far above any
+        // realistic share rate" was an overstatement and is withdrawn.
+        // Compaction also runs inline on the same loop every
+        // wal_compaction_threshold (1000 in prod) completions, adding a full
+        // rewrite plus sync_all plus a directory fsync to the same budget.
+        //
+        // Past that ceiling the failure is NOT backpressure, it is silent:
+        // share_event_tx is a bounded mpsc(4096) whose ~24 try_send sites in
+        // handler.rs all warn and continue, so a full queue drops the
+        // accounting event while the miner is still told Success and the share
+        // is still relayed. PB-44 carries the real fix, which is to take these
+        // syncs off the select loop or batch them.
         //
         // NOT GUARDED BY A TEST, deliberately. Removing this line reddens
         // nothing: fsync is not observable in-process, and a throughput
