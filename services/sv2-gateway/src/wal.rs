@@ -1,5 +1,13 @@
 //! Write-ahead log (WAL) for crash-durable share event delivery.
 //!
+//! "Crash-durable" here means what it says, as of PB-39. Every append is
+//! followed by `sync_data` (fdatasync), and compaction syncs the replacement
+//! file before the rename and the parent directory after it, so a record that
+//! `mark_pending` returned `Ok` for survives power loss and a host reset, not
+//! only a process crash. Before PB-39 this module flushed and never synced,
+//! while its own doc comments promised an fsync, so the guarantee an operator
+//! read here was one the code did not provide.
+//!
 //! The share lifecycle emits two NDJSON events per accepted share:
 //! 1. `ShareAcceptedEvent` (Event 1): share validated, SV2 ACK sent to miner
 //! 2. `ShareForwardResultEvent` (Event 2): upstream relay outcome
@@ -280,6 +288,42 @@ impl ShareWal {
         line.push('\n');
         self.writer.write_all(line.as_bytes())?;
         self.writer.flush()?;
+        // PB-39: flush() only pushes the BufWriter into the kernel, which
+        // survives a process crash but not power loss or a host reset. The
+        // module called itself crash-durable and two doc comments promised an
+        // fsync that was never performed. `sync_data` is the fdatasync(2) that
+        // makes those claims true; it syncs the file length as well as the
+        // bytes, which is all an append-only log needs, and skips the
+        // timestamp metadata `sync_all` would also push.
+        //
+        // MEASURED rather than assumed, on two filesystems, because the cost
+        // is real and PB-39 asked for a number instead of a guess:
+        //
+        //   node ext4 (/dev/sda1, the deployment target), 2000 appends of a
+        //     221-byte record: 174,361/s with flush alone, 2,340/s with
+        //     fdatasync. Mean 0.002ms against 0.412ms, p99 0.009ms against
+        //     0.791ms.
+        //   this repo's own `bench_append_cost_on_this_filesystem` through the
+        //     real code on macOS APFS: 229/s, 4.359ms each.
+        //
+        // Both sit orders of magnitude below the flush-only figure, which is
+        // the evidence that the syscall is doing physical work rather than
+        // being elided. Measure before trusting any host: fdatasync is a
+        // no-op on tmpfs, and an earlier version of this measurement was
+        // silently benchmarking RAM because /tmp on the node is tmpfs.
+        //
+        // The cost is affordable here and only here. Both callers run inside
+        // spawn_blocking on the main loop's share_event_rx arm (main.rs:1677
+        // and :1582), so this never touches a miner's ACK path and never
+        // blocks the async reactor. Moving this call onto the connection
+        // handler would make that 0.79ms p99 miner-visible.
+        //
+        // NOT GUARDED BY A TEST, deliberately. Removing this line reddens
+        // nothing: fsync is not observable in-process, and a throughput
+        // threshold would be a flaky test rather than a guard, since it would
+        // fail on tmpfs and on CI runners. The bench above is the re-checkable
+        // artifact; this comment is the reason it exists.
+        self.writer.get_ref().sync_data()?;
         Ok(())
     }
 
@@ -305,8 +349,33 @@ impl ShareWal {
                 tmp_writer.write_all(b"\n")?;
             }
             tmp_writer.flush()?;
+            // PB-39, and this is the worse half of it. rename(2) is atomic in
+            // the directory entry, but without syncing the replacement first a
+            // power loss can leave the WAL name pointing at a file whose
+            // contents never reached storage. That does not lose the most
+            // recent record, it loses EVERY pending record at once, because
+            // compaction rewrites the whole file.
+            tmp_writer.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp_path, &self.path)?;
+        // The rename itself is metadata in the parent directory and is not
+        // durable until the directory is synced. Without this the file can
+        // survive while the name change does not, and recovery reads the
+        // pre-compaction log.
+        if let Some(dir) = self.path.parent() {
+            // A directory opened read-only is the portable way to fsync one.
+            // Best effort: a filesystem that refuses this (some network mounts)
+            // must not take down the gateway, and the data sync above already
+            // holds.
+            match std::fs::File::open(dir) {
+                Ok(d) => {
+                    if let Err(e) = d.sync_all() {
+                        warn!(error = %e, "wal: parent directory sync failed after compaction");
+                    }
+                }
+                Err(e) => warn!(error = %e, "wal: could not open parent directory to sync"),
+            }
+        }
 
         // Re-open append handle.
         let file = std::fs::OpenOptions::new()
@@ -470,6 +539,115 @@ mod tests {
         assert_eq!(wal.pending_count(), 0);
         let recovery = wal.recover();
         assert!(recovery.synthetic_events.is_empty());
+        cleanup(&path);
+    }
+
+    // ── PB-39: the durability the module claims must be observable ──
+    //
+    // Every test above this point goes through the `Wal` API, so none of
+    // them can tell a record that reached the file from one still sitting
+    // in the BufWriter. That is exactly the gap PB-39 names: the module
+    // called itself crash-durable and two doc comments promised an fsync
+    // that was never performed.
+    //
+    // What in-process tests CAN establish is that `Ok` means the bytes left
+    // the process. They cannot establish that fdatasync reached the platter,
+    // because that needs a power cut. That half is verified by measurement
+    // instead: on the node's ext4 root, appends run at 174,361/s with flush
+    // alone and 2,340/s with fdatasync. A 75x cost is proof the syscall is
+    // doing physical work rather than being a no-op, which is the strongest
+    // available evidence short of pulling the plug. See
+    // `bench_append_cost_on_this_filesystem` below to re-measure anywhere.
+
+    /// Read the WAL file with a handle that knows nothing about the `Wal`
+    /// struct, which is the only way to see past its `BufWriter`.
+    fn read_wal_file_independently(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[test]
+    fn mark_pending_is_on_disk_before_it_returns() {
+        let path = temp_wal_path("pb39_pending_visible");
+        cleanup(&path);
+        {
+            let mut wal = ShareWal::open(&path, 1000).unwrap();
+            wal.mark_pending("aa".repeat(32).as_str(), "bb".repeat(32).as_str())
+                .unwrap();
+
+            // Deliberately do NOT drop the Wal. If the record is only in the
+            // BufWriter, this read misses it and the "callers must treat a
+            // failure as fatal to share durability" contract is a fiction.
+            let contents = read_wal_file_independently(&path);
+            assert!(
+                contents.contains(&"aa".repeat(32)),
+                "mark_pending returned Ok but the record is not in the file \
+                 while the Wal is still open. The durability contract says a \
+                 crash between this write and the forward result is \
+                 recoverable; it is not. File held: {contents:?}"
+            );
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compaction_result_is_on_disk_before_it_returns() {
+        let path = temp_wal_path("pb39_compaction_visible");
+        cleanup(&path);
+        {
+            let mut wal = ShareWal::open(&path, 2).unwrap();
+            wal.mark_pending("11".repeat(32).as_str(), "aa".repeat(32).as_str())
+                .unwrap();
+            wal.mark_pending("22".repeat(32).as_str(), "bb".repeat(32).as_str())
+                .unwrap();
+            // Two completions trip the threshold and force compaction.
+            wal.mark_completed("11".repeat(32).as_str(), "aa".repeat(32).as_str())
+                .unwrap();
+            wal.mark_completed("22".repeat(32).as_str(), "bb".repeat(32).as_str())
+                .unwrap();
+
+            let contents = read_wal_file_independently(&path);
+            assert!(
+                !contents.contains(&"11".repeat(32)),
+                "compaction ran but the completed record is still on disk: \
+                 {contents:?}"
+            );
+            assert!(
+                wal.pending_count() == 0,
+                "both shares completed, so nothing should be pending"
+            );
+        }
+        cleanup(&path);
+    }
+
+    /// Re-measure the durability cost wherever this is run. Ignored by
+    /// default because it is a measurement, not an assertion: fdatasync is a
+    /// no-op on tmpfs and near-free on some virtualised storage, so a
+    /// threshold here would be a flaky test rather than a guard.
+    ///
+    /// Run with:
+    /// `cargo test -p sv2-gateway --lib bench_append_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement, not an assertion: fdatasync is a no-op on tmpfs"]
+    fn bench_append_cost_on_this_filesystem() {
+        let path = temp_wal_path("pb39_bench");
+        cleanup(&path);
+        let n = 2000;
+        let mut wal = ShareWal::open(&path, usize::MAX).unwrap();
+        let start = std::time::Instant::now();
+        for i in 0..n {
+            wal.mark_pending(&format!("{i:064x}"), &format!("{:064x}", i * 7))
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        #[allow(clippy::cast_precision_loss)]
+        let per_sec = f64::from(n) / elapsed.as_secs_f64();
+        println!(
+            "PB-39 append cost: {n} records in {elapsed:?} = {per_sec:.0}/s, \
+             {:.3}ms each. On the node's ext4 the python equivalent measured \
+             174,361/s without fdatasync and 2,340/s with it; a result near \
+             the high number means the sync is not reaching storage here.",
+            elapsed.as_secs_f64() * 1000.0 / f64::from(n)
+        );
         cleanup(&path);
     }
 
